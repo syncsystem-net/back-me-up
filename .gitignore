@@ -1,0 +1,39 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/tmp/
+
+# Go build
+/bin/
+/vendor/
+
+# Air
+/tmp/
+
+# Environment
+.env
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dev tools output
+dev-tools/prompts/output/
+
+# Temp zips
+*.zip.tmp

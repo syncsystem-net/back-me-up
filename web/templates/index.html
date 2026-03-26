@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}}</title>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body x-data="app()">
+    <header>
+        <h1>BackMeUp</h1>
+        <nav>
+            <a href="/" :class="{ active: page === 'home' }" @click.prevent="page = 'home'">Backups</a>
+            <a href="#" :class="{ active: page === 'jobs' }" @click.prevent="page = 'jobs'">Jobs</a>
+            <a href="#" :class="{ active: page === 'accounts' }" @click.prevent="page = 'accounts'">Accounts</a>
+        </nav>
+    </header>
+
+    <main>
+        <div x-show="page === 'home'">
+            <h2>Backups</h2>
+            <p>Backup management coming in the next PR.</p>
+        </div>
+
+        <div x-show="page === 'jobs'">
+            <h2>Jobs</h2>
+            <p>Job monitoring coming soon.</p>
+        </div>
+
+        <div x-show="page === 'accounts'">
+            <h2>Accounts</h2>
+            <p>Account overview coming soon.</p>
+        </div>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
