@@ -147,3 +147,28 @@ FOURSHARED_ACCOUNT_1_QUOTA_GB=15
 - Use 2 sub-agents:
   - One to carry out the work.
   - The other to verify if the work is being done according to plan.
+
+### Ticket Stories
+Before starting each PR, write a ticket story in `dev-tools/prompts/output/tickets/pr-number-slug.md`.
+Write it as a product or engineering management ask — not a retrospective. The format:
+
+```
+# Story: [Title]
+
+## Background
+[Why this work is needed. Business or product context.]
+
+## User Stories
+- As a [user], I want to [action] so that [benefit].
+
+## Acceptance Criteria
+- [ ] [Specific, testable condition]
+
+## Out of Scope
+- [What this PR explicitly does NOT include]
+
+## Technical Notes
+- [Constraints, dependencies, or implementation hints relevant to engineering]
+```
+
+This directory is not pushed to the repo (it's in .gitignore via dev-tools/).
