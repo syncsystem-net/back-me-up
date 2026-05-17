@@ -1,0 +1,38 @@
+server:
+  port: 8080
+  host: "localhost"
+
+database:
+  path: "backmeup.db"
+
+upload:
+  chunk_size_mb: 100
+  temp_dir: ""  # Empty means same level as source directory
+
+retry_policy:
+  max_attempts: 3
+  initial_backoff_seconds: 2
+  max_backoff_seconds: 60
+  backoff_multiplier: 2
+
+rate_limits:
+  mega:
+    requests_per_second: 10
+    bandwidth_mb_per_second: 5
+  fourshared:
+    requests_per_second: 5
+    bandwidth_mb_per_second: 3
+
+concurrency:
+  max_concurrent_uploads: 2
+  max_concurrent_per_account: 1
+  max_workers: 5
+
+quota:
+  sync_interval_minutes: 60
+  cache_in_db: true
+
+verification:
+  enabled: true
+  verify_on_upload: true
+  periodic_check_days: 30
