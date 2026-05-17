@@ -9,18 +9,18 @@ document.addEventListener('alpine:init', () => {
         creating: false,
         error: '',
 
-        get megaAccounts() {
+        megaAccounts() {
             return this.accounts.filter(a => a.provider === 'mega');
         },
-        get foursharedAccounts() {
+        foursharedAccounts() {
             return this.accounts.filter(a => a.provider === 'fourshared');
         },
-        get filteredBackups() {
+        filteredBackups() {
             if (!this.search) return this.backups;
             const q = this.search.toLowerCase();
             return this.backups.filter(b => b.title.toLowerCase().includes(q));
         },
-        get totalGB() {
+        totalGB() {
             let bytes = 0;
             for (const b of this.backups) {
                 for (const j of (b.jobs || [])) bytes += j.total_bytes || 0;

@@ -17,7 +17,7 @@
         </nav>
     </header>
 
-    <main>
+    <main x-cloak>
         <div x-show="page === 'backups'">
             <div class="page-toolbar">
                 <input type="text" class="search-input" placeholder="Search by title..." x-model="search">
@@ -34,7 +34,7 @@
                     </tr>
                 </thead>
                 <tbody>
-                    <template x-for="b in filteredBackups" :key="b.id">
+                    <template x-for="b in filteredBackups()" :key="b.id">
                         <tr>
                             <td colspan="4" style="padding:0; border:none;">
                                 <table style="width:100%; border-collapse:collapse;">
@@ -77,8 +77,8 @@
                         </tr>
                     </template>
                     <tr class="table-footer">
-                        <td colspan="2">Total backups: <strong x-text="filteredBackups.length"></strong></td>
-                        <td colspan="2">Total GB: <strong x-text="totalGB"></strong></td>
+                        <td colspan="2">Total backups: <strong x-text="filteredBackups().length"></strong></td>
+                        <td colspan="2">Total GB: <strong x-text="totalGB()"></strong></td>
                     </tr>
                 </tbody>
             </table>
@@ -106,18 +106,18 @@
                 <label>Source Path</label>
                 <input type="text" x-model="newBackup.source_path" placeholder="C:\path\to\directory">
             </div>
-            <div class="form-field" x-show="megaAccounts.length > 0">
+            <div class="form-field" x-show="megaAccounts().length > 0">
                 <label>MEGA Accounts</label>
-                <template x-for="a in megaAccounts" :key="a.id">
+                <template x-for="a in megaAccounts()" :key="a.id">
                     <div class="account-checkbox">
                         <input type="checkbox" :id="'acct-' + a.id" @change="toggleAccount(a.id)" :checked="newBackup.account_ids.includes(a.id)">
                         <label :for="'acct-' + a.id" x-text="a.email + ' (' + a.quota_total_gb + ' GB)'"></label>
                     </div>
                 </template>
             </div>
-            <div class="form-field" x-show="foursharedAccounts.length > 0">
+            <div class="form-field" x-show="foursharedAccounts().length > 0">
                 <label>4shared Accounts</label>
-                <template x-for="a in foursharedAccounts" :key="a.id">
+                <template x-for="a in foursharedAccounts()" :key="a.id">
                     <div class="account-checkbox">
                         <input type="checkbox" :id="'acct-' + a.id" @change="toggleAccount(a.id)" :checked="newBackup.account_ids.includes(a.id)">
                         <label :for="'acct-' + a.id" x-text="a.email + ' (' + a.quota_total_gb + ' GB)'"></label>
