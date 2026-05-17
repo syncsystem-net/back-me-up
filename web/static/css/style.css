@@ -54,3 +54,207 @@ h2 {
     margin-bottom: 1rem;
     font-size: 1.5rem;
 }
+
+.page-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1rem;
+}
+
+.search-input {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.table th {
+    background: #1a1a2e;
+    color: #fff;
+    padding: 0.75rem 1rem;
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.875rem;
+}
+
+.table td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+}
+
+.table tr.expandable {
+    cursor: pointer;
+}
+
+.table tr.expandable:hover td {
+    background: #f9f9f9;
+}
+
+.dir-tree {
+    font-size: 0.82rem;
+    color: #555;
+    background: #fafafa;
+    padding: 0.5rem 1rem;
+}
+
+.dir-level-1 {
+    padding: 0.2rem 0;
+    font-weight: 600;
+    padding-left: 0.5rem;
+}
+
+.dir-level-2 {
+    padding: 0.15rem 0;
+    padding-left: 2rem;
+    color: #777;
+}
+
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+.modal-card {
+    background: #fff;
+    border-radius: 8px;
+    padding: 2rem;
+    max-width: 480px;
+    width: 100%;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+}
+
+.modal-card h2 {
+    margin-bottom: 1.5rem;
+}
+
+.form-field {
+    margin-bottom: 1rem;
+}
+
+.form-field label {
+    display: block;
+    font-size: 0.875rem;
+    font-weight: 600;
+    margin-bottom: 0.35rem;
+    color: #444;
+}
+
+.form-field input[type="text"] {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+
+.account-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+    font-size: 0.875rem;
+}
+
+.form-error {
+    color: #c0392b;
+    font-size: 0.875rem;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem;
+    background: #fdecea;
+    border-radius: 4px;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: flex-end;
+    margin-top: 1.5rem;
+}
+
+.badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.2rem 0.55rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.badge-pending {
+    background: #fff3cd;
+    color: #856404;
+}
+
+.badge-in_progress {
+    background: #cce5ff;
+    color: #004085;
+}
+
+.badge-complete {
+    background: #d4edda;
+    color: #155724;
+}
+
+.badge-failed {
+    background: #f8d7da;
+    color: #721c24;
+}
+
+.table-footer td {
+    background: #f0f0f0;
+    font-size: 0.875rem;
+    color: #555;
+    border-bottom: none;
+}
+
+.btn {
+    display: inline-block;
+    padding: 0.5rem 1.1rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+}
+
+.btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: #1a1a2e;
+    color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: #2a2a4e;
+}
+
+.btn-secondary {
+    background: #e0e0e0;
+    color: #333;
+}
+
+.btn-secondary:hover:not(:disabled) {
+    background: #c8c8c8;
+}
