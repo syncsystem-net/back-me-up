@@ -7,12 +7,12 @@ import (
 )
 
 type DBAccount struct {
-	ID           int64
-	Provider     string
-	Email        string
-	QuotaTotalGB float64
-	QuotaUsedGB  float64
-	CreatedAt    time.Time
+	ID           int64     `json:"id"`
+	Provider     string    `json:"provider"`
+	Email        string    `json:"email"`
+	QuotaTotalGB float64   `json:"quota_total_gb"`
+	QuotaUsedGB  float64   `json:"quota_used_gb"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 func UpsertAccount(db *sql.DB, provider, email string, quotaTotalGB float64) (int64, error) {

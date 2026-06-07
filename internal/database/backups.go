@@ -7,10 +7,10 @@ import (
 )
 
 type Backup struct {
-	ID         int64
-	Title      string
-	SourcePath string
-	CreatedAt  time.Time
+	ID         int64     `json:"id"`
+	Title      string    `json:"title"`
+	SourcePath string    `json:"source_path"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func CreateBackup(tx *sql.Tx, title, sourcePath string) (int64, error) {

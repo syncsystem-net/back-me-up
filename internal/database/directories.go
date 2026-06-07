@@ -7,13 +7,13 @@ import (
 )
 
 type Directory struct {
-	ID        int64
-	BackupID  int64
-	Path      string
-	Name      string
-	Level     int
-	SizeBytes int64
-	CreatedAt time.Time
+	ID        int64     `json:"id"`
+	BackupID  int64     `json:"backup_id"`
+	Path      string    `json:"path"`
+	Name      string    `json:"name"`
+	Level     int       `json:"level"`
+	SizeBytes int64     `json:"size_bytes"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func InsertDirectories(tx *sql.Tx, backupID int64, dirs []Directory) error {

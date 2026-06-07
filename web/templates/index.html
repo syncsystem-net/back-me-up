@@ -103,8 +103,12 @@
                 <input type="text" x-model="newBackup.title" placeholder="Backup title">
             </div>
             <div class="form-field">
-                <label>Source Path</label>
-                <input type="text" x-model="newBackup.source_path" placeholder="C:\path\to\directory">
+                <label>Select Directory To Compress And Back Up</label>
+                <div class="path-input-row">
+                    <input type="text" x-model="newBackup.source_path" placeholder="C:\path\to\directory or /path/to/directory">
+                    <button type="button" class="btn btn-secondary" @click="$refs.dirPicker.click()">Browse</button>
+                </div>
+                <input type="file" x-ref="dirPicker" webkitdirectory style="display:none" @change="handleDirSelect($event)">
             </div>
             <div class="form-field" x-show="megaAccounts().length > 0">
                 <label>MEGA Accounts</label>

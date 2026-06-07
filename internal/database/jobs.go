@@ -7,15 +7,15 @@ import (
 )
 
 type Job struct {
-	ID         int64
-	BackupID   int64
-	AccountID  int64
-	Provider   string
-	Email      string
-	Status     string
-	ZipPath    string
-	TotalBytes int64
-	CreatedAt  time.Time
+	ID         int64     `json:"id"`
+	BackupID   int64     `json:"backup_id"`
+	AccountID  int64     `json:"account_id"`
+	Provider   string    `json:"provider"`
+	Email      string    `json:"email"`
+	Status     string    `json:"status"`
+	ZipPath    string    `json:"zip_path"`
+	TotalBytes int64     `json:"total_bytes"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func InsertJob(tx *sql.Tx, backupID, accountID int64, zipPath string, totalBytes int64) (int64, error) {
