@@ -48,9 +48,11 @@ func main() {
 
 func syncAccountsToDB(db *sql.DB, accts *accounts.AccountStore) error {
 	for _, a := range accts.Accounts {
+		slog.Info("syncing account", "provider", a.Provider, "email", a.Email, "quota_gb", a.QuotaGB)
 		if _, err := database.UpsertAccount(db, string(a.Provider), a.Email, a.QuotaGB); err != nil {
 			return err
 		}
 	}
+	slog.Info("accounts synced", "count", len(accts.Accounts))
 	return nil
 }

@@ -14,6 +14,7 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB) {
 
 	mux.HandleFunc("/api/health", h.Health)
 	mux.HandleFunc("/api/accounts", handlers.GetAccountsHandler(db))
+	mux.HandleFunc("/api/browse", handlers.BrowseHandler())
 	mux.HandleFunc("/api/backups", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:

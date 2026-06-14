@@ -41,20 +41,11 @@ document.addEventListener('alpine:init', () => {
             this.accounts = await r.json() || [];
         },
 
-        handleDirSelect(event) {
-            const files = event.target.files;
-            if (!files || files.length === 0) return;
-            const file = files[0];
-            if (file.path) {
-                const pathSep = file.path.includes('\\') ? '\\' : '/';
-                const pathParts = file.path.split(pathSep);
-                const relParts = file.webkitRelativePath.split('/');
-                const dirParts = pathParts.slice(0, pathParts.length - (relParts.length - 1));
-                this.newBackup.source_path = dirParts.join(pathSep);
-            } else if (file.webkitRelativePath) {
-                this.newBackup.source_path = file.webkitRelativePath.split('/')[0];
-            }
-            event.target.value = '';
+        async browsePath() {
+            const r = await fetch('/api/browse');
+            if (!r.ok) return;
+            const { path } = await r.json();
+            if (path) this.newBackup.source_path = path;
         },
 
         toggleAccount(id) {

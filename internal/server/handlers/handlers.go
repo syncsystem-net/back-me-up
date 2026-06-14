@@ -235,6 +235,17 @@ func PostBackupsHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+func BrowseHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path, err := openFolderDialog()
+		if err != nil {
+			slog.Warn("folder picker error", "error", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"path": path})
+	}
+}
+
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
