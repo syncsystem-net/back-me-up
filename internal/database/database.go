@@ -42,9 +42,10 @@ func migrate(db *sql.DB) error {
 	return err
 }
 
-// migrateAccountsUniqueConstraint drops the accounts table when it still uses
-// the old single-column UNIQUE on email. Accounts are always re-synced from
-// .env on startup so the table can be safely recreated.
+// migrateAccountsUniqueConstraint recreates the accounts table with the
+// correct UNIQUE(provider, email) constraint. Jobs rows are deleted first
+// because they hold FK references to accounts. Accounts are always re-synced
+// from .env on startup so data loss here is safe.
 func migrateAccountsUniqueConstraint(db *sql.DB) error {
 	var tableSQL string
 	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'`).Scan(&tableSQL)
@@ -57,9 +58,16 @@ func migrateAccountsUniqueConstraint(db *sql.DB) error {
 	if strings.Contains(tableSQL, "UNIQUE(provider, email)") {
 		return nil // already on new constraint
 	}
-	slog.Info("migrating accounts table: updating unique constraint to (provider, email)")
-	_, err = db.Exec(`DROP TABLE IF EXISTS accounts`)
-	return err
+	slog.Info("migrating accounts table: clearing jobs and recreating with (provider, email) unique constraint")
+	// jobs.account_id references accounts — delete them first so the FK
+	// constraint does not block the DROP TABLE below.
+	if _, err = db.Exec(`DELETE FROM jobs`); err != nil {
+		return fmt.Errorf("clearing jobs for migration: %w", err)
+	}
+	if _, err = db.Exec(`DROP TABLE IF EXISTS accounts`); err != nil {
+		return fmt.Errorf("dropping accounts table: %w", err)
+	}
+	return nil
 }
 
 const schema = `
