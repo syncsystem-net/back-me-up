@@ -35,6 +35,8 @@ func main() {
 	}
 	defer db.Close()
 
+	slog.Info("main account (db backup only, not shown in UI)", "provider", accts.Main.Provider, "email", accts.Main.Email)
+
 	if err := syncAccountsToDB(db, accts); err != nil {
 		slog.Warn("failed to sync accounts to database", "error", err)
 	}

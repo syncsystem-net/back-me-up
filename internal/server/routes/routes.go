@@ -8,7 +8,11 @@ import (
 )
 
 func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB) {
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("web/static"))))
+	staticFS := http.StripPrefix("/static/", http.FileServer(http.Dir("web/static")))
+	mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		staticFS.ServeHTTP(w, r)
+	}))
 
 	mux.HandleFunc("/", h.Home)
 
