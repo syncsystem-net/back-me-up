@@ -7,6 +7,7 @@ document.addEventListener('alpine:init', () => {
         showNewModal: false,
         newBackup: { title: '', source_path: '', account_ids: [] },
         creating: false,
+        browseLoading: false,
         error: '',
 
         megaAccounts() {
@@ -42,10 +43,15 @@ document.addEventListener('alpine:init', () => {
         },
 
         async browsePath() {
-            const r = await fetch('/api/browse');
-            if (!r.ok) return;
-            const { path } = await r.json();
-            if (path) this.newBackup.source_path = path;
+            this.browseLoading = true;
+            try {
+                const r = await fetch('/api/browse');
+                if (!r.ok) return;
+                const { path } = await r.json();
+                if (path) this.newBackup.source_path = path;
+            } finally {
+                this.browseLoading = false;
+            }
         },
 
         toggleAccount(id) {

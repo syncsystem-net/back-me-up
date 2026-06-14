@@ -91,7 +91,31 @@
 
         <div x-show="page === 'accounts'">
             <h2>Accounts</h2>
-            <p>Account overview coming soon.</p>
+            <template x-if="accounts.length === 0">
+                <p style="color:#888;">No accounts found. Check your .env file — numbered accounts like <code>MEGA_ACCOUNT_1_EMAIL</code> appear here.</p>
+            </template>
+            <template x-if="accounts.length > 0">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Provider</th>
+                            <th>Email</th>
+                            <th>Quota Total (GB)</th>
+                            <th>Quota Used (GB)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="a in accounts" :key="a.id">
+                            <tr>
+                                <td x-text="a.provider"></td>
+                                <td x-text="a.email"></td>
+                                <td x-text="a.quota_total_gb"></td>
+                                <td x-text="a.quota_used_gb"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </template>
         </div>
     </main>
 
@@ -106,7 +130,7 @@
                 <label>Select Directory To Compress And Back Up</label>
                 <div class="path-input-row">
                     <input type="text" x-model="newBackup.source_path" placeholder="C:\path\to\directory or /path/to/directory">
-                    <button type="button" class="btn btn-secondary" @click="browsePath()">Browse</button>
+                    <button type="button" class="btn btn-secondary" @click="browsePath()" :disabled="browseLoading" x-text="browseLoading ? 'Opening…' : 'Browse'"></button>
                 </div>
             </div>
             <div class="form-field" x-show="megaAccounts().length > 0">

@@ -9,14 +9,17 @@ import (
 )
 
 func openFolderDialog() (string, error) {
+	// TopMost owner form forces the dialog in front of the browser window.
 	script := `Add-Type -AssemblyName System.Windows.Forms; ` +
 		`$f = New-Object System.Windows.Forms.FolderBrowserDialog; ` +
 		`$f.Description = 'Select folder to backup'; ` +
 		`$f.ShowNewFolderButton = $false; ` +
-		`if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }`
+		`$owner = New-Object System.Windows.Forms.Form; ` +
+		`$owner.TopMost = $true; ` +
+		`if ($f.ShowDialog($owner) -eq 'OK') { Write-Output $f.SelectedPath }`
 
 	cmd := exec.Command("powershell",
-		"-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+		"-NoProfile", "-STA", "-ExecutionPolicy", "Bypass",
 		"-Command", script)
 	out, err := cmd.Output()
 	if err != nil {

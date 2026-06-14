@@ -76,6 +76,13 @@ FOURSHARED_ACCOUNT_1_QUOTA_GB=15
 
 The `MAIN_ACCOUNT` is intentionally excluded from the backup modal — it is reserved for database backup only.
 
+## Development Workflow
+After each update, do the following:
+- Terminal: Ctrl + c (if the application is running)
+- `go run ./cmd/server`
+- Open `http://localhost:8080` in your browser.
+- Browser: Ctrl+Shift+R
+
 ## Troubleshooting
 
 - **"no .env file loaded"**: Copy `.env.example` to `.env` and fill in your credentials.
