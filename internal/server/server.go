@@ -28,7 +28,7 @@ func New(cfg *config.Config, db *sql.DB, accts *accounts.AccountStore) *Server {
 	}
 
 	h := handlers.New(db, accts)
-	routes.Register(s.mux, h)
+	routes.Register(s.mux, h, db)
 
 	return s
 }

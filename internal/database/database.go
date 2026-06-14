@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -34,8 +35,39 @@ func Open(dbPath string) (*sql.DB, error) {
 }
 
 func migrate(db *sql.DB) error {
+	if err := migrateAccountsUniqueConstraint(db); err != nil {
+		return fmt.Errorf("accounts migration: %w", err)
+	}
 	_, err := db.Exec(schema)
 	return err
+}
+
+// migrateAccountsUniqueConstraint recreates the accounts table with the
+// correct UNIQUE(provider, email) constraint. Jobs rows are deleted first
+// because they hold FK references to accounts. Accounts are always re-synced
+// from .env on startup so data loss here is safe.
+func migrateAccountsUniqueConstraint(db *sql.DB) error {
+	var tableSQL string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'`).Scan(&tableSQL)
+	if err == sql.ErrNoRows {
+		return nil // table does not exist yet; schema will create it
+	}
+	if err != nil {
+		return fmt.Errorf("checking accounts schema: %w", err)
+	}
+	if strings.Contains(tableSQL, "UNIQUE(provider, email)") {
+		return nil // already on new constraint
+	}
+	slog.Info("migrating accounts table: clearing jobs and recreating with (provider, email) unique constraint")
+	// jobs.account_id references accounts — delete them first so the FK
+	// constraint does not block the DROP TABLE below.
+	if _, err = db.Exec(`DELETE FROM jobs`); err != nil {
+		return fmt.Errorf("clearing jobs for migration: %w", err)
+	}
+	if _, err = db.Exec(`DROP TABLE IF EXISTS accounts`); err != nil {
+		return fmt.Errorf("dropping accounts table: %w", err)
+	}
+	return nil
 }
 
 const schema = `
@@ -60,11 +92,12 @@ CREATE TABLE IF NOT EXISTS backup_directories (
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
     quota_total_gb REAL DEFAULT 0,
     quota_used_gb REAL DEFAULT 0,
     last_quota_sync DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider, email)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (

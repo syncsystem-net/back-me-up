@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"log/slog"
 	"os"
 
@@ -34,9 +35,26 @@ func main() {
 	}
 	defer db.Close()
 
+	slog.Info("main account (db backup only, not shown in UI)", "provider", accts.Main.Provider, "email", accts.Main.Email)
+
+	if err := syncAccountsToDB(db, accts); err != nil {
+		slog.Warn("failed to sync accounts to database", "error", err)
+	}
+
 	srv := server.New(cfg, db, accts)
 	if err := srv.Start(); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func syncAccountsToDB(db *sql.DB, accts *accounts.AccountStore) error {
+	for _, a := range accts.Accounts {
+		slog.Info("syncing account", "provider", a.Provider, "email", a.Email, "quota_gb", a.QuotaGB)
+		if _, err := database.UpsertAccount(db, string(a.Provider), a.Email, a.QuotaGB); err != nil {
+			return err
+		}
+	}
+	slog.Info("accounts synced", "count", len(accts.Accounts))
+	return nil
 }

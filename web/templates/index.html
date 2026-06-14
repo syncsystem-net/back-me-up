@@ -7,20 +7,81 @@
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
-<body x-data="app()">
+<body x-data="app">
     <header>
         <h1>BackMeUp</h1>
         <nav>
-            <a href="/" :class="{ active: page === 'home' }" @click.prevent="page = 'home'">Backups</a>
+            <a href="/" :class="{ active: page === 'backups' }" @click.prevent="page = 'backups'">Backups</a>
             <a href="#" :class="{ active: page === 'jobs' }" @click.prevent="page = 'jobs'">Jobs</a>
             <a href="#" :class="{ active: page === 'accounts' }" @click.prevent="page = 'accounts'">Accounts</a>
         </nav>
     </header>
 
-    <main>
-        <div x-show="page === 'home'">
-            <h2>Backups</h2>
-            <p>Backup management coming in the next PR.</p>
+    <main x-cloak>
+        <div x-show="page === 'backups'">
+            <div class="page-toolbar">
+                <input type="text" class="search-input" placeholder="Search by title..." x-model="search">
+                <button class="btn btn-primary" @click="showNewModal = true; error = ''">New Backup</button>
+            </div>
+
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Title</th>
+                        <th>Created</th>
+                        <th>MEGA</th>
+                        <th>4shared</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="b in filteredBackups()" :key="b.id">
+                        <tr>
+                            <td colspan="4" style="padding:0; border:none;">
+                                <table style="width:100%; border-collapse:collapse;">
+                                    <tbody>
+                                        <tr class="expandable" @click="b.expanded = !b.expanded">
+                                            <td x-text="b.title"></td>
+                                            <td x-text="new Date(b.created_at).toLocaleDateString()"></td>
+                                            <td>
+                                                <template x-if="jobStatus(b, 'mega')">
+                                                    <span :class="'badge badge-' + jobStatus(b, 'mega')" x-text="jobStatus(b, 'mega')"></span>
+                                                </template>
+                                                <template x-if="!jobStatus(b, 'mega')">
+                                                    <span>&mdash;</span>
+                                                </template>
+                                            </td>
+                                            <td>
+                                                <template x-if="jobStatus(b, 'fourshared')">
+                                                    <span :class="'badge badge-' + jobStatus(b, 'fourshared')" x-text="jobStatus(b, 'fourshared')"></span>
+                                                </template>
+                                                <template x-if="!jobStatus(b, 'fourshared')">
+                                                    <span>&mdash;</span>
+                                                </template>
+                                            </td>
+                                        </tr>
+                                        <tr x-show="b.expanded">
+                                            <td colspan="4" class="dir-tree">
+                                                <template x-for="d1 in dirLevel1(b)" :key="d1.id">
+                                                    <div>
+                                                        <div class="dir-level-1" x-text="d1.name"></div>
+                                                        <template x-for="d2 in dirLevel2(b, d1.path)" :key="d2.id">
+                                                            <div class="dir-level-2" x-text="d2.name"></div>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </td>
+                        </tr>
+                    </template>
+                    <tr class="table-footer">
+                        <td colspan="2">Total backups: <strong x-text="filteredBackups().length"></strong></td>
+                        <td colspan="2">Total GB: <strong x-text="totalGB()"></strong></td>
+                    </tr>
+                </tbody>
+            </table>
         </div>
 
         <div x-show="page === 'jobs'">
@@ -30,9 +91,73 @@
 
         <div x-show="page === 'accounts'">
             <h2>Accounts</h2>
-            <p>Account overview coming soon.</p>
+            <template x-if="accounts.length === 0">
+                <p style="color:#888;">No accounts found. Check your .env file — numbered accounts like <code>MEGA_ACCOUNT_1_EMAIL</code> appear here.</p>
+            </template>
+            <template x-if="accounts.length > 0">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Provider</th>
+                            <th>Email</th>
+                            <th>Quota Total (GB)</th>
+                            <th>Quota Used (GB)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="a in accounts" :key="a.id">
+                            <tr>
+                                <td x-text="a.provider"></td>
+                                <td x-text="a.email"></td>
+                                <td x-text="a.quota_total_gb"></td>
+                                <td x-text="a.quota_used_gb"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </template>
         </div>
     </main>
+
+    <div x-show="showNewModal" class="modal-overlay" @click.self="showNewModal = false">
+        <div class="modal-card">
+            <h2>New Backup</h2>
+            <div class="form-field">
+                <label>Title</label>
+                <input type="text" x-model="newBackup.title" placeholder="Backup title">
+            </div>
+            <div class="form-field">
+                <label>Select Directory To Compress And Back Up</label>
+                <div class="path-input-row">
+                    <input type="text" x-model="newBackup.source_path" placeholder="C:\path\to\directory or /path/to/directory">
+                    <button type="button" class="btn btn-secondary" @click="browsePath()" :disabled="browseLoading" x-text="browseLoading ? 'Opening…' : 'Browse'"></button>
+                </div>
+            </div>
+            <div class="form-field" x-show="megaAccounts().length > 0">
+                <label>MEGA Accounts</label>
+                <template x-for="a in megaAccounts()" :key="a.id">
+                    <div class="account-checkbox">
+                        <input type="checkbox" :id="'acct-' + a.id" @change="toggleAccount(a.id)" :checked="newBackup.account_ids.includes(a.id)">
+                        <label :for="'acct-' + a.id" x-text="a.email + ' (' + a.quota_total_gb + ' GB)'"></label>
+                    </div>
+                </template>
+            </div>
+            <div class="form-field" x-show="foursharedAccounts().length > 0">
+                <label>4shared Accounts</label>
+                <template x-for="a in foursharedAccounts()" :key="a.id">
+                    <div class="account-checkbox">
+                        <input type="checkbox" :id="'acct-' + a.id" @change="toggleAccount(a.id)" :checked="newBackup.account_ids.includes(a.id)">
+                        <label :for="'acct-' + a.id" x-text="a.email + ' (' + a.quota_total_gb + ' GB)'"></label>
+                    </div>
+                </template>
+            </div>
+            <div class="form-error" x-show="error" x-text="error"></div>
+            <div class="modal-actions">
+                <button class="btn btn-primary" @click="createBackup()" :disabled="creating" x-text="creating ? 'Creating...' : 'Create Backup'"></button>
+                <button class="btn btn-secondary" @click="showNewModal = false">Cancel</button>
+            </div>
+        </div>
+    </div>
 
     <script src="/static/js/app.js"></script>
 </body>
