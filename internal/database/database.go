@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -34,7 +35,30 @@ func Open(dbPath string) (*sql.DB, error) {
 }
 
 func migrate(db *sql.DB) error {
+	if err := migrateAccountsUniqueConstraint(db); err != nil {
+		return fmt.Errorf("accounts migration: %w", err)
+	}
 	_, err := db.Exec(schema)
+	return err
+}
+
+// migrateAccountsUniqueConstraint drops the accounts table when it still uses
+// the old single-column UNIQUE on email. Accounts are always re-synced from
+// .env on startup so the table can be safely recreated.
+func migrateAccountsUniqueConstraint(db *sql.DB) error {
+	var tableSQL string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='accounts'`).Scan(&tableSQL)
+	if err == sql.ErrNoRows {
+		return nil // table does not exist yet; schema will create it
+	}
+	if err != nil {
+		return fmt.Errorf("checking accounts schema: %w", err)
+	}
+	if strings.Contains(tableSQL, "UNIQUE(provider, email)") {
+		return nil // already on new constraint
+	}
+	slog.Info("migrating accounts table: updating unique constraint to (provider, email)")
+	_, err = db.Exec(`DROP TABLE IF EXISTS accounts`)
 	return err
 }
 
@@ -60,11 +84,12 @@ CREATE TABLE IF NOT EXISTS backup_directories (
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
     quota_total_gb REAL DEFAULT 0,
     quota_used_gb REAL DEFAULT 0,
     last_quota_sync DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider, email)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (

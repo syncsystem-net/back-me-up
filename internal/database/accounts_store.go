@@ -18,7 +18,7 @@ type DBAccount struct {
 func UpsertAccount(db *sql.DB, provider, email string, quotaTotalGB float64) (int64, error) {
 	_, err := db.Exec(
 		`INSERT INTO accounts (provider, email, quota_total_gb) VALUES (?, ?, ?)
-		 ON CONFLICT(email) DO UPDATE SET provider=excluded.provider, quota_total_gb=excluded.quota_total_gb`,
+		 ON CONFLICT(provider, email) DO UPDATE SET quota_total_gb=excluded.quota_total_gb`,
 		provider, email, quotaTotalGB,
 	)
 	if err != nil {
@@ -26,7 +26,7 @@ func UpsertAccount(db *sql.DB, provider, email string, quotaTotalGB float64) (in
 	}
 
 	var id int64
-	if err := db.QueryRow(`SELECT id FROM accounts WHERE email = ?`, email).Scan(&id); err != nil {
+	if err := db.QueryRow(`SELECT id FROM accounts WHERE provider = ? AND email = ?`, provider, email).Scan(&id); err != nil {
 		return 0, fmt.Errorf("getting account id: %w", err)
 	}
 	return id, nil
