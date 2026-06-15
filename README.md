@@ -2,6 +2,17 @@
 
 Backup tool that zips local directories and uploads them to cloud storage providers (MEGA, 4shared). Manage multiple accounts, track upload jobs, and verify file integrity.
 
+## Features
+
+- Point at a directory, give the backup a title, and pick one or more cloud accounts to upload to.
+- Each backup is zipped (named after the directory) and scanned two levels deep; the subdirectory tree is recorded and shown in an expandable row.
+- A background worker pool uploads in chunks with live progress (polled every 2s), automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit.
+- On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to your main account.
+- Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
+- Providers are pluggable: MEGA (email/password) and 4shared (OAuth 1.0) today, with a registry so new backends are a focused addition.
+
+Not yet implemented (planned): Download/Delete actions on uploaded backups, overwrite-on-conflict prompts, the subdirectory search bar, and the standalone "Accounts available" view.
+
 ## Prerequisites
 
 - Go 1.21+
@@ -39,6 +50,7 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 ```
 cmd/server/            - Application entry point (HTTP server + worker pool)
 cmd/fourshared-auth/   - One-time OAuth helper to authorize a 4shared account
+cmd/fourshared-test/   - Diagnostic: tests one 4shared account's credentials in isolation
 internal/
   config/              - YAML configuration loader
   accounts/            - .env account parser (passwords + OAuth app/tokens)
@@ -56,6 +68,25 @@ web/
   templates/           - HTML templates (Alpine.js)
   static/              - CSS, JS assets
 ```
+
+## Configuration (config.yml)
+
+Application behavior is tuned in `config.yml`; every value has a sensible default if omitted.
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `server.host` / `server.port` | `localhost` / `8080` | HTTP listen address |
+| `database.path` | `backmeup.db` | SQLite file location |
+| `upload.chunk_size_mb` | `100` | Upload chunk size (MEGA dictates its own; applies to providers that chunk) |
+| `upload.temp_dir` | `""` | Where zips are staged; empty = same level as the source directory |
+| `retry_policy.*` | `3` attempts, 2s→60s backoff, ×2 | Per-job retry with exponential backoff |
+| `concurrency.max_workers` | `5` | Worker pool goroutine count (claimers) |
+| `concurrency.max_concurrent_uploads` | `2` | Hard ceiling on simultaneous uploads across all accounts |
+| `concurrency.max_concurrent_per_account` | `1` | Simultaneous uploads per single account |
+| `verification.enabled` / `verify_on_upload` | `true` / `true` | Download the first chunk and compare checksum after upload |
+| `quota.sync_interval_minutes` | `60` | (Reserved) periodic quota polling; quota currently refreshes on job completion |
+
+Credentials are **not** in `config.yml` — they live in `.env` (see below).
 
 ## .env Account Structure
 

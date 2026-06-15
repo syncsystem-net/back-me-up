@@ -109,24 +109,32 @@ Note: Consult me for anything else needed.
 
 ### .env File Format:
 
+Note: single-quote any value containing `$`, `#`, backticks, or spaces (godotenv
+expands unquoted/double-quoted values — see Technical Notes). The full 4shared
+credential walkthrough lives in README.md → "Provider credentials".
+
 # Main account for database backup
 MAIN_ACCOUNT_PROVIDER=mega
 MAIN_ACCOUNT_EMAIL=main@example.com
-MAIN_ACCOUNT_PASSWORD=encryptedpass123
+MAIN_ACCOUNT_PASSWORD='secret'
 
-# MEGA accounts (numbered)
+# MEGA accounts (numbered) — password login, no app registration
 MEGA_ACCOUNT_1_EMAIL=mega1@example.com
-MEGA_ACCOUNT_1_PASSWORD=pass1
+MEGA_ACCOUNT_1_PASSWORD='pass1'
 MEGA_ACCOUNT_1_QUOTA_GB=20
 
-MEGA_ACCOUNT_2_EMAIL=mega2@example.com
-MEGA_ACCOUNT_2_PASSWORD=pass2
-MEGA_ACCOUNT_2_QUOTA_GB=20
-
-# 4shared accounts
+# 4shared accounts (numbered) — OAuth 1.0, per-account registered app.
+# CONSUMER_* come from registering the app; OAUTH_TOKEN/SECRET are produced by
+#   go run ./cmd/fourshared-auth -account 1
+# CONSUMER_DOMAIN must be a real domain pointed at 127.0.0.1 (4shared rejects localhost).
 FOURSHARED_ACCOUNT_1_EMAIL=4s1@example.com
-FOURSHARED_ACCOUNT_1_PASSWORD=pass3
+FOURSHARED_ACCOUNT_1_PASSWORD='pass3'
 FOURSHARED_ACCOUNT_1_QUOTA_GB=15
+FOURSHARED_ACCOUNT_1_CONSUMER_KEY=...
+FOURSHARED_ACCOUNT_1_CONSUMER_SECRET=...
+FOURSHARED_ACCOUNT_1_CONSUMER_DOMAIN=backmeup.example.com
+FOURSHARED_ACCOUNT_1_OAUTH_TOKEN=...
+FOURSHARED_ACCOUNT_1_OAUTH_TOKEN_SECRET=...
 
 # Add more as needed...
 
@@ -138,6 +146,7 @@ FOURSHARED_ACCOUNT_1_QUOTA_GB=15
 ## Workflow
 - Divide each chunk of the work into PRs.
 - For every chunk, create a new branch.
+- **PRs are NOT stacked — each PR targets `main`.** I merge each PR into `main` and pull local `main` before the next phase, so every new branch is cut from `main` and its PR uses `--base main`. Do **not** base a new PR on the previous `pr/N` branch. Before opening a PR, sanity-check with `git diff --stat main..<branch>` (should show only the new work) and `git merge-base --is-ancestor pr/<prev> main` (prior PR already merged).
 - Build commits however it makes better sense.
 - Push the commits however it makes sense.
 - Let me manually validate each chunk of work / PR before moving to the next one.
@@ -294,3 +303,61 @@ msg="syncing account" provider=mega email=...
 msg="syncing account" provider=fourshared email=...
 msg="accounts synced" count=2
 ```
+
+---
+
+### Cloud provider integration (architecture)
+
+Providers live behind a small abstraction so adding one is a focused change:
+
+- `internal/provider/provider.go` — the `Provider` interface plus `Progress`, `Config`, `OAuthCreds` types. No concrete imports.
+- `internal/provider/<name>/` — one subpackage per backend (`mega`, `fourshared`), each implementing `Provider`.
+- `internal/provider/registry/` — maps a provider name to its implementation (`New(name, oauth, cfg)`). This is the only place that imports the concrete packages, so the worker depends on the interface, never on a backend.
+- `internal/provider/oauth1/` — reusable OAuth 1.0a HMAC-SHA1 request signing for any OAuth provider.
+
+Adding a provider = implement `Provider` in a new subpackage + add one `case` in the registry. Credentials are never stored in the DB; the worker matches a job's `account_id` (provider+email) to the in-memory `AccountStore` to get the password/token.
+
+---
+
+### MEGA provider
+
+- Library: `github.com/t3rm1n4l/go-mega` (handles MEGA's encryption). Password login.
+- **`"Object (typically, node or user) not found"` at login means invalid credentials** — most often the `.env` `$`-expansion gotcha below, occasionally an unregistered email. **2FA is not supported** (go-mega has a separate `MultiFactorLogin` we don't call).
+- Chunk-level upload: `NewUpload` → `Chunks()`/`ChunkLocation(id)`/`UploadChunk(id, ...)`/`Finish()`. MEGA dictates its own chunk boundaries (the `upload.chunk_size_mb` config does not apply to it). The node hash (`node.GetHash()`) is the stored remote ref; `fs.HashLookup(hash)` resolves it for download/delete.
+
+---
+
+### 4shared provider (the hard one)
+
+4shared's API is sparsely documented and full of surprises. Hard-won facts:
+
+- **It is OAuth 1.0, not 1.0a.** The authorize callback returns only `oauth_token` and **no `oauth_verifier`**; the access-token exchange is signed with the request token and must **not** send `oauth_verifier`. (`cmd/fourshared-auth` treats the callback's arrival as the completion signal.)
+- **Per-account application.** Each 4shared account is authorized through its own registered app: `FOURSHARED_ACCOUNT_<n>_CONSUMER_KEY` / `_CONSUMER_SECRET` / `_CONSUMER_DOMAIN` / `_OAUTH_TOKEN` / `_OAUTH_TOKEN_SECRET`. A shared `FOURSHARED_CONSUMER_KEY/SECRET` is an optional fallback.
+- **Callback domain.** 4shared **rejects `localhost`** as an Application domain ("Invalid application domain"), and its out-of-band PIN page is broken (Allow → "Invalid token"). Register a real domain pointed at `127.0.0.1` (DNS A record or hosts file); `cmd/fourshared-auth` runs a local server on `127.0.0.1:<port>` to capture the redirect automatically.
+- **POST/PUT params go in the body, not the query string** (else `400.0504 "The parameters must be in the body..."`). Send them form-encoded (`application/x-www-form-urlencoded`); form-body params are part of the OAuth signature base string, so set `req.Form` before signing.
+- **Chunked upload flow:** `POST upload.4shared.com/v1_2/upload` (form: `name`, `folderId`, `size`) returns a FileResponse whose **`id` is the permanent file id** — reused for every chunk and for later download/delete. Chunks go to `POST /upload/{id}` with a `Content-Range` header; **308 = "resume incomplete" (more chunks), 201 = complete**, and neither response carries an id. **Do not let Go's HTTP client auto-follow the 308 as a redirect** — set `CheckRedirect` to `http.ErrUseLastResponse` for `/upload/` requests.
+- `GET api.4shared.com/v1_2/user` returns quota (`totalSpace`/`freeSpace`) and `rootFolderId`. Folder listing: `GET /folder/{id}/files`; delete: `DELETE /files/{id}`.
+- **Diagnostics:** `go run ./cmd/fourshared-test -account <n>` checks one account's creds in isolation; `FOURSHARED_DEBUG=1` logs the OAuth signature base string, Authorization header, and raw responses. Reach for these before guessing.
+- **`401 ... "token ... does not exist"`** usually means a **stale token** — re-authorizing an app invalidates the previous token. Re-run `cmd/fourshared-auth`.
+
+---
+
+### .env credentials and special characters
+
+**`godotenv` expands `$` in unquoted AND double-quoted values.** A password like `paSs1$2178` silently becomes `paSs1` (everything from `$` is treated as a variable reference). This is a top cause of "wrong credentials" failures (e.g. MEGA's "Object not found").
+
+Wrap any value with `$`, `#`, backticks, or spaces in **single** quotes (double quotes still expand):
+```env
+MEGA_ACCOUNT_1_PASSWORD='paSs1$2178'
+```
+OAuth tokens/consumer keys are hex and don't need quoting.
+
+---
+
+### Background upload worker
+
+- `internal/worker` owns the pool. Sizing: pool goroutines = `concurrency.max_workers`; a global semaphore caps simultaneous uploads at `concurrency.max_concurrent_uploads`; a per-account semaphore enforces `concurrency.max_concurrent_per_account`.
+- Jobs are claimed atomically with `UPDATE jobs SET status='in_progress' ... WHERE id=(SELECT ... WHERE status='pending' ... LIMIT 1) RETURNING id` so no two workers take the same job.
+- **Resume is whole-file, not chunk-level.** Provider upload sessions can't be reconstructed across a process restart, so `RequeueStaleJobs` resets `in_progress`→`pending` at startup and the job re-uploads from 0 (progress is reset per attempt). Chunk-level resume only happens within a single in-process attempt.
+- On success: verify the first chunk's checksum, refresh that account's quota, mark complete, then delete the temp zip **only when every sibling job sharing that zip is complete** (a failed sibling keeps it for retry), and back up the metadata DB to the main account.
+- The UI shows a **"verifying"** label when bytes are 100% uploaded but the job is still `in_progress` (post-upload checksum/finalize), so the bar doesn't look stuck.
