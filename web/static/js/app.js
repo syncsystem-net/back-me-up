@@ -10,6 +10,14 @@ document.addEventListener('alpine:init', () => {
         browseLoading: false,
         error: '',
 
+        // Expanded accordion rows survive the 2s polling refresh.
+        expandedIds: [],
+
+        // Logs modal state.
+        showLogsModal: false,
+        logsTitle: '',
+        logs: [],
+
         megaAccounts() {
             return this.accounts.filter(a => a.provider === 'mega');
         },
@@ -31,15 +39,34 @@ document.addEventListener('alpine:init', () => {
 
         async init() {
             await Promise.all([this.loadBackups(), this.loadAccounts()]);
+            // Poll for live progress every 2s.
+            setInterval(() => this.refresh(), 2000);
+        },
+        async refresh() {
+            if (document.hidden) return;
+            await this.loadBackups();
+            // Refresh quota numbers only while uploads are active (cheap, avoids churn).
+            if (this.hasActiveJobs()) await this.loadAccounts();
         },
         async loadBackups() {
             const r = await fetch('/api/backups');
             const data = await r.json();
-            this.backups = (data || []).map(b => ({ ...b, expanded: false }));
+            this.backups = (data || []).map(b => ({ ...b, expanded: this.expandedIds.includes(b.id) }));
         },
         async loadAccounts() {
             const r = await fetch('/api/accounts');
             this.accounts = await r.json() || [];
+        },
+
+        hasActiveJobs() {
+            return this.backups.some(b => (b.jobs || []).some(j => j.status === 'pending' || j.status === 'in_progress'));
+        },
+
+        toggleExpand(b) {
+            b.expanded = !b.expanded;
+            const idx = this.expandedIds.indexOf(b.id);
+            if (b.expanded && idx === -1) this.expandedIds.push(b.id);
+            if (!b.expanded && idx !== -1) this.expandedIds.splice(idx, 1);
         },
 
         async browsePath() {
@@ -82,13 +109,47 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        providerJobs(backup, provider) {
+            return (backup.jobs || []).filter(j => j.provider === provider);
+        },
         jobStatus(backup, provider) {
-            const jobs = (backup.jobs || []).filter(j => j.provider === provider);
+            const jobs = this.providerJobs(backup, provider);
             if (jobs.length === 0) return null;
             if (jobs.some(j => j.status === 'failed')) return 'failed';
             if (jobs.some(j => j.status === 'in_progress')) return 'in_progress';
             if (jobs.every(j => j.status === 'complete')) return 'complete';
             return 'pending';
+        },
+        // Display label: once bytes are fully uploaded but the job is still
+        // in_progress, it's verifying the checksum / finalizing — surface that so
+        // the bar doesn't appear stuck at 100%.
+        displayStatus(backup, provider) {
+            const s = this.jobStatus(backup, provider);
+            if (s === 'in_progress' && this.jobProgress(backup, provider) >= 100) return 'verifying';
+            return s;
+        },
+        // Aggregate upload percentage across a provider's jobs (0-100), or null.
+        jobProgress(backup, provider) {
+            const jobs = this.providerJobs(backup, provider);
+            if (jobs.length === 0) return null;
+            let uploaded = 0, total = 0;
+            for (const j of jobs) { uploaded += j.uploaded_bytes || 0; total += j.total_bytes || 0; }
+            if (total === 0) return 0;
+            return Math.min(100, Math.round((uploaded / total) * 100));
+        },
+
+        async openLogs(backup, provider) {
+            const jobs = this.providerJobs(backup, provider);
+            this.logsTitle = `${provider} logs — ${backup.title}`;
+            this.logs = [];
+            this.showLogsModal = true;
+            for (const j of jobs) {
+                const r = await fetch(`/api/jobs/${j.id}/logs`);
+                if (!r.ok) continue;
+                const lines = await r.json() || [];
+                for (const l of lines) this.logs.push({ ...l, email: j.email });
+            }
+            this.logs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
         },
 
         dirLevel1(backup) {

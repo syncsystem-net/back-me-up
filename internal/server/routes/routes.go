@@ -29,4 +29,5 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB) {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("GET /api/jobs/{id}/logs", handlers.GetJobLogsHandler(db))
 }
