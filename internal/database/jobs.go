@@ -15,6 +15,7 @@ type Job struct {
 	Status         string    `json:"status"`
 	ZipPath        string    `json:"zip_path"`
 	RemotePath     string    `json:"remote_path"`
+	RemoteName     string    `json:"remote_name"`
 	TotalBytes     int64     `json:"total_bytes"`
 	UploadedBytes  int64     `json:"uploaded_bytes"`
 	ChunksTotal    int       `json:"chunks_total"`
@@ -23,10 +24,10 @@ type Job struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-func InsertJob(tx *sql.Tx, backupID, accountID int64, zipPath string, totalBytes int64) (int64, error) {
+func InsertJob(tx *sql.Tx, backupID, accountID int64, zipPath, remoteName string, totalBytes int64) (int64, error) {
 	res, err := tx.Exec(
-		`INSERT INTO jobs (backup_id, account_id, zip_path, total_bytes) VALUES (?, ?, ?, ?)`,
-		backupID, accountID, zipPath, totalBytes,
+		`INSERT INTO jobs (backup_id, account_id, zip_path, remote_name, total_bytes) VALUES (?, ?, ?, ?, ?)`,
+		backupID, accountID, zipPath, remoteName, totalBytes,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("inserting job: %w", err)
@@ -39,7 +40,7 @@ func InsertJob(tx *sql.Tx, backupID, accountID int64, zipPath string, totalBytes
 }
 
 const jobColumns = `j.id, j.backup_id, j.account_id, a.provider, a.email, j.status,
-	COALESCE(j.zip_path, ''), COALESCE(j.remote_path, ''), j.total_bytes,
+	COALESCE(j.zip_path, ''), COALESCE(j.remote_path, ''), COALESCE(j.remote_name, ''), j.total_bytes,
 	j.uploaded_bytes, j.chunks_total, j.chunks_uploaded, COALESCE(j.error_message, ''), j.created_at`
 
 func scanJob(s interface {
@@ -47,7 +48,7 @@ func scanJob(s interface {
 }) (*Job, error) {
 	j := &Job{}
 	if err := s.Scan(&j.ID, &j.BackupID, &j.AccountID, &j.Provider, &j.Email, &j.Status,
-		&j.ZipPath, &j.RemotePath, &j.TotalBytes, &j.UploadedBytes, &j.ChunksTotal,
+		&j.ZipPath, &j.RemotePath, &j.RemoteName, &j.TotalBytes, &j.UploadedBytes, &j.ChunksTotal,
 		&j.ChunksUploaded, &j.ErrorMessage, &j.CreatedAt); err != nil {
 		return nil, err
 	}
@@ -177,6 +178,17 @@ func CountUnfinishedJobsForZip(db *sql.DB, zipPath string, excludeJobID int64) (
 		return 0, fmt.Errorf("counting unfinished jobs for zip: %w", err)
 	}
 	return n, nil
+}
+
+// DeleteJob removes a single job row. Used by the per-provider Delete action
+// after the remote file has been removed from that provider's storage. The
+// backup record, its directories, and any sibling provider's job are untouched
+// (job_logs for this job cascade away via the FK).
+func DeleteJob(db *sql.DB, id int64) error {
+	if _, err := db.Exec(`DELETE FROM jobs WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("deleting job: %w", err)
+	}
+	return nil
 }
 
 // UpdateJobStatus is a low-level status setter retained for callers that only

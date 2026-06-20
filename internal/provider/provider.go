@@ -42,6 +42,13 @@ type Provider interface {
 	// Download streams the object identified by remoteRef into w.
 	Download(ctx context.Context, remoteRef string, w io.Writer) error
 
+	// FindByName looks for a file with the given name in the account's cloud
+	// root (the same location Upload writes to). It returns the matching
+	// remoteRef and found=true when one exists, or found=false when none does.
+	// It is used to detect name conflicts before queuing a backup so the user
+	// can choose to overwrite or skip.
+	FindByName(ctx context.Context, name string) (remoteRef string, found bool, err error)
+
 	// Delete removes the object identified by remoteRef from the provider.
 	Delete(ctx context.Context, remoteRef string) error
 

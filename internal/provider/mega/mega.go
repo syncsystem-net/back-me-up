@@ -123,6 +123,23 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 	return nil
 }
 
+func (c *Client) FindByName(ctx context.Context, name string) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	root := c.m.FS.GetRoot()
+	children, err := c.m.FS.GetChildren(root)
+	if err != nil {
+		return "", false, fmt.Errorf("listing mega root: %w", err)
+	}
+	for _, n := range children {
+		if n.GetName() == name {
+			return n.GetHash(), true, nil
+		}
+	}
+	return "", false, nil
+}
+
 func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 	if err := ctx.Err(); err != nil {
 		return err

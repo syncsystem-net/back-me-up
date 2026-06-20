@@ -24,10 +24,12 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB) {
 		case http.MethodGet:
 			handlers.GetBackupsHandler(db)(w, r)
 		case http.MethodPost:
-			handlers.PostBackupsHandler(db)(w, r)
+			h.PostBackups(w, r)
 		default:
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		}
 	})
 	mux.HandleFunc("GET /api/jobs/{id}/logs", handlers.GetJobLogsHandler(db))
+	mux.HandleFunc("GET /api/jobs/{id}/download", h.DownloadJob)
+	mux.HandleFunc("DELETE /api/jobs/{id}", h.DeleteJob)
 }

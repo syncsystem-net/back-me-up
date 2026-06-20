@@ -54,7 +54,41 @@ func migrate(db *sql.DB) error {
 	if err := migrateAccountsUniqueConstraint(db); err != nil {
 		return fmt.Errorf("accounts migration: %w", err)
 	}
-	_, err := db.Exec(schema)
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Additive column migration for the clean cloud upload name. CREATE TABLE
+	// above adds it for fresh databases; existing databases need an ALTER.
+	if err := addColumnIfMissing(db, "jobs", "remote_name", "TEXT"); err != nil {
+		return fmt.Errorf("jobs.remote_name migration: %w", err)
+	}
+	return nil
+}
+
+// addColumnIfMissing adds a column to a table only if it is not already present,
+// using PRAGMA table_info to check. SQLite has no "ADD COLUMN IF NOT EXISTS".
+func addColumnIfMissing(db *sql.DB, table, column, typ string) error {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("reading %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scanning %s columns: %w", table, err)
+		}
+		if name == column {
+			return nil // already present
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, typ))
 	return err
 }
 
@@ -123,6 +157,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     zip_path TEXT,
     remote_path TEXT,
+    remote_name TEXT,
     total_bytes INTEGER DEFAULT 0,
     uploaded_bytes INTEGER DEFAULT 0,
     chunks_total INTEGER DEFAULT 0,

@@ -296,6 +296,56 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 	return nil
 }
 
+// fileEntry mirrors the fields we consume from a folder's file listing.
+type fileEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// FindByName lists the account's root folder and returns the id of the first
+// file whose name matches. 4shared's listing response is decoded defensively:
+// it may be a bare array or an object with a "files" array.
+func (c *Client) FindByName(ctx context.Context, name string) (string, bool, error) {
+	u, err := c.getUser(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+"/folder/"+u.RootFolderID+"/files", nil)
+	if err != nil {
+		return "", false, err
+	}
+	c.signer.Sign(req, nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", false, fmt.Errorf("GET /folder/%s/files: %w", u.RootFolderID, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if c.debug {
+		slog.Info("4shared folder files response", "status", resp.StatusCode, "body", string(body))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", false, fmt.Errorf("GET /folder/%s/files: 4shared returned %d: %s", u.RootFolderID, resp.StatusCode, string(body))
+	}
+
+	var files []fileEntry
+	if err := json.Unmarshal(body, &files); err != nil {
+		var wrapped struct {
+			Files []fileEntry `json:"files"`
+		}
+		if err2 := json.Unmarshal(body, &wrapped); err2 != nil {
+			return "", false, fmt.Errorf("decoding folder files %q: %w", string(body), err)
+		}
+		files = wrapped.Files
+	}
+	for _, f := range files {
+		if f.Name == name {
+			return f.ID, true, nil
+		}
+	}
+	return "", false, nil
+}
+
 func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiBase+"/files/"+remoteRef, nil)
 	if err != nil {

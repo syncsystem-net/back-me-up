@@ -338,7 +338,7 @@ Adding a provider = implement `Provider` in a new subpackage + add one `case` in
 - **Chunked upload flow:** `POST upload.4shared.com/v1_2/upload` (form: `name`, `folderId`, `size`) returns a FileResponse whose **`id` is the permanent file id** — reused for every chunk and for later download/delete. Chunks go to `POST /upload/{id}` with a `Content-Range` header; **308 = "resume incomplete" (more chunks), 201 = complete**, and neither response carries an id. **Do not let Go's HTTP client auto-follow the 308 as a redirect** — set `CheckRedirect` to `http.ErrUseLastResponse` for `/upload/` requests.
 - `GET api.4shared.com/v1_2/user` returns quota (`totalSpace`/`freeSpace`) and `rootFolderId`. Folder listing: `GET /folder/{id}/files`; delete: `DELETE /files/{id}`.
 - **Diagnostics:** `go run ./cmd/fourshared-test -account <n>` checks one account's creds in isolation; `FOURSHARED_DEBUG=1` logs the OAuth signature base string, Authorization header, and raw responses. Reach for these before guessing.
-- **`401 ... "token ... does not exist"`** usually means a **stale token** — re-authorizing an app invalidates the previous token. Re-run `cmd/fourshared-auth`.
+- **`401 ... "token ... expired, rejected or does not exist"` (`401.0301`)** means the OAuth access token is no longer valid server-side. **We set no token lifetime anywhere** — OAuth 1.0 access tokens have no client-configurable expiry, so there is nothing to tune in config; validity is entirely 4shared's call. Causes: 4shared expired it, the app was re-authorized (invalidates the previous token), or it was revoked. 4shared does not publish the TTL. Fix is always the same: re-run `cmd/fourshared-auth -account <n>` and replace the token in `.env`.
 
 ---
 

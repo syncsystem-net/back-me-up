@@ -27,7 +27,8 @@ func New(cfg *config.Config, db *sql.DB, accts *accounts.AccountStore) *Server {
 		mux:      http.NewServeMux(),
 	}
 
-	h := handlers.New(db, accts)
+	chunkSize := int64(cfg.Upload.ChunkSizeMB) << 20
+	h := handlers.New(db, accts, chunkSize)
 	routes.Register(s.mux, h, db)
 
 	return s

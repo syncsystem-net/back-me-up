@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,17 +15,19 @@ import (
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/archive"
+	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/scanner"
 )
 
 type Handlers struct {
-	db       *sql.DB
-	accounts *accounts.AccountStore
-	tmpl     *template.Template
+	db        *sql.DB
+	accounts  *accounts.AccountStore
+	tmpl      *template.Template
+	chunkSize int64
 }
 
-func New(db *sql.DB, accts *accounts.AccountStore) *Handlers {
+func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64) *Handlers {
 	tmplPath := filepath.Join("web", "templates", "*.html")
 	tmpl, err := template.ParseGlob(tmplPath)
 	if err != nil {
@@ -33,9 +36,10 @@ func New(db *sql.DB, accts *accounts.AccountStore) *Handlers {
 	}
 
 	return &Handlers{
-		db:       db,
-		accounts: accts,
-		tmpl:     tmpl,
+		db:        db,
+		accounts:  accts,
+		tmpl:      tmpl,
+		chunkSize: chunkSize,
 	}
 }
 
@@ -128,123 +132,207 @@ func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func PostBackupsHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Title      string  `json:"title"`
-			SourcePath string  `json:"source_path"`
-			AccountIDs []int64 `json:"account_ids"`
-		}
+// conflictInfo describes a same-name file already present on a selected account.
+type conflictInfo struct {
+	AccountID int64  `json:"account_id"`
+	Provider  string `json:"provider"`
+	Email     string `json:"email"`
+	Name      string `json:"name"`
+}
 
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			jsonError(w, "invalid request body", http.StatusBadRequest)
-			return
-		}
+func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Title      string  `json:"title"`
+		SourcePath string  `json:"source_path"`
+		AccountIDs []int64 `json:"account_ids"`
+		// ConflictResolutions maps an account id (as a string key, since JSON
+		// object keys are strings) to "overwrite" or "skip". Sent on resubmit
+		// after the user resolves the conflicts reported by a prior 409.
+		ConflictResolutions map[string]string `json:"conflict_resolutions"`
+	}
 
-		if req.Title == "" {
-			jsonError(w, "title is required", http.StatusBadRequest)
-			return
-		}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
 
-		info, err := os.Stat(req.SourcePath)
-		if err != nil || !info.IsDir() {
-			jsonError(w, "source_path must be an existing directory", http.StatusBadRequest)
-			return
-		}
+	if req.Title == "" {
+		jsonError(w, "title is required", http.StatusBadRequest)
+		return
+	}
 
-		if len(req.AccountIDs) == 0 {
-			jsonError(w, "at least one account_id is required", http.StatusBadRequest)
-			return
-		}
+	info, err := os.Stat(req.SourcePath)
+	if err != nil || !info.IsDir() {
+		jsonError(w, "source_path must be an existing directory", http.StatusBadRequest)
+		return
+	}
 
-		entries, err := scanner.Scan(req.SourcePath)
-		if err != nil {
-			slog.Error("scanning directory", "path", req.SourcePath, "error", err)
-			jsonError(w, "failed to scan source directory", http.StatusInternalServerError)
-			return
-		}
+	if len(req.AccountIDs) == 0 {
+		jsonError(w, "at least one account_id is required", http.StatusBadRequest)
+		return
+	}
 
-		zipPath, err := archive.Zip(req.SourcePath)
-		if err != nil {
-			slog.Error("creating zip", "path", req.SourcePath, "error", err)
-			jsonError(w, "failed to create zip archive", http.StatusInternalServerError)
-			return
+	// Drop accounts the user chose to skip; the rest are the effective upload
+	// targets for quota, conflict detection, and job creation.
+	effective := make([]int64, 0, len(req.AccountIDs))
+	for _, id := range req.AccountIDs {
+		if req.ConflictResolutions[strconv.FormatInt(id, 10)] == "skip" {
+			continue
 		}
+		effective = append(effective, id)
+	}
+	if len(effective) == 0 {
+		jsonError(w, "all selected accounts were skipped; nothing to upload", http.StatusBadRequest)
+		return
+	}
 
-		zipInfo, err := os.Stat(zipPath)
-		if err != nil {
-			os.Remove(zipPath)
-			jsonError(w, "failed to stat zip file", http.StatusInternalServerError)
-			return
-		}
-		totalBytes := zipInfo.Size()
+	entries, err := scanner.Scan(req.SourcePath)
+	if err != nil {
+		slog.Error("scanning directory", "path", req.SourcePath, "error", err)
+		jsonError(w, "failed to scan source directory", http.StatusInternalServerError)
+		return
+	}
 
-		// Quota pre-check: refuse the backup (and discard the zip) if any selected
-		// account lacks the free space to hold it, so we never start an upload
-		// that is doomed to fail partway. Accounts with unknown quota (0) are
-		// skipped rather than blocking the user.
-		if msg, ok := checkQuota(db, req.AccountIDs, totalBytes); !ok {
-			os.Remove(zipPath)
-			jsonError(w, msg, http.StatusConflict)
-			return
-		}
+	zipPath, err := archive.Zip(req.SourcePath)
+	if err != nil {
+		slog.Error("creating zip", "path", req.SourcePath, "error", err)
+		jsonError(w, "failed to create zip archive", http.StatusInternalServerError)
+		return
+	}
+	remoteName := archive.RemoteName(req.SourcePath)
 
-		tx, err := db.Begin()
-		if err != nil {
-			os.Remove(zipPath)
-			jsonError(w, "failed to begin transaction", http.StatusInternalServerError)
-			return
-		}
+	zipInfo, err := os.Stat(zipPath)
+	if err != nil {
+		os.Remove(zipPath)
+		jsonError(w, "failed to stat zip file", http.StatusInternalServerError)
+		return
+	}
+	totalBytes := zipInfo.Size()
 
-		backupID, err := database.CreateBackup(tx, req.Title, req.SourcePath)
-		if err != nil {
+	// Quota pre-check: refuse the backup (and discard the zip) if any selected
+	// account lacks the free space to hold it, so we never start an upload
+	// that is doomed to fail partway. Accounts with unknown quota (0) are
+	// skipped rather than blocking the user.
+	if msg, ok := checkQuota(h.db, effective, totalBytes); !ok {
+		os.Remove(zipPath)
+		jsonError(w, msg, http.StatusConflict)
+		return
+	}
+
+	// Detect same-name files already on each target account. Unresolved
+	// conflicts are reported back (409) so the user can choose overwrite/skip;
+	// "overwrite" deletes the existing remote here so the new upload replaces it.
+	// Detection failures (login/network) are non-fatal: we log and proceed,
+	// leaving the upload worker as the source of truth.
+	if conflicts := h.resolveConflicts(r.Context(), effective, remoteName, req.ConflictResolutions); len(conflicts) > 0 {
+		os.Remove(zipPath)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":     "some accounts already have a file with this name",
+			"conflicts": conflicts,
+		})
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		os.Remove(zipPath)
+		jsonError(w, "failed to begin transaction", http.StatusInternalServerError)
+		return
+	}
+
+	backupID, err := database.CreateBackup(tx, req.Title, req.SourcePath)
+	if err != nil {
+		tx.Rollback()
+		os.Remove(zipPath)
+		slog.Error("creating backup record", "error", err)
+		jsonError(w, "failed to create backup", http.StatusInternalServerError)
+		return
+	}
+
+	dirs := make([]database.Directory, 0, len(entries))
+	for _, e := range entries {
+		dirs = append(dirs, database.Directory{
+			Path:      e.Path,
+			Name:      e.Name,
+			Level:     e.Level,
+			SizeBytes: e.SizeBytes,
+		})
+	}
+
+	if err := database.InsertDirectories(tx, backupID, dirs); err != nil {
+		tx.Rollback()
+		os.Remove(zipPath)
+		slog.Error("inserting directories", "error", err)
+		jsonError(w, "failed to insert directories", http.StatusInternalServerError)
+		return
+	}
+
+	for _, accountID := range effective {
+		if _, err := database.InsertJob(tx, backupID, accountID, zipPath, remoteName, totalBytes); err != nil {
 			tx.Rollback()
 			os.Remove(zipPath)
-			slog.Error("creating backup record", "error", err)
-			jsonError(w, "failed to create backup", http.StatusInternalServerError)
+			slog.Error("inserting job", "account_id", accountID, "error", err)
+			jsonError(w, "failed to insert job", http.StatusInternalServerError)
 			return
 		}
+	}
 
-		dirs := make([]database.Directory, 0, len(entries))
-		for _, e := range entries {
-			dirs = append(dirs, database.Directory{
-				Path:      e.Path,
-				Name:      e.Name,
-				Level:     e.Level,
-				SizeBytes: e.SizeBytes,
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		os.Remove(zipPath)
+		slog.Error("committing transaction", "error", err)
+		jsonError(w, "failed to commit transaction", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]int64{"id": backupID})
+}
+
+// resolveConflicts checks each target account's cloud root for an existing file
+// named remoteName. For an account the user marked "overwrite" it deletes the
+// existing file so the upload replaces it; an account with an existing file and
+// no resolution is returned as a conflict for the UI to prompt on. Connection or
+// lookup failures are logged and treated as "no conflict".
+func (h *Handlers) resolveConflicts(ctx context.Context, accountIDs []int64, remoteName string, resolutions map[string]string) []conflictInfo {
+	var conflicts []conflictInfo
+	for _, id := range accountIDs {
+		acct, err := database.GetDBAccountByID(h.db, id)
+		if err != nil {
+			slog.Warn("conflict check: account not found", "account_id", id, "error", err)
+			continue
+		}
+		p, err := cloud.Connect(ctx, h.accounts, acct.Provider, acct.Email, h.chunkSize)
+		if err != nil {
+			slog.Warn("conflict check: could not connect", "provider", acct.Provider, "email", acct.Email, "error", err)
+			continue
+		}
+		ref, found, err := p.FindByName(ctx, remoteName)
+		if err != nil {
+			slog.Warn("conflict check: lookup failed", "provider", acct.Provider, "email", acct.Email, "error", err)
+			continue
+		}
+		if !found {
+			continue
+		}
+		switch resolutions[strconv.FormatInt(id, 10)] {
+		case "overwrite":
+			if err := p.Delete(ctx, ref); err != nil {
+				slog.Warn("conflict overwrite: delete failed", "provider", acct.Provider, "email", acct.Email, "error", err)
+			}
+		default:
+			conflicts = append(conflicts, conflictInfo{
+				AccountID: id,
+				Provider:  acct.Provider,
+				Email:     acct.Email,
+				Name:      remoteName,
 			})
 		}
-
-		if err := database.InsertDirectories(tx, backupID, dirs); err != nil {
-			tx.Rollback()
-			os.Remove(zipPath)
-			slog.Error("inserting directories", "error", err)
-			jsonError(w, "failed to insert directories", http.StatusInternalServerError)
-			return
-		}
-
-		for _, accountID := range req.AccountIDs {
-			if _, err := database.InsertJob(tx, backupID, accountID, zipPath, totalBytes); err != nil {
-				tx.Rollback()
-				os.Remove(zipPath)
-				slog.Error("inserting job", "account_id", accountID, "error", err)
-				jsonError(w, "failed to insert job", http.StatusInternalServerError)
-				return
-			}
-		}
-
-		if err := tx.Commit(); err != nil {
-			tx.Rollback()
-			os.Remove(zipPath)
-			slog.Error("committing transaction", "error", err)
-			jsonError(w, "failed to commit transaction", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]int64{"id": backupID})
 	}
+	return conflicts
 }
 
 // checkQuota verifies each selected account has room for sizeBytes. It returns
@@ -293,6 +381,98 @@ func GetJobLogsHandler(db *sql.DB) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(logs)
 	}
+}
+
+// DownloadJob streams the remote zip for a completed job back to the browser.
+// Route: GET /api/jobs/{id}/download.
+func (h *Handlers) DownloadJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		jsonError(w, "invalid job id", http.StatusBadRequest)
+		return
+	}
+	job, err := database.GetJob(h.db, id)
+	if err != nil {
+		jsonError(w, "job not found", http.StatusNotFound)
+		return
+	}
+	if job.Status != "complete" || job.RemotePath == "" {
+		jsonError(w, "job has no uploaded file to download", http.StatusConflict)
+		return
+	}
+
+	p, err := cloud.Connect(r.Context(), h.accounts, job.Provider, job.Email, h.chunkSize)
+	if err != nil {
+		slog.Error("download: connect failed", "job", id, "error", err)
+		jsonError(w, "could not connect to provider", http.StatusBadGateway)
+		return
+	}
+
+	filename := job.RemoteName
+	if filename == "" {
+		filename = filepath.Base(job.ZipPath)
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
+
+	if err := p.Download(r.Context(), job.RemotePath, w); err != nil {
+		// Headers (and likely some bytes) are already sent, so we can't switch to
+		// a JSON error here; log it and let the client see a truncated download.
+		slog.Error("download stream failed", "job", id, "error", err)
+	}
+}
+
+// DeleteJob removes a job's file from its provider and deletes the job record.
+// It requires a JSON body {"confirm":"DELETE"} (also enforced in the UI). Only
+// that provider's copy is affected — the backup record, its directories, and any
+// sibling provider's job remain. Route: DELETE /api/jobs/{id}.
+func (h *Handlers) DeleteJob(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		jsonError(w, "invalid job id", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if body.Confirm != "DELETE" {
+		jsonError(w, `confirmation must be exactly "DELETE"`, http.StatusBadRequest)
+		return
+	}
+
+	job, err := database.GetJob(h.db, id)
+	if err != nil {
+		jsonError(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	// Remove the remote file first. If it fails, keep the record so the user can
+	// retry rather than orphaning a file in the cloud. A job that never uploaded
+	// (no remote_path) skips straight to record deletion.
+	if job.RemotePath != "" {
+		p, err := cloud.Connect(r.Context(), h.accounts, job.Provider, job.Email, h.chunkSize)
+		if err != nil {
+			slog.Error("delete: connect failed", "job", id, "error", err)
+			jsonError(w, "could not connect to provider", http.StatusBadGateway)
+			return
+		}
+		if err := p.Delete(r.Context(), job.RemotePath); err != nil {
+			slog.Error("delete: remote delete failed", "job", id, "error", err)
+			jsonError(w, "failed to delete file from provider", http.StatusBadGateway)
+			return
+		}
+	}
+
+	if err := database.DeleteJob(h.db, id); err != nil {
+		slog.Error("delete: removing job record failed", "job", id, "error", err)
+		jsonError(w, "deleted from provider but failed to remove record", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func BrowseHandler() http.HandlerFunc {

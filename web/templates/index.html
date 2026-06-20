@@ -53,6 +53,12 @@
                                                             </div>
                                                         </template>
                                                         <button class="btn-link" @click.stop="openLogs(b, 'mega')">logs</button>
+                                                        <template x-for="j in completedJobs(b, 'mega')" :key="j.id">
+                                                            <span class="job-actions">
+                                                                <a class="btn-link" :href="`/api/jobs/${j.id}/download`" @click.stop>download</a>
+                                                                <button class="btn-link btn-danger" @click.stop="openDelete(j, b, 'mega')">delete</button>
+                                                            </span>
+                                                        </template>
                                                     </div>
                                                 </template>
                                                 <template x-if="!jobStatus(b, 'mega')">
@@ -70,6 +76,12 @@
                                                             </div>
                                                         </template>
                                                         <button class="btn-link" @click.stop="openLogs(b, 'fourshared')">logs</button>
+                                                        <template x-for="j in completedJobs(b, 'fourshared')" :key="j.id">
+                                                            <span class="job-actions">
+                                                                <a class="btn-link" :href="`/api/jobs/${j.id}/download`" @click.stop>download</a>
+                                                                <button class="btn-link btn-danger" @click.stop="openDelete(j, b, 'fourshared')">delete</button>
+                                                            </span>
+                                                        </template>
                                                     </div>
                                                 </template>
                                                 <template x-if="!jobStatus(b, 'fourshared')">
@@ -195,6 +207,42 @@
             </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" @click="showLogsModal = false">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showDeleteModal" class="modal-overlay" @click.self="showDeleteModal = false">
+        <div class="modal-card">
+            <h2>Delete backup file</h2>
+            <p>This permanently deletes <strong x-text="deleteTarget ? deleteTarget.label : ''"></strong> from the provider. The backup record and your copy on any other provider are kept. Type <code>DELETE</code> to confirm.</p>
+            <div class="form-field">
+                <input type="text" x-model="deleteConfirm" placeholder="DELETE">
+            </div>
+            <div class="form-error" x-show="error" x-text="error"></div>
+            <div class="modal-actions">
+                <button class="btn btn-danger" @click="confirmDelete()" :disabled="deleteConfirm !== 'DELETE' || deleting" x-text="deleting ? 'Deleting…' : 'Delete'"></button>
+                <button class="btn btn-secondary" @click="showDeleteModal = false">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showConflictModal" class="modal-overlay" @click.self="showConflictModal = false">
+        <div class="modal-card">
+            <h2>File already exists</h2>
+            <p>A file with this name already exists on the following account(s). Choose what to do for each:</p>
+            <template x-for="c in conflicts" :key="c.account_id">
+                <div class="form-field">
+                    <label x-text="c.provider + ' — ' + c.email + ' (' + c.name + ')'"></label>
+                    <div class="conflict-choice">
+                        <label><input type="radio" :name="'cf-' + c.account_id" value="overwrite" x-model="conflictChoices[c.account_id]"> Overwrite</label>
+                        <label><input type="radio" :name="'cf-' + c.account_id" value="skip" x-model="conflictChoices[c.account_id]"> Skip</label>
+                    </div>
+                </div>
+            </template>
+            <div class="form-error" x-show="error" x-text="error"></div>
+            <div class="modal-actions">
+                <button class="btn btn-primary" @click="submitConflicts()" :disabled="creating" x-text="creating ? 'Working…' : 'Continue'"></button>
+                <button class="btn btn-secondary" @click="showConflictModal = false">Cancel</button>
             </div>
         </div>
     </div>

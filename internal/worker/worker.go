@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
+	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
-	"github.com/syncsystem-net/back-me-up/internal/provider/registry"
 )
 
 // Config is the worker's slice of application configuration, pre-converted into
@@ -145,7 +145,13 @@ func (w *Worker) process(ctx context.Context, job *database.Job) {
 		return
 	}
 
-	remoteName := filepath.Base(job.ZipPath)
+	// Upload under the clean cloud name recorded on the job. The local zip may
+	// carry a uniqueness suffix to avoid clobbering an in-flight zip on disk, so
+	// we cannot derive the remote name from the zip's basename.
+	remoteName := job.RemoteName
+	if remoteName == "" {
+		remoteName = filepath.Base(job.ZipPath)
+	}
 	remoteRef, err := w.uploadWithRetry(ctx, p, job, remoteName)
 	if err != nil {
 		w.fail(job, err.Error())
@@ -210,18 +216,7 @@ func (w *Worker) uploadWithRetry(ctx context.Context, p provider.Provider, job *
 
 // connect builds a provider for the job's account and authenticates it.
 func (w *Worker) connect(ctx context.Context, job *database.Job) (provider.Provider, error) {
-	acct, ok := w.findAccount(job.Provider, job.Email)
-	if !ok {
-		return nil, fmt.Errorf("no credentials in .env for %s account %s", job.Provider, job.Email)
-	}
-	p, err := registry.New(job.Provider, w.oauthFor(acct), provider.Config{ChunkSizeBytes: w.cfg.ChunkSizeBytes})
-	if err != nil {
-		return nil, err
-	}
-	if err := p.Login(ctx, acct.Email, acct.Password); err != nil {
-		return nil, err
-	}
-	return p, nil
+	return cloud.Connect(ctx, w.accounts, job.Provider, job.Email, w.cfg.ChunkSizeBytes)
 }
 
 func (w *Worker) refreshQuota(ctx context.Context, p provider.Provider, job *database.Job) {
@@ -277,31 +272,6 @@ func (w *Worker) accountSem(accountID int64) chan struct{} {
 		w.acctSem[accountID] = sem
 	}
 	return sem
-}
-
-func (w *Worker) findAccount(providerName, email string) (accounts.Account, bool) {
-	for _, a := range w.accounts.Accounts {
-		if string(a.Provider) == providerName && a.Email == email {
-			return a, true
-		}
-	}
-	return accounts.Account{}, false
-}
-
-func (w *Worker) oauthFor(a accounts.Account) provider.OAuthCreds {
-	switch a.Provider {
-	case accounts.ProviderFourShared:
-		// Account-level consumer creds are resolved (with shared fallback) at
-		// load time in the accounts package.
-		return provider.OAuthCreds{
-			ConsumerKey:    a.ConsumerKey,
-			ConsumerSecret: a.ConsumerSecret,
-			Token:          a.OAuthToken,
-			TokenSecret:    a.OAuthTokenSecret,
-		}
-	default:
-		return provider.OAuthCreds{}
-	}
 }
 
 // nextBackoff grows the delay geometrically, capped at max.
