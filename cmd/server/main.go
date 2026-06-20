@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/config"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/server"
+	"github.com/syncsystem-net/back-me-up/internal/worker"
 )
 
 func main() {
@@ -41,10 +44,34 @@ func main() {
 		slog.Warn("failed to sync accounts to database", "error", err)
 	}
 
+	// Start the background upload worker pool. It runs for the life of the
+	// process, claiming pending jobs and uploading them to their providers.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := worker.New(db, accts, workerConfig(cfg), cfg.Database.Path)
+	w.Start(ctx)
+
 	srv := server.New(cfg, db, accts)
 	if err := srv.Start(); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
+	}
+}
+
+// workerConfig translates the application config into the worker's units
+// (bytes, durations).
+func workerConfig(cfg *config.Config) worker.Config {
+	return worker.Config{
+		ChunkSizeBytes:          int64(cfg.Upload.ChunkSizeMB) << 20,
+		MaxWorkers:              cfg.Concurrency.MaxWorkers,
+		MaxConcurrentUploads:    cfg.Concurrency.MaxConcurrentUploads,
+		MaxConcurrentPerAccount: cfg.Concurrency.MaxConcurrentPerAccount,
+		MaxAttempts:             cfg.RetryPolicy.MaxAttempts,
+		InitialBackoff:          time.Duration(cfg.RetryPolicy.InitialBackoffSeconds) * time.Second,
+		MaxBackoff:              time.Duration(cfg.RetryPolicy.MaxBackoffSeconds) * time.Second,
+		BackoffMultiplier:       cfg.RetryPolicy.BackoffMultiplier,
+		VerifyOnUpload:          cfg.Verification.Enabled && cfg.Verification.VerifyOnUpload,
+		PollInterval:            2 * time.Second,
 	}
 }
 

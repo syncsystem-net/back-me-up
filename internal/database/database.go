@@ -15,11 +15,27 @@ func Open(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
+	// SQLite allows only one writer at a time. With a connection pool, several
+	// upload workers and HTTP handlers race for the write lock and lose with
+	// SQLITE_BUSY ("database is locked"), and a per-connection busy_timeout set
+	// below would only cover whichever pooled connection happened to run it.
+	// Pinning the pool to a single connection funnels all access through one
+	// serialized path, so SQLite never sees concurrent writers. Throughput is a
+	// non-issue for a local single-user tool, and uploads hold no DB lock while
+	// transferring (only short progress writes touch the database).
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		return nil, fmt.Errorf("setting journal mode: %w", err)
 	}
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		return nil, fmt.Errorf("enabling foreign keys: %w", err)
+	}
+	// Several upload workers and HTTP handlers write concurrently; without a
+	// busy timeout a contended writer fails immediately with SQLITE_BUSY and a
+	// progress update would be silently dropped. Wait briefly for the lock.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		return nil, fmt.Errorf("setting busy timeout: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {

@@ -39,12 +39,21 @@
                             <td colspan="4" style="padding:0; border:none;">
                                 <table style="width:100%; border-collapse:collapse;">
                                     <tbody>
-                                        <tr class="expandable" @click="b.expanded = !b.expanded">
+                                        <tr class="expandable" @click="toggleExpand(b)">
                                             <td x-text="b.title"></td>
                                             <td x-text="new Date(b.created_at).toLocaleDateString()"></td>
                                             <td>
                                                 <template x-if="jobStatus(b, 'mega')">
-                                                    <span :class="'badge badge-' + jobStatus(b, 'mega')" x-text="jobStatus(b, 'mega')"></span>
+                                                    <div class="provider-cell">
+                                                        <span :class="'badge badge-' + displayStatus(b, 'mega')" x-text="displayStatus(b, 'mega')"></span>
+                                                        <template x-if="jobStatus(b, 'mega') === 'in_progress'">
+                                                            <div class="progress">
+                                                                <div class="progress-bar" :style="`width:${jobProgress(b,'mega')}%`"></div>
+                                                                <span class="progress-pct" x-text="jobProgress(b,'mega') + '%'"></span>
+                                                            </div>
+                                                        </template>
+                                                        <button class="btn-link" @click.stop="openLogs(b, 'mega')">logs</button>
+                                                    </div>
                                                 </template>
                                                 <template x-if="!jobStatus(b, 'mega')">
                                                     <span>&mdash;</span>
@@ -52,7 +61,16 @@
                                             </td>
                                             <td>
                                                 <template x-if="jobStatus(b, 'fourshared')">
-                                                    <span :class="'badge badge-' + jobStatus(b, 'fourshared')" x-text="jobStatus(b, 'fourshared')"></span>
+                                                    <div class="provider-cell">
+                                                        <span :class="'badge badge-' + displayStatus(b, 'fourshared')" x-text="displayStatus(b, 'fourshared')"></span>
+                                                        <template x-if="jobStatus(b, 'fourshared') === 'in_progress'">
+                                                            <div class="progress">
+                                                                <div class="progress-bar" :style="`width:${jobProgress(b,'fourshared')}%`"></div>
+                                                                <span class="progress-pct" x-text="jobProgress(b,'fourshared') + '%'"></span>
+                                                            </div>
+                                                        </template>
+                                                        <button class="btn-link" @click.stop="openLogs(b, 'fourshared')">logs</button>
+                                                    </div>
                                                 </template>
                                                 <template x-if="!jobStatus(b, 'fourshared')">
                                                     <span>&mdash;</span>
@@ -155,6 +173,28 @@
             <div class="modal-actions">
                 <button class="btn btn-primary" @click="createBackup()" :disabled="creating" x-text="creating ? 'Creating...' : 'Create Backup'"></button>
                 <button class="btn btn-secondary" @click="showNewModal = false">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showLogsModal" class="modal-overlay" @click.self="showLogsModal = false">
+        <div class="modal-card">
+            <h2 x-text="logsTitle"></h2>
+            <template x-if="logs.length === 0">
+                <p style="color:#888;">No log entries yet.</p>
+            </template>
+            <div class="log-list" x-show="logs.length > 0">
+                <template x-for="(l, i) in logs" :key="i">
+                    <div class="log-line" :class="'log-' + l.level">
+                        <span class="log-time" x-text="new Date(l.created_at).toLocaleString()"></span>
+                        <span class="log-level" x-text="l.level"></span>
+                        <span class="log-email" x-text="l.email"></span>
+                        <span class="log-msg" x-text="l.message"></span>
+                    </div>
+                </template>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" @click="showLogsModal = false">Close</button>
             </div>
         </div>
     </div>

@@ -3,11 +3,13 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
@@ -75,12 +77,12 @@ func GetAccountsHandler(db *sql.DB) http.HandlerFunc {
 
 func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
 	type backupResponse struct {
-		ID          int64                  `json:"id"`
-		Title       string                 `json:"title"`
-		SourcePath  string                 `json:"source_path"`
-		CreatedAt   time.Time              `json:"created_at"`
-		Directories []*database.Directory  `json:"directories"`
-		Jobs        []*database.Job        `json:"jobs"`
+		ID          int64                 `json:"id"`
+		Title       string                `json:"title"`
+		SourcePath  string                `json:"source_path"`
+		CreatedAt   time.Time             `json:"created_at"`
+		Directories []*database.Directory `json:"directories"`
+		Jobs        []*database.Job       `json:"jobs"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +179,16 @@ func PostBackupsHandler(db *sql.DB) http.HandlerFunc {
 		}
 		totalBytes := zipInfo.Size()
 
+		// Quota pre-check: refuse the backup (and discard the zip) if any selected
+		// account lacks the free space to hold it, so we never start an upload
+		// that is doomed to fail partway. Accounts with unknown quota (0) are
+		// skipped rather than blocking the user.
+		if msg, ok := checkQuota(db, req.AccountIDs, totalBytes); !ok {
+			os.Remove(zipPath)
+			jsonError(w, msg, http.StatusConflict)
+			return
+		}
+
 		tx, err := db.Begin()
 		if err != nil {
 			os.Remove(zipPath)
@@ -232,6 +244,54 @@ func PostBackupsHandler(db *sql.DB) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]int64{"id": backupID})
+	}
+}
+
+// checkQuota verifies each selected account has room for sizeBytes. It returns
+// ("", true) when every account fits (or has unknown quota), or a human-readable
+// message and false on the first account that does not fit.
+func checkQuota(db *sql.DB, accountIDs []int64, sizeBytes int64) (string, bool) {
+	const bytesPerGB = 1 << 30
+	for _, id := range accountIDs {
+		acct, err := database.GetDBAccountByID(db, id)
+		if err != nil {
+			return "selected account not found", false
+		}
+		if acct.QuotaTotalGB <= 0 {
+			continue // quota unknown; don't block
+		}
+		availableBytes := int64((acct.QuotaTotalGB - acct.QuotaUsedGB) * bytesPerGB)
+		if sizeBytes > availableBytes {
+			return fmt.Sprintf(
+				"%s account %s does not have enough space: backup is %.2f GB but only %.2f GB is free",
+				acct.Provider, acct.Email,
+				float64(sizeBytes)/bytesPerGB, float64(availableBytes)/bytesPerGB,
+			), false
+		}
+	}
+	return "", true
+}
+
+// GetJobLogsHandler returns the log lines for a single job, powering the
+// per-provider "logs" modal. Route: GET /api/jobs/{id}/logs.
+func GetJobLogsHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			jsonError(w, "invalid job id", http.StatusBadRequest)
+			return
+		}
+		logs, err := database.ListJobLogs(db, id)
+		if err != nil {
+			slog.Error("listing job logs", "job", id, "error", err)
+			jsonError(w, "failed to list job logs", http.StatusInternalServerError)
+			return
+		}
+		if logs == nil {
+			logs = []*database.JobLog{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(logs)
 	}
 }
 

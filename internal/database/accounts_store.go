@@ -52,6 +52,21 @@ func ListDBAccounts(db *sql.DB) ([]*DBAccount, error) {
 	return accounts, rows.Err()
 }
 
+// UpdateAccountQuota stores the latest total/used capacity (in bytes, converted
+// to GB) for an account and stamps last_quota_sync. Called after a successful
+// upload so the table reflects fresh usage without waiting for a poll cycle.
+func UpdateAccountQuota(db *sql.DB, id, totalBytes, usedBytes int64) error {
+	const bytesPerGB = 1 << 30
+	_, err := db.Exec(
+		`UPDATE accounts SET quota_total_gb = ?, quota_used_gb = ?, last_quota_sync = CURRENT_TIMESTAMP WHERE id = ?`,
+		float64(totalBytes)/bytesPerGB, float64(usedBytes)/bytesPerGB, id,
+	)
+	if err != nil {
+		return fmt.Errorf("updating account quota: %w", err)
+	}
+	return nil
+}
+
 func GetDBAccountByID(db *sql.DB, id int64) (*DBAccount, error) {
 	row := db.QueryRow(
 		`SELECT id, provider, email, quota_total_gb, quota_used_gb, created_at FROM accounts WHERE id = ?`,
