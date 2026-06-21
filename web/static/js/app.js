@@ -18,6 +18,17 @@ document.addEventListener('alpine:init', () => {
         logsTitle: '',
         logs: [],
 
+        // Delete-confirmation modal state.
+        showDeleteModal: false,
+        deleteTarget: null, // { jobId, label }
+        deleteConfirm: '',
+        deleting: false,
+
+        // Overwrite-on-conflict modal state.
+        showConflictModal: false,
+        conflicts: [],       // [{ account_id, provider, email, name }]
+        conflictChoices: {}, // { [account_id]: 'overwrite' | 'skip' }
+
         megaAccounts() {
             return this.accounts.filter(a => a.provider === 'mega');
         },
@@ -87,21 +98,41 @@ document.addEventListener('alpine:init', () => {
             else this.newBackup.account_ids.splice(idx, 1);
         },
 
-        async createBackup() {
+        // createBackup posts the new backup. On a 409 carrying a `conflicts` list
+        // (a same-name file already on one or more accounts) it opens the conflict
+        // modal instead of erroring; resubmits pass `resolutions` (account_id ->
+        // 'overwrite' | 'skip'). A 409 without `conflicts` is a quota rejection.
+        async createBackup(resolutions) {
             this.creating = true;
             this.error = '';
             try {
+                const body = { ...this.newBackup };
+                if (resolutions) body.conflict_resolutions = resolutions;
                 const r = await fetch('/api/backups', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(this.newBackup),
+                    body: JSON.stringify(body),
                 });
+                if (r.status === 409) {
+                    const e = await r.json();
+                    if (e.conflicts && e.conflicts.length) {
+                        this.conflicts = e.conflicts;
+                        this.conflictChoices = {};
+                        for (const c of e.conflicts) this.conflictChoices[c.account_id] = 'overwrite';
+                        this.error = '';
+                        this.showConflictModal = true;
+                        return;
+                    }
+                    this.error = e.error || 'Not enough space';
+                    return;
+                }
                 if (!r.ok) {
                     const e = await r.json();
                     this.error = e.error || 'Failed to create backup';
                     return;
                 }
                 this.showNewModal = false;
+                this.showConflictModal = false;
                 this.newBackup = { title: '', source_path: '', account_ids: [] };
                 await this.loadBackups();
             } finally {
@@ -109,8 +140,18 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        async submitConflicts() {
+            this.showConflictModal = false;
+            await this.createBackup(this.conflictChoices);
+        },
+
         providerJobs(backup, provider) {
             return (backup.jobs || []).filter(j => j.provider === provider);
+        },
+        // Completed jobs for a provider — the ones that have a downloadable /
+        // deletable remote file.
+        completedJobs(backup, provider) {
+            return this.providerJobs(backup, provider).filter(j => j.status === 'complete');
         },
         jobStatus(backup, provider) {
             const jobs = this.providerJobs(backup, provider);
@@ -150,6 +191,35 @@ document.addEventListener('alpine:init', () => {
                 for (const l of lines) this.logs.push({ ...l, email: j.email });
             }
             this.logs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        },
+
+        openDelete(job, backup, provider) {
+            this.deleteTarget = { jobId: job.id, label: `${provider} — ${backup.title} (${job.email})` };
+            this.deleteConfirm = '';
+            this.error = '';
+            this.showDeleteModal = true;
+        },
+        async confirmDelete() {
+            if (this.deleteConfirm !== 'DELETE' || !this.deleteTarget) return;
+            this.deleting = true;
+            this.error = '';
+            try {
+                const r = await fetch(`/api/jobs/${this.deleteTarget.jobId}`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: this.deleteConfirm }),
+                });
+                if (!r.ok) {
+                    const e = await r.json().catch(() => ({}));
+                    this.error = e.error || 'Failed to delete';
+                    return;
+                }
+                this.showDeleteModal = false;
+                this.deleteTarget = null;
+                await this.loadBackups();
+            } finally {
+                this.deleting = false;
+            }
         },
 
         dirLevel1(backup) {

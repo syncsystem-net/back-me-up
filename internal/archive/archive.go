@@ -2,16 +2,30 @@ package archive
 
 import (
 	"archive/zip"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
 
+// RemoteName is the clean cloud filename for a backup of srcDir: the directory's
+// base name plus ".zip". It is stable across repeat backups of the same
+// directory (unlike the local temp zip, which is uniquely suffixed), so it is
+// what conflict detection checks for and what the worker uploads under.
+func RemoteName(srcDir string) string {
+	return filepath.Base(filepath.Clean(srcDir)) + ".zip"
+}
+
+// Zip compresses srcDir into a temp zip created at the same level as srcDir and
+// returns the local path. The file name carries a random suffix so that backing
+// up the same directory twice cannot clobber a zip an in-flight upload is still
+// reading; the clean cloud name is provided separately by RemoteName.
 func Zip(srcDir string) (string, error) {
 	srcDir = filepath.Clean(srcDir)
 	baseName := filepath.Base(srcDir)
-	zipPath := filepath.Join(filepath.Dir(srcDir), baseName+".zip")
+	zipPath := filepath.Join(filepath.Dir(srcDir), baseName+"-"+uniqueToken()+".zip")
 
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
@@ -70,4 +84,14 @@ func Zip(srcDir string) (string, error) {
 	}
 
 	return zipPath, nil
+}
+
+// uniqueToken returns a short random hex string for temp-zip naming. It falls
+// back to a fixed token only if the system RNG fails, which is effectively never.
+func uniqueToken() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return "tmp"
+	}
+	return hex.EncodeToString(b)
 }
