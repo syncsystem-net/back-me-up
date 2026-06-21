@@ -390,3 +390,52 @@ h2 {
 .log-error .log-level { color: #f87171; }
 .log-warn .log-level { color: #fbbf24; }
 .log-info .log-level { color: #60a5fa; }
+
+/* --- Accounts Available view: two columns per provider (PR #5) --- */
+.accounts-columns {
+    display: flex;
+    gap: 2rem;
+    align-items: flex-start;
+}
+
+.accounts-column {
+    flex: 1;
+    min-width: 0;
+}
+
+.accounts-column-title {
+    font-size: 1.1rem;
+    margin-bottom: 0.75rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 2px solid #1a1a2e;
+}
+
+.accounts-empty {
+    color: #888;
+    font-size: 0.875rem;
+}
+
+.account-card {
+    background: #fff;
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.75rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.account-email {
+    font-weight: 600;
+    word-break: break-all;
+}
+
+.account-quota {
+    font-size: 0.9rem;
+    color: #444;
+    margin-top: 0.25rem;
+}
+
+.account-synced {
+    font-size: 0.78rem;
+    color: #888;
+    margin-top: 0.25rem;
+}

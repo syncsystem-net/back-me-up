@@ -62,6 +62,13 @@ func migrate(db *sql.DB) error {
 	if err := addColumnIfMissing(db, "jobs", "remote_name", "TEXT"); err != nil {
 		return fmt.Errorf("jobs.remote_name migration: %w", err)
 	}
+	// Additive column for the cached quota poll timestamp. CREATE TABLE adds it
+	// for fresh databases; existing databases that already have the
+	// UNIQUE(provider, email) constraint skip the recreate above and need an
+	// ALTER so the accounts/quota queries don't hit "no such column".
+	if err := addColumnIfMissing(db, "accounts", "last_quota_sync", "DATETIME"); err != nil {
+		return fmt.Errorf("accounts.last_quota_sync migration: %w", err)
+	}
 	return nil
 }
 

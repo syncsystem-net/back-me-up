@@ -10,6 +10,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/config"
 	"github.com/syncsystem-net/back-me-up/internal/database"
+	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/server"
 	"github.com/syncsystem-net/back-me-up/internal/worker"
 )
@@ -51,7 +52,14 @@ func main() {
 	w := worker.New(db, accts, workerConfig(cfg), cfg.Database.Path)
 	w.Start(ctx)
 
-	srv := server.New(cfg, db, accts)
+	// Start the background quota poller. It refreshes every numbered account's
+	// cached quota shortly after startup and then on the configured interval, so
+	// the UI shows current numbers even without recent uploads.
+	chunkSizeBytes := int64(cfg.Upload.ChunkSizeMB) << 20
+	syncer := quota.New(db, accts, chunkSizeBytes, time.Duration(cfg.Quota.SyncIntervalMinutes)*time.Minute)
+	go syncer.Run(ctx)
+
+	srv := server.New(cfg, db, accts, syncer)
 	if err := srv.Start(); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
