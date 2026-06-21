@@ -8,13 +8,13 @@ import (
 )
 
 type Config struct {
-	Server      ServerConfig      `yaml:"server"`
-	Database    DatabaseConfig    `yaml:"database"`
-	Upload      UploadConfig      `yaml:"upload"`
-	RetryPolicy RetryPolicyConfig `yaml:"retry_policy"`
-	RateLimits  RateLimitsConfig  `yaml:"rate_limits"`
-	Concurrency ConcurrencyConfig `yaml:"concurrency"`
-	Quota       QuotaConfig       `yaml:"quota"`
+	Server       ServerConfig       `yaml:"server"`
+	Database     DatabaseConfig     `yaml:"database"`
+	Upload       UploadConfig       `yaml:"upload"`
+	RetryPolicy  RetryPolicyConfig  `yaml:"retry_policy"`
+	RateLimits   RateLimitsConfig   `yaml:"rate_limits"`
+	Concurrency  ConcurrencyConfig  `yaml:"concurrency"`
+	Quota        QuotaConfig        `yaml:"quota"`
 	Verification VerificationConfig `yaml:"verification"`
 }
 

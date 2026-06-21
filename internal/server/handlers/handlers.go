@@ -11,12 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/archive"
 	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/database"
+	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/scanner"
 )
 
@@ -79,16 +81,51 @@ func GetAccountsHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
-	type backupResponse struct {
-		ID          int64                 `json:"id"`
-		Title       string                `json:"title"`
-		SourcePath  string                `json:"source_path"`
-		CreatedAt   time.Time             `json:"created_at"`
-		Directories []*database.Directory `json:"directories"`
-		Jobs        []*database.Job       `json:"jobs"`
-	}
+// backupResponse is the JSON shape the frontend row template renders: a backup
+// with its directories and provider jobs attached. Shared by /api/backups and
+// /api/search so search results render with the same template.
+type backupResponse struct {
+	ID          int64                 `json:"id"`
+	Title       string                `json:"title"`
+	SourcePath  string                `json:"source_path"`
+	CreatedAt   time.Time             `json:"created_at"`
+	Directories []*database.Directory `json:"directories"`
+	Jobs        []*database.Job       `json:"jobs"`
+}
 
+// assembleBackups attaches each backup's directories and jobs, producing the
+// response shape the UI expects. A query/scan failure is returned so the caller
+// can emit an HTTP error.
+func assembleBackups(db *sql.DB, backups []*database.Backup) ([]backupResponse, error) {
+	result := make([]backupResponse, 0, len(backups))
+	for _, b := range backups {
+		dirs, err := database.ListDirectoriesByBackup(db, b.ID)
+		if err != nil {
+			return nil, fmt.Errorf("listing directories for backup %d: %w", b.ID, err)
+		}
+		jobs, err := database.ListJobsByBackup(db, b.ID)
+		if err != nil {
+			return nil, fmt.Errorf("listing jobs for backup %d: %w", b.ID, err)
+		}
+		if dirs == nil {
+			dirs = []*database.Directory{}
+		}
+		if jobs == nil {
+			jobs = []*database.Job{}
+		}
+		result = append(result, backupResponse{
+			ID:          b.ID,
+			Title:       b.Title,
+			SourcePath:  b.SourcePath,
+			CreatedAt:   b.CreatedAt,
+			Directories: dirs,
+			Jobs:        jobs,
+		})
+	}
+	return result, nil
+}
+
+func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		backups, err := database.ListBackups(db)
 		if err != nil {
@@ -97,38 +134,65 @@ func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		result := make([]backupResponse, 0, len(backups))
-		for _, b := range backups {
-			dirs, err := database.ListDirectoriesByBackup(db, b.ID)
-			if err != nil {
-				slog.Error("listing directories", "backup_id", b.ID, "error", err)
-				jsonError(w, "failed to list directories", http.StatusInternalServerError)
-				return
-			}
-			jobs, err := database.ListJobsByBackup(db, b.ID)
-			if err != nil {
-				slog.Error("listing jobs", "backup_id", b.ID, "error", err)
-				jsonError(w, "failed to list jobs", http.StatusInternalServerError)
-				return
-			}
-			if dirs == nil {
-				dirs = []*database.Directory{}
-			}
-			if jobs == nil {
-				jobs = []*database.Job{}
-			}
-			result = append(result, backupResponse{
-				ID:          b.ID,
-				Title:       b.Title,
-				SourcePath:  b.SourcePath,
-				CreatedAt:   b.CreatedAt,
-				Directories: dirs,
-				Jobs:        jobs,
-			})
+		result, err := assembleBackups(db, backups)
+		if err != nil {
+			slog.Error("assembling backups", "error", err)
+			jsonError(w, "failed to assemble backups", http.StatusInternalServerError)
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// SearchBackupsHandler returns backups that have a subdirectory name matching
+// q, in the same JSON shape as /api/backups so the UI reuses the row template.
+// An empty q returns an empty list (the client falls back to the in-memory
+// list). Route: GET /api/search?q=.
+func SearchBackupsHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		w.Header().Set("Content-Type", "application/json")
+		if q == "" {
+			json.NewEncoder(w).Encode([]backupResponse{})
+			return
+		}
+		backups, err := database.SearchBackupsByDirectory(db, q)
+		if err != nil {
+			slog.Error("searching backups", "q", q, "error", err)
+			jsonError(w, "failed to search backups", http.StatusInternalServerError)
+			return
+		}
+		result, err := assembleBackups(db, backups)
+		if err != nil {
+			slog.Error("assembling search results", "error", err)
+			jsonError(w, "failed to assemble search results", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// QuotaSyncHandler triggers an immediate quota refresh for every numbered
+// account and returns the updated account list. Route: POST
+// /api/accounts/quota-sync.
+func QuotaSyncHandler(db *sql.DB, syncer *quota.Syncer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if syncer != nil {
+			syncer.SyncAll(r.Context())
+		}
+		accts, err := database.ListDBAccounts(db)
+		if err != nil {
+			slog.Error("listing accounts after quota sync", "error", err)
+			jsonError(w, "failed to list accounts", http.StatusInternalServerError)
+			return
+		}
+		if accts == nil {
+			accts = []*database.DBAccount{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(accts)
 	}
 }
 

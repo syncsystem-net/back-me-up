@@ -20,7 +20,7 @@
     <main x-cloak>
         <div x-show="page === 'backups'">
             <div class="page-toolbar">
-                <input type="text" class="search-input" placeholder="Search by title..." x-model="search">
+                <input type="text" class="search-input" placeholder="Search by subdirectory name..." x-model="search" @input="onSearchInput()">
                 <button class="btn btn-primary" @click="showNewModal = true; error = ''">New Backup</button>
             </div>
 
@@ -120,32 +120,41 @@
         </div>
 
         <div x-show="page === 'accounts'">
-            <h2>Accounts</h2>
+            <div class="page-toolbar">
+                <h2 style="margin-bottom:0; flex:1;">Accounts Available</h2>
+                <button class="btn btn-primary" @click="refreshQuotas()" :disabled="refreshingQuotas" x-text="refreshingQuotas ? 'Refreshing…' : 'Refresh quotas now'"></button>
+            </div>
             <template x-if="accounts.length === 0">
                 <p style="color:#888;">No accounts found. Check your .env file — numbered accounts like <code>MEGA_ACCOUNT_1_EMAIL</code> appear here.</p>
             </template>
-            <template x-if="accounts.length > 0">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>Provider</th>
-                            <th>Email</th>
-                            <th>Quota Total (GB)</th>
-                            <th>Quota Used (GB)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <template x-for="a in accounts" :key="a.id">
-                            <tr>
-                                <td x-text="a.provider"></td>
-                                <td x-text="a.email"></td>
-                                <td x-text="a.quota_total_gb"></td>
-                                <td x-text="a.quota_used_gb"></td>
-                            </tr>
-                        </template>
-                    </tbody>
-                </table>
-            </template>
+            <div class="accounts-columns" x-show="accounts.length > 0">
+                <div class="accounts-column">
+                    <h3 class="accounts-column-title">MEGA</h3>
+                    <template x-if="megaAccounts().length === 0">
+                        <p class="accounts-empty">No MEGA accounts configured.</p>
+                    </template>
+                    <template x-for="a in megaAccounts()" :key="a.id">
+                        <div class="account-card">
+                            <div class="account-email" x-text="a.email"></div>
+                            <div class="account-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
+                            <div class="account-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
+                        </div>
+                    </template>
+                </div>
+                <div class="accounts-column">
+                    <h3 class="accounts-column-title">4shared</h3>
+                    <template x-if="foursharedAccounts().length === 0">
+                        <p class="accounts-empty">No 4shared accounts configured.</p>
+                    </template>
+                    <template x-for="a in foursharedAccounts()" :key="a.id">
+                        <div class="account-card">
+                            <div class="account-email" x-text="a.email"></div>
+                            <div class="account-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
+                            <div class="account-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
+                        </div>
+                    </template>
+                </div>
+            </div>
         </div>
     </main>
 

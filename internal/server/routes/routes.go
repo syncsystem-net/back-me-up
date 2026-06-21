@@ -4,10 +4,11 @@ import (
 	"database/sql"
 	"net/http"
 
+	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/server/handlers"
 )
 
-func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB) {
+func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quota.Syncer) {
 	staticFS := http.StripPrefix("/static/", http.FileServer(http.Dir("web/static")))
 	mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -18,6 +19,8 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB) {
 
 	mux.HandleFunc("/api/health", h.Health)
 	mux.HandleFunc("/api/accounts", handlers.GetAccountsHandler(db))
+	mux.HandleFunc("POST /api/accounts/quota-sync", handlers.QuotaSyncHandler(db, syncer))
+	mux.HandleFunc("GET /api/search", handlers.SearchBackupsHandler(db))
 	mux.HandleFunc("/api/browse", handlers.BrowseHandler())
 	mux.HandleFunc("/api/backups", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {

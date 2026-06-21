@@ -9,9 +9,12 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - A background worker pool uploads in chunks with live progress (polled every 2s), automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit.
 - On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to your main account.
 - Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
+- Per-provider Download and Delete (typed `DELETE` confirmation) actions on completed backups, with overwrite-or-skip prompts when a file of the same name already exists on a selected account.
+- Search the backups list by title or subdirectory name; an "Accounts available" view shows each provider's accounts side by side with used/total quota and when it was last synced.
+- Quotas refresh automatically on a background interval (`quota.sync_interval_minutes`) and on demand via the "Refresh quotas now" button, in addition to refreshing after each successful upload.
 - Providers are pluggable: MEGA (email/password) and 4shared (OAuth 1.0) today, with a registry so new backends are a focused addition.
 
-Not yet implemented (planned): Download/Delete actions on uploaded backups, overwrite-on-conflict prompts, the subdirectory search bar, and the standalone "Accounts available" view.
+Not yet implemented (planned): per-provider rate limiting and periodic re-verification of random uploaded files.
 
 ## Prerequisites
 
@@ -84,7 +87,7 @@ Application behavior is tuned in `config.yml`; every value has a sensible defaul
 | `concurrency.max_concurrent_uploads` | `2` | Hard ceiling on simultaneous uploads across all accounts |
 | `concurrency.max_concurrent_per_account` | `1` | Simultaneous uploads per single account |
 | `verification.enabled` / `verify_on_upload` | `true` / `true` | Download the first chunk and compare checksum after upload |
-| `quota.sync_interval_minutes` | `60` | (Reserved) periodic quota polling; quota currently refreshes on job completion |
+| `quota.sync_interval_minutes` | `60` | How often the background poller refreshes every account's cached quota (also refreshed after each upload and via "Refresh quotas now") |
 
 Credentials are **not** in `config.yml` — they live in `.env` (see below).
 

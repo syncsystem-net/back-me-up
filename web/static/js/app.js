@@ -4,6 +4,11 @@ document.addEventListener('alpine:init', () => {
         backups: [],
         accounts: [],
         search: '',
+        // Server-side search results (subdirectory-name match). Populated when
+        // `search` is non-empty; the in-memory `backups` list is shown otherwise.
+        searchResults: [],
+        searchDebounce: null,
+        refreshingQuotas: false,
         showNewModal: false,
         newBackup: { title: '', source_path: '', account_ids: [] },
         creating: false,
@@ -35,10 +40,39 @@ document.addEventListener('alpine:init', () => {
         foursharedAccounts() {
             return this.accounts.filter(a => a.provider === 'fourshared');
         },
+        // When the search box has a term, show the server-side results (matched
+        // by subdirectory name, returned in the same shape as /api/backups);
+        // otherwise show the live in-memory list.
         filteredBackups() {
-            if (!this.search) return this.backups;
-            const q = this.search.toLowerCase();
-            return this.backups.filter(b => b.title.toLowerCase().includes(q));
+            const list = this.search ? this.searchResults : this.backups;
+            return list.map(b => ({ ...b, expanded: this.expandedIds.includes(b.id) }));
+        },
+        // Debounced fetch fired on each keystroke in the search box.
+        onSearchInput() {
+            clearTimeout(this.searchDebounce);
+            this.searchDebounce = setTimeout(() => this.runSearch(), 250);
+        },
+        async runSearch() {
+            const q = this.search.trim();
+            if (!q) { this.searchResults = []; return; }
+            const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+            if (!r.ok) { this.searchResults = []; return; }
+            this.searchResults = await r.json() || [];
+        },
+        // Human-readable "last synced" label for an account, or "never".
+        lastSynced(a) {
+            if (!a || !a.last_quota_sync) return 'never';
+            return new Date(a.last_quota_sync).toLocaleString();
+        },
+        async refreshQuotas() {
+            this.refreshingQuotas = true;
+            try {
+                const r = await fetch('/api/accounts/quota-sync', { method: 'POST' });
+                if (r.ok) this.accounts = await r.json() || [];
+                else await this.loadAccounts();
+            } finally {
+                this.refreshingQuotas = false;
+            }
         },
         totalGB() {
             let bytes = 0;
@@ -55,7 +89,13 @@ document.addEventListener('alpine:init', () => {
         },
         async refresh() {
             if (document.hidden) return;
-            await this.loadBackups();
+            // Don't reload the main list while a search is active, or it would
+            // clobber the displayed results; keep the search results fresh instead.
+            if (this.search) {
+                await this.runSearch();
+            } else {
+                await this.loadBackups();
+            }
             // Refresh quota numbers only while uploads are active (cheap, avoids churn).
             if (this.hasActiveJobs()) await this.loadAccounts();
         },
