@@ -12,9 +12,9 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - Per-provider Download and Delete (typed `DELETE` confirmation) actions on completed backups, with overwrite-or-skip prompts when a file of the same name already exists on a selected account.
 - Search the backups list by title or subdirectory name; an "Accounts available" view shows each provider's accounts side by side with used/total quota and when it was last synced.
 - Quotas refresh automatically on a background interval (`quota.sync_interval_minutes`) and on demand via the "Refresh quotas now" button, in addition to refreshing after each successful upload.
+- Per-provider rate limiting (`rate_limits.<provider>`) paces API requests and upload bandwidth so a large backup stays within each provider's limits.
+- Periodic re-verification (`verification.periodic_check_days`) re-downloads the first chunk of a random sample of already-uploaded files on a schedule and compares it to the checksum recorded at upload time; mismatches surface in the per-job logs modal.
 - Providers are pluggable: MEGA (email/password) and 4shared (OAuth 1.0) today, with a registry so new backends are a focused addition.
-
-Not yet implemented (planned): per-provider rate limiting and periodic re-verification of random uploaded files.
 
 ## Prerequisites
 
@@ -86,7 +86,10 @@ Application behavior is tuned in `config.yml`; every value has a sensible defaul
 | `concurrency.max_workers` | `5` | Worker pool goroutine count (claimers) |
 | `concurrency.max_concurrent_uploads` | `2` | Hard ceiling on simultaneous uploads across all accounts |
 | `concurrency.max_concurrent_per_account` | `1` | Simultaneous uploads per single account |
+| `rate_limits.<provider>.requests_per_second` | `10` (mega) / `5` (4shared) | Per-provider API request rate ceiling; `0` = unlimited |
+| `rate_limits.<provider>.bandwidth_mb_per_second` | `5` (mega) / `3` (4shared) | Per-provider upload bandwidth ceiling in MB/s; `0` = unlimited |
 | `verification.enabled` / `verify_on_upload` | `true` / `true` | Download the first chunk and compare checksum after upload |
+| `verification.periodic_check_days` | `30` | Re-verify a completed file if it hasn't been re-checked within this many days (an omitted/`0` value falls back to 30). Turn periodic re-verification off with `verification.enabled: false`. |
 | `quota.sync_interval_minutes` | `60` | How often the background poller refreshes every account's cached quota (also refreshed after each upload and via "Refresh quotas now") |
 
 Credentials are **not** in `config.yml` — they live in `.env` (see below).
@@ -193,6 +196,14 @@ Creating a backup writes one `pending` job per selected account. A background wo
 5. On failure (after retries): marks the job `failed`, records the error, and keeps the temp zip for a future retry.
 
 Click **logs** in a provider column to see that job's log history (including failure reasons) in a modal.
+
+### Rate limiting
+
+Each provider has its own request-rate and bandwidth ceiling under `rate_limits.<provider>` in `config.yml`. The limiter is a token bucket shared by every account of that provider (the limits are per-provider, not per-account). 4shared is paced per HTTP request and per upload chunk; MEGA is paced at chunk granularity only, because the MEGA library owns its own HTTP client and its individual requests aren't interceptable. Setting a rate to `0` disables that dimension.
+
+### Periodic re-verification
+
+When `verification.enabled` is on, a background re-verifier wakes on an interval derived from `periodic_check_days` (about a quarter of the period, clamped to between 1 and 24 hours) and re-checks a small random sample of completed backups that haven't been re-verified within the configured number of days. It re-downloads the first chunk and compares it to the checksum captured at upload time. A pass refreshes the file's last-verified timestamp; a mismatch or download failure is recorded in that job's logs (open the **logs** modal to see it). Re-verification only reports — it never re-uploads or deletes; acting on a failure is left to you.
 
 ## Development Workflow
 

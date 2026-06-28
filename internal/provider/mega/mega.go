@@ -18,14 +18,33 @@ import (
 
 // Client is a logged-in (or about-to-be) MEGA session bound to one account.
 type Client struct {
-	m *gomega.Mega
+	m       *gomega.Mega
+	limiter provider.RateLimiter
 }
 
 // New returns an unauthenticated MEGA client. The chunkSize argument is part of
 // the provider contract but ignored here: MEGA's protocol dictates its own
-// chunk boundaries via the upload session.
-func New(_ int64) *Client {
-	return &Client{m: gomega.New()}
+// chunk boundaries via the upload session. limiter (may be nil) paces requests
+// and bandwidth; because go-mega owns its own HTTP client, limiting here is
+// applied at chunk granularity rather than per underlying HTTP request.
+func New(_ int64, limiter provider.RateLimiter) *Client {
+	return &Client{m: gomega.New(), limiter: limiter}
+}
+
+// wait blocks for one request token (nil limiter is a no-op).
+func (c *Client) wait(ctx context.Context) error {
+	if c.limiter == nil {
+		return nil
+	}
+	return c.limiter.WaitRequest(ctx)
+}
+
+// waitBytes blocks for n bytes of bandwidth budget (nil limiter is a no-op).
+func (c *Client) waitBytes(ctx context.Context, n int) error {
+	if c.limiter == nil {
+		return nil
+	}
+	return c.limiter.WaitBytes(ctx, n)
 }
 
 func (c *Client) Name() string { return "mega" }
@@ -34,6 +53,9 @@ func (c *Client) Login(ctx context.Context, email, password string) error {
 	// go-mega's Login is blocking and not context-aware; honour an already
 	// cancelled context before spending a network round-trip.
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.wait(ctx); err != nil {
 		return err
 	}
 	if err := c.m.Login(email, password); err != nil {
@@ -75,6 +97,15 @@ func (c *Client) Upload(ctx context.Context, localPath, remoteName string, onPro
 		if _, err := f.ReadAt(buf, pos); err != nil && err != io.EOF {
 			return "", fmt.Errorf("reading chunk %d: %w", id, err)
 		}
+		// Pace per chunk: one request token, then this chunk's bytes of bandwidth.
+		// go-mega owns the underlying HTTP, so this is the finest granularity we
+		// can throttle MEGA at.
+		if err := c.wait(ctx); err != nil {
+			return "", err
+		}
+		if err := c.waitBytes(ctx, csize); err != nil {
+			return "", err
+		}
 		if err := u.UploadChunk(id, buf); err != nil {
 			return "", fmt.Errorf("uploading chunk %d/%d: %w", id+1, chunks, err)
 		}
@@ -109,6 +140,9 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := c.wait(ctx); err != nil {
+			return err
+		}
 		chunk, err := d.DownloadChunk(id)
 		if err != nil {
 			return fmt.Errorf("downloading chunk %d: %w", id, err)
@@ -125,6 +159,9 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 
 func (c *Client) FindByName(ctx context.Context, name string) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if err := c.wait(ctx); err != nil {
 		return "", false, err
 	}
 	root := c.m.FS.GetRoot()
@@ -144,6 +181,9 @@ func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
 	node := c.m.FS.HashLookup(remoteRef)
 	if node == nil {
 		return fmt.Errorf("mega node %q not found", remoteRef)
@@ -157,6 +197,9 @@ func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 
 func (c *Client) GetQuota(ctx context.Context) (int64, int64, error) {
 	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	if err := c.wait(ctx); err != nil {
 		return 0, 0, err
 	}
 	q, err := c.m.GetQuota()

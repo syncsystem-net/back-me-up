@@ -56,12 +56,28 @@ type Provider interface {
 	GetQuota(ctx context.Context) (totalBytes, usedBytes int64, err error)
 }
 
+// RateLimiter paces a provider's API requests and upload bandwidth. It is
+// declared here (rather than imported) so backends depend only on this package;
+// internal/ratelimit provides the concrete implementation. A nil RateLimiter
+// means no limiting, so providers must tolerate it.
+type RateLimiter interface {
+	// WaitRequest blocks until one request may proceed, or ctx is cancelled.
+	WaitRequest(ctx context.Context) error
+	// WaitBytes blocks until n bytes of bandwidth budget are available, or ctx is
+	// cancelled.
+	WaitBytes(ctx context.Context, n int) error
+}
+
 // Config carries provider-agnostic settings the registry passes to every
 // backend at construction time.
 type Config struct {
 	// ChunkSizeBytes is the preferred upload chunk size. Providers that control
 	// their own chunk boundaries (e.g. MEGA's protocol) may ignore it.
 	ChunkSizeBytes int64
+
+	// RateLimiter paces this provider's requests and bandwidth. May be nil (no
+	// limiting); providers must guard against that.
+	RateLimiter RateLimiter
 }
 
 // OAuthCreds carries the credentials an OAuth-based provider needs at

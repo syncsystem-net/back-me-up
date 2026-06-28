@@ -69,6 +69,16 @@ func migrate(db *sql.DB) error {
 	if err := addColumnIfMissing(db, "accounts", "last_quota_sync", "DATETIME"); err != nil {
 		return fmt.Errorf("accounts.last_quota_sync migration: %w", err)
 	}
+	// Additive columns for periodic re-verification: the first-chunk checksum
+	// captured at verify-on-upload time, and when the file was last re-verified
+	// against it. CREATE TABLE adds them for fresh databases; existing databases
+	// need an ALTER.
+	if err := addColumnIfMissing(db, "jobs", "verify_checksum", "TEXT"); err != nil {
+		return fmt.Errorf("jobs.verify_checksum migration: %w", err)
+	}
+	if err := addColumnIfMissing(db, "jobs", "last_verified_at", "DATETIME"); err != nil {
+		return fmt.Errorf("jobs.last_verified_at migration: %w", err)
+	}
 	return nil
 }
 
@@ -170,6 +180,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     chunks_total INTEGER DEFAULT 0,
     chunks_uploaded INTEGER DEFAULT 0,
     error_message TEXT,
+    verify_checksum TEXT,
+    last_verified_at DATETIME,
     started_at DATETIME,
     completed_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,

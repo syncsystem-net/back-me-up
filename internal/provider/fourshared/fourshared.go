@@ -39,14 +39,16 @@ type Client struct {
 	http      *http.Client
 	chunkSize int64
 	debug     bool
+	limiter   provider.RateLimiter
 }
 
 // New returns a 4shared client. consumerKey/consumerSecret are the application
 // credentials for this account; token/tokenSecret are the per-account access
 // token from the authorize step. chunkSize controls the size of each
-// Content-Range upload part. Set FOURSHARED_DEBUG=1 to log signed requests and
-// raw responses for troubleshooting auth.
-func New(chunkSize int64, consumerKey, consumerSecret, token, tokenSecret string) *Client {
+// Content-Range upload part. limiter (may be nil) paces every API request and
+// upload chunk. Set FOURSHARED_DEBUG=1 to log signed requests and raw responses
+// for troubleshooting auth.
+func New(chunkSize int64, limiter provider.RateLimiter, consumerKey, consumerSecret, token, tokenSecret string) *Client {
 	if chunkSize <= 0 {
 		chunkSize = 100 << 20 // 100MB fallback
 	}
@@ -73,10 +75,22 @@ func New(chunkSize int64, consumerKey, consumerSecret, token, tokenSecret string
 		},
 		chunkSize: chunkSize,
 		debug:     debug,
+		limiter:   limiter,
 	}
 }
 
 func (c *Client) Name() string { return "fourshared" }
+
+// do paces the request through the rate limiter (one request token) and sends
+// it. A nil limiter is a no-op. The request's own context drives the wait.
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	if c.limiter != nil {
+		if err := c.limiter.WaitRequest(req.Context()); err != nil {
+			return nil, err
+		}
+	}
+	return c.http.Do(req)
+}
 
 func (c *Client) Login(ctx context.Context, email, password string) error {
 	if c.signer.ConsumerKey == "" || c.signer.ConsumerSecret == "" {
@@ -105,7 +119,7 @@ func (c *Client) getUser(ctx context.Context) (*user, error) {
 		return nil, err
 	}
 	c.signer.Sign(req, nil)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("GET /user: %w", err)
 	}
@@ -161,8 +175,9 @@ func (c *Client) Upload(ctx context.Context, localPath, remoteName string, onPro
 		return "", err
 	}
 
-	// Start (or, server-side, find) the upload session.
-	init, err := c.startUpload(ctx, u.RootFolderID, remoteName, size)
+	// Start (or, server-side, find) the upload session. allowReplace=true lets it
+	// recover from a residual same-name file (see startUpload).
+	init, err := c.startUpload(ctx, u.RootFolderID, remoteName, size, true)
 	if err != nil {
 		return "", err
 	}
@@ -204,7 +219,16 @@ func (c *Client) Upload(ctx context.Context, localPath, remoteName string, onPro
 	return init.ID, nil
 }
 
-func (c *Client) startUpload(ctx context.Context, folderID, name string, size int64) (*uploadInit, error) {
+// startUpload opens (or server-side resumes) an upload session for name in
+// folderID. Unlike MEGA, 4shared rejects a second file with an existing name at
+// upload-init time with 403.0201 ("already exists") instead of overwriting. The
+// conflict pre-check (handlers.resolveConflicts) normally deletes a duplicate
+// before the job is queued, but it can miss one — e.g. a prior upload that
+// failed partway leaves the name reserved without showing in the folder listing.
+// Because a queued job means the user already opted to upload to this account
+// (choosing "skip" creates no job), allowReplace lets startUpload delete the
+// existing same-name file and retry the init once rather than failing the job.
+func (c *Client) startUpload(ctx context.Context, folderID, name string, size int64, allowReplace bool) (*uploadInit, error) {
 	// 4shared requires POST/PUT parameters in the request body (form-encoded),
 	// not the query string (error 400.0504 otherwise). Form params are also part
 	// of the OAuth signature base string, so set req.Form for the signer.
@@ -221,7 +245,7 @@ func (c *Client) startUpload(ctx context.Context, folderID, name string, size in
 	req.Form = form // include the body params in the OAuth signature
 	c.signer.Sign(req, nil)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("POST /upload: %w", err)
 	}
@@ -229,6 +253,25 @@ func (c *Client) startUpload(ctx context.Context, folderID, name string, size in
 	body, _ := io.ReadAll(resp.Body)
 	if c.debug {
 		slog.Info("4shared POST /upload response", "status", resp.StatusCode, "body", string(body))
+	}
+	if resp.StatusCode == http.StatusForbidden && isAlreadyExists(body) {
+		if !allowReplace {
+			return nil, fmt.Errorf("POST /upload: 4shared still reports %q exists after replace attempt: %s", name, string(body))
+		}
+		// A same-name file is occupying this name. Find and delete it, then retry
+		// the init once (allowReplace=false so we don't loop).
+		ref, found, ferr := c.FindByName(ctx, name)
+		if ferr != nil {
+			return nil, fmt.Errorf("POST /upload: %q already exists and the lookup to replace it failed: %w", name, ferr)
+		}
+		if !found {
+			return nil, fmt.Errorf("POST /upload: 4shared reports %q already exists but it is not in the folder listing to replace "+
+				"(likely an incomplete prior upload reserving the name); delete it from the 4shared web UI and retry: %s", name, string(body))
+		}
+		if derr := c.Delete(ctx, ref); derr != nil {
+			return nil, fmt.Errorf("POST /upload: %q already exists and could not be replaced: %w", name, derr)
+		}
+		return c.startUpload(ctx, folderID, name, size, false)
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return nil, fmt.Errorf("POST /upload: 4shared returned %d: %s", resp.StatusCode, string(body))
@@ -259,7 +302,14 @@ func (c *Client) uploadChunk(ctx context.Context, uploadID string, chunk []byte,
 	req.ContentLength = int64(len(chunk))
 	c.signer.Sign(req, nil)
 
-	resp, err := c.http.Do(req)
+	// Pace bandwidth before sending the chunk body (do() handles the request
+	// token). A nil limiter is a no-op.
+	if c.limiter != nil {
+		if err := c.limiter.WaitBytes(ctx, len(chunk)); err != nil {
+			return err
+		}
+	}
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("POST /upload/%s: %w", uploadID, err)
 	}
@@ -282,7 +332,7 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 		return err
 	}
 	c.signer.Sign(req, nil)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("GET /files/%s/download: %w", remoteRef, err)
 	}
@@ -302,41 +352,24 @@ type fileEntry struct {
 	Name string `json:"name"`
 }
 
+// folderFilesPaths are the candidate URL templates (relative to apiBase) for
+// listing a folder's files. 4shared's docs are inconsistent about whether the
+// folder resource is singular ("folder") or plural ("folders"), and the wrong
+// one returns 404 ("Resource not found", 404.0400). listFolderFiles tries each
+// in order and uses the first that doesn't 404, so we work regardless of which
+// spelling the account's API actually honours.
+var folderFilesPaths = []string{"/folders/%s/files", "/folder/%s/files"}
+
 // FindByName lists the account's root folder and returns the id of the first
-// file whose name matches. 4shared's listing response is decoded defensively:
-// it may be a bare array or an object with a "files" array.
+// file whose name matches.
 func (c *Client) FindByName(ctx context.Context, name string) (string, bool, error) {
 	u, err := c.getUser(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+"/folder/"+u.RootFolderID+"/files", nil)
+	files, err := c.listFolderFiles(ctx, u.RootFolderID)
 	if err != nil {
 		return "", false, err
-	}
-	c.signer.Sign(req, nil)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", false, fmt.Errorf("GET /folder/%s/files: %w", u.RootFolderID, err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if c.debug {
-		slog.Info("4shared folder files response", "status", resp.StatusCode, "body", string(body))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", false, fmt.Errorf("GET /folder/%s/files: 4shared returned %d: %s", u.RootFolderID, resp.StatusCode, string(body))
-	}
-
-	var files []fileEntry
-	if err := json.Unmarshal(body, &files); err != nil {
-		var wrapped struct {
-			Files []fileEntry `json:"files"`
-		}
-		if err2 := json.Unmarshal(body, &wrapped); err2 != nil {
-			return "", false, fmt.Errorf("decoding folder files %q: %w", string(body), err)
-		}
-		files = wrapped.Files
 	}
 	for _, f := range files {
 		if f.Name == name {
@@ -346,13 +379,68 @@ func (c *Client) FindByName(ctx context.Context, name string) (string, bool, err
 	return "", false, nil
 }
 
+// listFolderFiles returns the files in folderID, probing the candidate path
+// spellings until one responds non-404. The response is decoded defensively: it
+// may be a bare array or an object with a "files" array.
+func (c *Client) listFolderFiles(ctx context.Context, folderID string) ([]fileEntry, error) {
+	var lastErr error
+	for _, tmpl := range folderFilesPaths {
+		path := fmt.Sprintf(tmpl, folderID)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.signer.Sign(req, nil)
+		resp, err := c.do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GET %s: %w", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if c.debug {
+			slog.Info("4shared folder files response", "path", path, "status", resp.StatusCode, "body", string(body))
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			// Wrong spelling for this API; remember the error and try the next.
+			lastErr = fmt.Errorf("GET %s: 4shared returned 404: %s", path, string(body))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("GET %s: 4shared returned %d: %s", path, resp.StatusCode, string(body))
+		}
+		files, err := decodeFileList(body)
+		if err != nil {
+			return nil, fmt.Errorf("decoding %s %q: %w", path, string(body), err)
+		}
+		slog.Info("4shared folder listing path resolved", "path", path)
+		return files, nil
+	}
+	return nil, lastErr
+}
+
+// decodeFileList parses a folder's file listing, which 4shared may return as a
+// bare array or as an object wrapping a "files" array.
+func decodeFileList(body []byte) ([]fileEntry, error) {
+	var files []fileEntry
+	if err := json.Unmarshal(body, &files); err == nil {
+		return files, nil
+	}
+	var wrapped struct {
+		Files []fileEntry `json:"files"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, err
+	}
+	return wrapped.Files, nil
+}
+
 func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiBase+"/files/"+remoteRef, nil)
 	if err != nil {
 		return err
 	}
 	c.signer.Sign(req, nil)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return fmt.Errorf("DELETE /files/%s: %w", remoteRef, err)
 	}
@@ -367,4 +455,11 @@ func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 func apiError(op string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	return fmt.Errorf("%s: 4shared returned %d: %s", op, resp.StatusCode, string(body))
+}
+
+// isAlreadyExists reports whether a 4shared error body is the "name already
+// exists" rejection (code 403.0201) returned by upload-init for a duplicate name.
+func isAlreadyExists(body []byte) bool {
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "403.0201") || strings.Contains(s, "already exists")
 }

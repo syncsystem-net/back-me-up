@@ -54,7 +54,7 @@ func main() {
 	fmt.Printf("  oauth_token present: %v\n", acct.OAuthToken != "")
 	fmt.Printf("  oauth_token_secret present: %v\n\n", acct.OAuthTokenSecret != "")
 
-	c := fourshared.New(0, acct.ConsumerKey, acct.ConsumerSecret, acct.OAuthToken, acct.OAuthTokenSecret)
+	c := fourshared.New(0, nil, acct.ConsumerKey, acct.ConsumerSecret, acct.OAuthToken, acct.OAuthTokenSecret)
 	total, used, err := c.GetQuota(context.Background())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nFAILED: %v\n", err)
