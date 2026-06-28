@@ -11,6 +11,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/config"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
+	"github.com/syncsystem-net/back-me-up/internal/ratelimit"
 	"github.com/syncsystem-net/back-me-up/internal/server"
 	"github.com/syncsystem-net/back-me-up/internal/worker"
 )
@@ -44,6 +45,10 @@ func main() {
 	if err := syncAccountsToDB(db, accts); err != nil {
 		slog.Warn("failed to sync accounts to database", "error", err)
 	}
+
+	// Install per-provider rate limiters (request rate + bandwidth) so every
+	// provider built via the registry is paced automatically.
+	ratelimit.Configure(rateLimitSet(cfg))
 
 	// Start the background upload worker pool. It runs for the life of the
 	// process, claiming pending jobs and uploading them to their providers.
@@ -80,7 +85,51 @@ func workerConfig(cfg *config.Config) worker.Config {
 		BackoffMultiplier:       cfg.RetryPolicy.BackoffMultiplier,
 		VerifyOnUpload:          cfg.Verification.Enabled && cfg.Verification.VerifyOnUpload,
 		PollInterval:            2 * time.Second,
+		PeriodicCheckDays:       periodicCheckDays(cfg),
+		ReverifyInterval:        reverifyInterval(periodicCheckDays(cfg)),
 	}
+}
+
+// reverifyInterval derives how often the re-verifier scans from the configured
+// check period: roughly a quarter of the period so files are re-checked
+// reasonably soon after becoming due, clamped to [1h, 24h] so it neither busy-
+// loops on a short period nor sleeps for days on a long one.
+func reverifyInterval(days int) time.Duration {
+	if days <= 0 {
+		return 24 * time.Hour // unused (the loop won't start), but a sane value
+	}
+	interval := time.Duration(days) * 24 * time.Hour / 4
+	if interval < time.Hour {
+		return time.Hour
+	}
+	if interval > 24*time.Hour {
+		return 24 * time.Hour
+	}
+	return interval
+}
+
+// periodicCheckDays returns the re-verify cadence in days, or 0 (disabled) when
+// verification is off. Re-verification relies on checksums captured during
+// verify-on-upload, so it is meaningful only while verification is enabled.
+func periodicCheckDays(cfg *config.Config) int {
+	if !cfg.Verification.Enabled {
+		return 0
+	}
+	return cfg.Verification.PeriodicCheckDays
+}
+
+// rateLimitSet builds the per-provider limiter set from config. Bandwidth is
+// given in MB/s and converted to bytes/s; a zero rate leaves that dimension
+// unlimited.
+func rateLimitSet(cfg *config.Config) *ratelimit.Set {
+	const mb = 1 << 20
+	mkLimiter := func(rl config.ProviderRateLimit) *ratelimit.Limiter {
+		return ratelimit.New(float64(rl.RequestsPerSecond), float64(rl.BandwidthMBPerSecond)*mb)
+	}
+	return ratelimit.NewSet(map[string]*ratelimit.Limiter{
+		"mega":       mkLimiter(cfg.RateLimits.Mega),
+		"fourshared": mkLimiter(cfg.RateLimits.FourShared),
+	})
 }
 
 func syncAccountsToDB(db *sql.DB, accts *accounts.AccountStore) error {

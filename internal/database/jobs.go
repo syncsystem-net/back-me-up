@@ -139,6 +139,77 @@ func CompleteJob(db *sql.DB, id int64, remotePath string) error {
 	return nil
 }
 
+// SetJobVerified records the first-chunk checksum captured during
+// verify-on-upload and stamps the job as verified now. Called after a successful
+// upload verification so periodic re-verification has a reference to compare
+// against later (the temp zip is deleted, so the checksum is the only record).
+func SetJobVerified(db *sql.DB, id int64, checksum string) error {
+	_, err := db.Exec(
+		`UPDATE jobs SET verify_checksum = ?, last_verified_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		checksum, id,
+	)
+	if err != nil {
+		return fmt.Errorf("recording job verification: %w", err)
+	}
+	return nil
+}
+
+// TouchJobVerified stamps last_verified_at to now after a successful periodic
+// re-verification, leaving the stored checksum unchanged.
+func TouchJobVerified(db *sql.DB, id int64) error {
+	_, err := db.Exec(`UPDATE jobs SET last_verified_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("touching job verification: %w", err)
+	}
+	return nil
+}
+
+// ListJobsDueForReverify returns up to limit completed jobs that carry a stored
+// verify checksum and have not been re-verified since olderThan (or never).
+// Selection is randomized so the periodic checker samples different files across
+// runs rather than always re-checking the same ones.
+func ListJobsDueForReverify(db *sql.DB, olderThan time.Time, limit int) ([]*Job, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	rows, err := db.Query(
+		`SELECT `+jobColumns+`
+		 FROM jobs j
+		 JOIN accounts a ON j.account_id = a.id
+		 WHERE j.status = 'complete'
+		   AND j.verify_checksum IS NOT NULL AND j.verify_checksum != ''
+		   AND (j.last_verified_at IS NULL OR j.last_verified_at < ?)
+		 ORDER BY RANDOM()
+		 LIMIT ?`,
+		olderThan, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing jobs due for reverify: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []*Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning reverify job row: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// VerifyChecksum returns the stored first-chunk checksum for a job (empty if
+// none recorded). Used by the periodic re-verifier to compare against the
+// freshly downloaded head.
+func VerifyChecksum(db *sql.DB, id int64) (string, error) {
+	var sum sql.NullString
+	if err := db.QueryRow(`SELECT verify_checksum FROM jobs WHERE id = ?`, id).Scan(&sum); err != nil {
+		return "", fmt.Errorf("reading verify checksum: %w", err)
+	}
+	return sum.String, nil
+}
+
 // FailJob marks a job failed and records the error message.
 func FailJob(db *sql.DB, id int64, errMsg string) error {
 	_, err := db.Exec(

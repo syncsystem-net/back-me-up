@@ -18,9 +18,9 @@ import (
 func New(name string, oauth provider.OAuthCreds, cfg provider.Config) (provider.Provider, error) {
 	switch name {
 	case "mega":
-		return mega.New(cfg.ChunkSizeBytes), nil
+		return mega.New(cfg.ChunkSizeBytes, cfg.RateLimiter), nil
 	case "fourshared":
-		return fourshared.New(cfg.ChunkSizeBytes, oauth.ConsumerKey, oauth.ConsumerSecret, oauth.Token, oauth.TokenSecret), nil
+		return fourshared.New(cfg.ChunkSizeBytes, cfg.RateLimiter, oauth.ConsumerKey, oauth.ConsumerSecret, oauth.Token, oauth.TokenSecret), nil
 	default:
 		return nil, fmt.Errorf("unknown provider %q", name)
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 	"github.com/syncsystem-net/back-me-up/internal/provider/registry"
+	"github.com/syncsystem-net/back-me-up/internal/ratelimit"
 )
 
 // errEnoughBytes halts a verification download once the first chunk has been
@@ -24,27 +25,47 @@ var errEnoughBytes = errors.New("verify: first chunk read")
 // verify downloads the first chunk of the uploaded object and compares its
 // SHA-256 with the same span of the local zip. This is a cheap integrity check
 // that catches a corrupted or truncated upload without re-downloading gigabytes.
-func (w *Worker) verify(ctx context.Context, p provider.Provider, job *database.Job, remoteRef string) error {
+// It returns the verified first-chunk checksum so the caller can persist it for
+// later periodic re-verification (by then the local zip is gone).
+func (w *Worker) verify(ctx context.Context, p provider.Provider, job *database.Job, remoteRef string) (string, error) {
+	limit := w.verifyLimit()
+
+	localSum, err := hashFileHead(job.ZipPath, limit)
+	if err != nil {
+		return "", fmt.Errorf("hashing local head: %w", err)
+	}
+
+	remoteSum, err := w.downloadHeadSum(ctx, p, remoteRef, limit)
+	if err != nil {
+		return "", err
+	}
+
+	if localSum != remoteSum {
+		return "", fmt.Errorf("checksum mismatch (local %s != remote %s)", localSum[:12], remoteSum[:12])
+	}
+	return localSum, nil
+}
+
+// verifyLimit is the number of leading bytes verification hashes (the configured
+// chunk size, with a sane fallback). Both upload verification and periodic
+// re-verification hash this same span; changing chunk_size_mb between an
+// upload and a later re-verify can therefore cause a false mismatch.
+func (w *Worker) verifyLimit() int64 {
 	limit := w.cfg.ChunkSizeBytes
 	if limit <= 0 {
 		limit = 100 << 20
 	}
+	return limit
+}
 
-	localSum, err := hashFileHead(job.ZipPath, limit)
-	if err != nil {
-		return fmt.Errorf("hashing local head: %w", err)
-	}
-
+// downloadHeadSum downloads the first limit bytes of remoteRef and returns their
+// hex SHA-256, stopping the transfer once enough bytes have been read.
+func (w *Worker) downloadHeadSum(ctx context.Context, p provider.Provider, remoteRef string, limit int64) (string, error) {
 	cw := &cappedHasher{h: sha256.New(), limit: limit}
 	if err := p.Download(ctx, remoteRef, cw); err != nil && !errors.Is(err, errEnoughBytes) {
-		return fmt.Errorf("downloading head: %w", err)
+		return "", fmt.Errorf("downloading head: %w", err)
 	}
-	remoteSum := fmt.Sprintf("%x", cw.h.Sum(nil))
-
-	if localSum != remoteSum {
-		return fmt.Errorf("checksum mismatch (local %s != remote %s)", localSum[:12], remoteSum[:12])
-	}
-	return nil
+	return fmt.Sprintf("%x", cw.h.Sum(nil)), nil
 }
 
 // backupDatabase checkpoints the WAL, copies the SQLite file, and uploads the
@@ -73,7 +94,10 @@ func (w *Worker) backupDatabase(ctx context.Context) {
 	}
 	defer os.Remove(tmp)
 
-	p, err := registry.New(string(main.Provider), w.mainOAuth(), provider.Config{ChunkSizeBytes: w.cfg.ChunkSizeBytes})
+	p, err := registry.New(string(main.Provider), w.mainOAuth(), provider.Config{
+		ChunkSizeBytes: w.cfg.ChunkSizeBytes,
+		RateLimiter:    ratelimit.For(string(main.Provider)),
+	})
 	if err != nil {
 		slog.Warn("building main provider failed", "error", err)
 		return

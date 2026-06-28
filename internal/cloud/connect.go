@@ -13,6 +13,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 	"github.com/syncsystem-net/back-me-up/internal/provider/registry"
+	"github.com/syncsystem-net/back-me-up/internal/ratelimit"
 )
 
 // Connect resolves the credentials for (providerName, email) from the account
@@ -24,7 +25,10 @@ func Connect(ctx context.Context, store *accounts.AccountStore, providerName, em
 	if !ok {
 		return nil, fmt.Errorf("no credentials in .env for %s account %s", providerName, email)
 	}
-	p, err := registry.New(providerName, oauthFor(acct), provider.Config{ChunkSizeBytes: chunkSizeBytes})
+	p, err := registry.New(providerName, oauthFor(acct), provider.Config{
+		ChunkSizeBytes: chunkSizeBytes,
+		RateLimiter:    ratelimit.For(providerName),
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -34,6 +34,12 @@ type Config struct {
 	BackoffMultiplier       int
 	VerifyOnUpload          bool
 	PollInterval            time.Duration
+
+	// PeriodicCheckDays re-verifies a completed file if it has not been checked
+	// within this many days. Zero disables periodic re-verification.
+	PeriodicCheckDays int
+	// ReverifyInterval is how often the re-verifier wakes to look for due files.
+	ReverifyInterval time.Duration
 }
 
 // Worker owns the upload pool and its dependencies.
@@ -92,6 +98,10 @@ func (w *Worker) Start(ctx context.Context) {
 		go w.loop(ctx, i)
 	}
 	slog.Info("upload worker pool started", "workers", w.cfg.MaxWorkers, "max_concurrent_uploads", w.cfg.MaxConcurrentUploads)
+
+	if w.cfg.PeriodicCheckDays > 0 {
+		go w.reverifyLoop(ctx)
+	}
 }
 
 func (w *Worker) loop(ctx context.Context, id int) {
@@ -159,16 +169,26 @@ func (w *Worker) process(ctx context.Context, job *database.Job) {
 	}
 
 	// Verify the upload by comparing the checksum of the first chunk.
+	var verifiedSum string
 	if w.cfg.VerifyOnUpload {
-		if err := w.verify(ctx, p, job, remoteRef); err != nil {
+		sum, err := w.verify(ctx, p, job, remoteRef)
+		if err != nil {
 			w.fail(job, fmt.Sprintf("verification failed: %v", err))
 			return
 		}
+		verifiedSum = sum
 		w.log(job.ID, "info", "verification passed")
 	}
 
 	if err := database.CompleteJob(w.db, job.ID, remoteRef); err != nil {
 		slog.Error("marking job complete failed", "job", job.ID, "error", err)
+	}
+	// Persist the verified checksum so periodic re-verification can re-check this
+	// file later, once the local temp zip is gone.
+	if verifiedSum != "" {
+		if err := database.SetJobVerified(w.db, job.ID, verifiedSum); err != nil {
+			slog.Warn("recording job verification failed", "job", job.ID, "error", err)
+		}
 	}
 	w.log(job.ID, "info", "upload complete")
 
