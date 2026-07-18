@@ -54,6 +54,14 @@ func migrate(db *sql.DB) error {
 	if err := migrateAccountsUniqueConstraint(db); err != nil {
 		return fmt.Errorf("accounts migration: %w", err)
 	}
+	// PR #7 reshapes backups to be per-user (owner_email) with an intermediate
+	// backup_zips table that jobs reference. The old model tied jobs directly to a
+	// single-upload backup, so pre-existing backup/job rows can't be mapped onto
+	// the new relationships. Clear them (accounts are always re-synced from .env,
+	// so only disposable backup test data is lost) before adding the new columns.
+	if err := clearBackupsIfLegacy(db); err != nil {
+		return fmt.Errorf("per-user backups migration: %w", err)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
@@ -78,6 +86,76 @@ func migrate(db *sql.DB) error {
 	}
 	if err := addColumnIfMissing(db, "jobs", "last_verified_at", "DATETIME"); err != nil {
 		return fmt.Errorf("jobs.last_verified_at migration: %w", err)
+	}
+	// PR #7: the user (email) that owns the backup record, and the zip a job
+	// uploads. CREATE TABLE above adds them for fresh databases; existing
+	// databases need an ALTER.
+	if err := addColumnIfMissing(db, "backups", "owner_email", "TEXT"); err != nil {
+		return fmt.Errorf("backups.owner_email migration: %w", err)
+	}
+	if err := addColumnIfMissing(db, "jobs", "zip_id", "INTEGER"); err != nil {
+		return fmt.Errorf("jobs.zip_id migration: %w", err)
+	}
+	// Indexes over ALTER-added columns must be created here, not in the schema
+	// block above: on an existing database `CREATE TABLE IF NOT EXISTS jobs` is a
+	// no-op, so the column does not exist yet when that block runs.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_zip_id ON jobs(zip_id)`); err != nil {
+		return fmt.Errorf("jobs.zip_id index: %w", err)
+	}
+	return nil
+}
+
+// columnExists reports whether table has a column named column, using
+// PRAGMA table_info. Returns false (no error) when the table does not exist.
+func columnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("reading %s columns: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("scanning %s columns: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// clearBackupsIfLegacy wipes backup/job rows when the backups table predates the
+// per-user reshape (no owner_email column). Rows are deleted child-first so FK
+// constraints don't block. A fresh database (no backups table) is a no-op — the
+// schema will create the new shape directly.
+func clearBackupsIfLegacy(db *sql.DB) error {
+	var exists int
+	if err := db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='backups'`).Scan(&exists); err == sql.ErrNoRows {
+		return nil // fresh database
+	} else if err != nil {
+		return fmt.Errorf("checking backups table: %w", err)
+	}
+	hasOwner, err := columnExists(db, "backups", "owner_email")
+	if err != nil {
+		return err
+	}
+	if hasOwner {
+		return nil // already migrated
+	}
+	slog.Info("migrating to per-user backups: clearing legacy backup/job rows")
+	for _, stmt := range []string{
+		`DELETE FROM job_logs`,
+		`DELETE FROM jobs`,
+		`DELETE FROM backup_directories`,
+		`DELETE FROM backups`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("clearing legacy rows (%s): %w", stmt, err)
+		}
 	}
 	return nil
 }
@@ -140,9 +218,21 @@ func migrateAccountsUniqueConstraint(db *sql.DB) error {
 const schema = `
 CREATE TABLE IF NOT EXISTS backups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_email TEXT,
     title TEXT NOT NULL,
     source_path TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS backup_zips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backup_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    size_bytes INTEGER DEFAULT 0,
+    tree_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (backup_id) REFERENCES backups(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS backup_directories (
@@ -170,6 +260,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     backup_id INTEGER NOT NULL,
+    zip_id INTEGER,
     account_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     zip_path TEXT,
@@ -199,6 +290,7 @@ CREATE TABLE IF NOT EXISTS job_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backup_directories_backup_id ON backup_directories(backup_id);
+CREATE INDEX IF NOT EXISTS idx_backup_zips_backup_id ON backup_zips(backup_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_backup_id ON jobs(backup_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_account_id ON jobs(account_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);

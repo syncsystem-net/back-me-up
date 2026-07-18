@@ -4,13 +4,13 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 
 ## Features
 
-- Point at a directory, give the backup a title, and pick one or more cloud accounts to upload to.
-- Each backup is zipped (named after the directory) and scanned two levels deep; the subdirectory tree is recorded and shown in an expandable row.
+- The backups table is grouped by **user** (account email): the same email configured on both MEGA and 4shared shows as one row, and every configured account appears even before its first upload.
+- Point at a directory from a user's row (Upload / Edit), give the backup a title (defaults to the folder name), and it uploads to that user's accounts. A record belongs to one user and **accumulates zips** over time — each upload adds another archive, and every zip's directory tree is recorded and shown under "Files: expand".
 - A background worker pool uploads in chunks with live progress (polled every 2s), automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit.
 - On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to your main account.
 - Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
-- Per-provider Download and Delete (typed `DELETE` confirmation) actions on completed backups, with overwrite-or-skip prompts when a file of the same name already exists on a selected account.
-- Search the backups list by title or subdirectory name; an "Accounts available" view shows each provider's accounts side by side with used/total quota and when it was last synced.
+- Per-provider Download and Delete-All actions, plus record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
+- Real-time search filters the backups table by user, title, or file name as you type; an "Accounts" view groups each provider's accounts in expandable cards with used/total quota and when it was last synced.
 - Quotas refresh automatically on a background interval (`quota.sync_interval_minutes`) and on demand via the "Refresh quotas now" button, in addition to refreshing after each successful upload.
 - Per-provider rate limiting (`rate_limits.<provider>`) paces API requests and upload bandwidth so a large backup stays within each provider's limits.
 - Periodic re-verification (`verification.periodic_check_days`) re-downloads the first chunk of a random sample of already-uploaded files on a schedule and compares it to the checksum recorded at upload time; mismatches surface in the per-job logs modal.
@@ -137,14 +137,14 @@ Authorization needs a **callback domain**. 4shared rejects `localhost` ("Invalid
 
 **Step 1 — Point a domain at your machine (one time per account).**
 
-Pick a subdomain of a domain you own, e.g. `backmeup.syncsystem.net`, and make it resolve to loopback so the OAuth callback reaches the helper running locally.
+Pick a subdomain of a domain you own, e.g. `backmeup.mydomainexample.com`, and make it resolve to loopback so the OAuth callback reaches the helper running locally.
 
-- **Option A — public DNS (recommended):** in your DNS provider, add an **A record** with type `A`, host `backmeup` (i.e. `backmeup.syncsystem.net`), and value `127.0.0.1`. Do **not** use a CNAME to your real site — the browser would follow your site's http→https/www redirects and you'd lose the callback.
-- **Option B — if your DNS panel refuses a 127.0.0.1 record:** skip public DNS and add a line to your hosts file (`C:\Windows\System32\drivers\etc\hosts`, edited as Administrator): `127.0.0.1   backmeup.syncsystem.net`.
+- **Option A — public DNS (recommended):** in your DNS provider, add an **A record** with type `A`, host `backmeup` (i.e. `backmeup.mydomainexample.com`), and value `127.0.0.1`. Do **not** use a CNAME to your real site — the browser would follow your site's http→https/www redirects and you'd lose the callback.
+- **Option B — if your DNS panel refuses a 127.0.0.1 record:** skip public DNS and add a line to your hosts file (`C:\Windows\System32\drivers\etc\hosts`, edited as Administrator): `127.0.0.1   backmeup.mydomainexample.com`.
 
 Then set it in `.env`:
 ```env
-FOURSHARED_ACCOUNT_1_CONSUMER_DOMAIN=backmeup.syncsystem.net
+FOURSHARED_ACCOUNT_1_CONSUMER_DOMAIN=backmeup.mydomainexample.com
 ```
 
 **Step 2 — Register the 4shared application (one time per account).**
@@ -153,7 +153,7 @@ Sign in to the 4shared account you want to authorize, go to <https://www.4shared
 
 - **Application title**: `BackMeUp`
 - **Application description**: `Personal backup uploader`
-- **Application domain**: your domain without the scheme, exactly matching Step 1 — `backmeup.syncsystem.net`
+- **Application domain**: your domain without the scheme, exactly matching Step 1 — `backmeup.mydomainexample.com`
 - Leave the **Initiate / Authorize / Request token addresses** at their shown defaults (`https://api.4shared.com/v1_2/oauth/initiate`, `/authorize`, `/token`).
 
 Click **Create**. The page now shows a **Consumer Key** and **Consumer Secret** — copy both into `.env`:
@@ -169,7 +169,7 @@ Run the bundled helper for that account number — it reads the consumer key, se
 go run ./cmd/fourshared-auth -account 1
 ```
 
-The helper starts a local server on `127.0.0.1:8723` and opens your browser to the 4shared authorize page. Log in to the account and click **Allow**. 4shared redirects to `http://backmeup.syncsystem.net:8723/callback?...`, which resolves to your machine and hits the helper; the browser shows *"BackMeUp: 4shared authorized"* and the terminal prints the two token lines:
+The helper starts a local server on `127.0.0.1:8723` and opens your browser to the 4shared authorize page. Log in to the account and click **Allow**. 4shared redirects to `http://backmeup.mydomainexample.com:8723/callback?...`, which resolves to your machine and hits the helper; the browser shows *"BackMeUp: 4shared authorized"* and the terminal prints the two token lines:
 ```env
 FOURSHARED_ACCOUNT_1_OAUTH_TOKEN=...
 FOURSHARED_ACCOUNT_1_OAUTH_TOKEN_SECRET=...
