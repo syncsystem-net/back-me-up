@@ -185,6 +185,25 @@ This directory is not pushed to the repo (it's in .gitignore via dev-tools/).
 
 ---
 
+## Roadmap: Ticket #7 (frontend refactor) — shipped in phases
+
+Ticket #7 was too large for one PR. Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/7-frontend-refactor-phases.md`. Design exports live in `dev-tools/prompts/layout/`.
+
+**Decisions locked with the user (apply to all phases):**
+- Grouping key is the **account email** — the same email on MEGA and 4shared is one "user". No account schema change.
+- A backup record belongs to **one user and accumulates zips**; re-uploading appends another zip to the same record. Title is editable.
+- **Every configured user appears as a row**, even with zero uploads.
+- **No top-level "+ New Backup"** — uploads go through the per-row Upload / Edit.
+- Full recursive tree is **capped by config, default 3 levels**.
+
+**Phase 7a — redesign + per-user model: DONE.** `backups.owner_email`, `backup_zips` (with `tree_json`), `jobs.zip_id`, `GET /api/users`, record-level delete, full CSS/HTML rewrite to the Figma design.
+
+**Phase 7b — NEXT:** recursive scanner with a new `scan.max_depth` config (default 3); accent-insensitive exclude terms; DB-backed **Settings** UI (wire the currently-disabled Settings button); interactive expand-all/per-node JSON tree replacing the read-only `<pre>`; title edit updates the file JSON; global JSON search across `backup_zips.tree_json`. Legacy `backup_directories` + `GET /api/backups` are now unused and can be removed.
+
+**Phase 7c:** auto-sync remote crawl (wire the disabled **Auto-Sync** button). Needs a new `List` method on `provider.Provider` — MEGA can use `FS.GetChildren`, 4shared already has `listFolderFiles` (add a `Size` field). Reuse `cloud.Connect` + the `quota.SyncAll` iteration pattern.
+
+---
+
 ## Technical Notes
 
 Lessons learned and recurring patterns from development. Reference before implementing related features.
@@ -201,6 +220,14 @@ db.Exec(`DELETE FROM jobs`)       // removes FK ref to accounts
 db.Exec(`DROP TABLE IF EXISTS accounts`)  // now succeeds
 ```
 Alternative: rename the old table first (`ALTER TABLE accounts RENAME TO accounts_old`), recreate with new schema, then drop the renamed copy — no FK issues since nothing references `accounts_old`.
+
+**Index over an ALTER-added column must be created after the ALTER**
+Never put `CREATE INDEX ... ON t(col)` in the `schema` const when `col` is added later via `addColumnIfMissing`. On an existing database `CREATE TABLE IF NOT EXISTS t` is a **no-op**, so the column does not exist when the schema block runs and the index fails with `no such column`. Create such indexes after the additive column migrations:
+```go
+addColumnIfMissing(db, "jobs", "zip_id", "INTEGER")
+db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_zip_id ON jobs(zip_id)`)
+```
+This broke the first real PR #7 migration run even though fresh-database tests passed. **Always test the upgrade path, not just the greenfield path** — `TestMigrateFromLegacySchema` in `internal/database` builds a real pre-migration DB and now guards it.
 
 **Schema migrations for tables with FK references**
 Never use plain `DROP TABLE` in a migration when another table has live rows pointing to it. Always either clear the child rows first or use the rename pattern above.

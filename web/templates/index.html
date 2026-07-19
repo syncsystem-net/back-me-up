@@ -8,250 +8,303 @@
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body x-data="app">
-    <header>
-        <h1>BackMeUp</h1>
-        <nav>
-            <a href="/" :class="{ active: page === 'backups' }" @click.prevent="page = 'backups'">Backups</a>
-            <a href="#" :class="{ active: page === 'jobs' }" @click.prevent="page = 'jobs'">Jobs</a>
-            <a href="#" :class="{ active: page === 'accounts' }" @click.prevent="page = 'accounts'">Accounts</a>
-        </nav>
-    </header>
+    <!-- Logo band -->
+    <div class="logo-band">
+        <div class="logo">
+            <span class="logo-word">Sync</span><span class="logo-s">S</span><span class="logo-word">ystem</span>
+            <span class="logo-sub">b a c k m e u p</span>
+        </div>
+    </div>
+
+    <!-- Dark summary bar -->
+    <div class="topbar">
+        Active Accounts: <strong x-text="activeAccountsCount()"></strong>
+        | Total: <strong x-text="totalUsedGB()"></strong> GB / <strong x-text="totalFreeGB()"></strong> GB (free)
+    </div>
+
+    <!-- Tabs -->
+    <nav class="tabs" x-cloak>
+        <a href="#" class="tab" :class="{ active: page === 'accounts' }" @click.prevent="page = 'accounts'">accounts</a>
+        <a href="#" class="tab" :class="{ active: page === 'backups' }" @click.prevent="page = 'backups'">backups</a>
+        <a href="#" class="tab" :class="{ active: page === 'jobs' }" @click.prevent="page = 'jobs'">jobs</a>
+    </nav>
+
+    <!-- Page title ribbon -->
+    <div class="ribbon" x-cloak>
+        <span x-text="page"></span>
+    </div>
 
     <main x-cloak>
+        <!-- ===================== BACKUPS ===================== -->
         <div x-show="page === 'backups'">
-            <div class="page-toolbar">
-                <input type="text" class="search-input" placeholder="Search by subdirectory name..." x-model="search" @input="onSearchInput()">
-                <button class="btn btn-primary" @click="showNewModal = true; error = ''">New Backup</button>
+            <div class="search-wrap">
+                <span class="search-tab">search</span>
+                <div class="search-row">
+                    <input type="text" class="search-input" placeholder="Search users, titles or files…" x-model="search">
+                    <button class="search-btn" @click="void 0" aria-label="search">▶</button>
+                </div>
             </div>
 
-            <table class="table">
+            <div class="toolbar">
+                <button class="btn btn-purple" @click="toggleExpandAll()">
+                    <span x-text="allExpanded ? '▾ Collapse All' : '▸ Expand All'"></span>
+                </button>
+                <div class="toolbar-right">
+                    <button class="btn btn-pink" disabled title="Coming in a later phase">Auto-Sync</button>
+                    <button class="btn btn-pink" disabled title="Coming in a later phase">Settings</button>
+                </div>
+            </div>
+
+            <table class="records">
                 <thead>
                     <tr>
-                        <th>Title</th>
-                        <th>Created</th>
-                        <th>MEGA</th>
-                        <th>4shared</th>
+                        <th class="col-user">User Name</th>
+                        <th class="col-title">Title</th>
+                        <th class="col-stored">Stored / Status</th>
+                        <th class="col-created">Created</th>
+                        <th class="col-actions">Actions</th>
                     </tr>
                 </thead>
-                <tbody>
-                    <template x-for="b in filteredBackups()" :key="b.id">
-                        <tr>
-                            <td colspan="4" style="padding:0; border:none;">
-                                <table style="width:100%; border-collapse:collapse;">
-                                    <tbody>
-                                        <tr class="expandable" @click="toggleExpand(b)">
-                                            <td x-text="b.title"></td>
-                                            <td x-text="new Date(b.created_at).toLocaleDateString()"></td>
-                                            <td>
-                                                <template x-if="jobStatus(b, 'mega')">
-                                                    <div class="provider-cell">
-                                                        <span :class="'badge badge-' + displayStatus(b, 'mega')" x-text="displayStatus(b, 'mega')"></span>
-                                                        <template x-if="jobStatus(b, 'mega') === 'in_progress'">
-                                                            <div class="progress">
-                                                                <div class="progress-bar" :style="`width:${jobProgress(b,'mega')}%`"></div>
-                                                                <span class="progress-pct" x-text="jobProgress(b,'mega') + '%'"></span>
-                                                            </div>
-                                                        </template>
-                                                        <button class="btn-link" @click.stop="openLogs(b, 'mega')">logs</button>
-                                                        <template x-for="j in completedJobs(b, 'mega')" :key="j.id">
-                                                            <span class="job-actions">
-                                                                <a class="btn-link" :href="`/api/jobs/${j.id}/download`" @click.stop>download</a>
-                                                                <button class="btn-link btn-danger" @click.stop="openDelete(j, b, 'mega')">delete</button>
-                                                            </span>
-                                                        </template>
-                                                    </div>
-                                                </template>
-                                                <template x-if="!jobStatus(b, 'mega')">
-                                                    <span>&mdash;</span>
-                                                </template>
-                                            </td>
-                                            <td>
-                                                <template x-if="jobStatus(b, 'fourshared')">
-                                                    <div class="provider-cell">
-                                                        <span :class="'badge badge-' + displayStatus(b, 'fourshared')" x-text="displayStatus(b, 'fourshared')"></span>
-                                                        <template x-if="jobStatus(b, 'fourshared') === 'in_progress'">
-                                                            <div class="progress">
-                                                                <div class="progress-bar" :style="`width:${jobProgress(b,'fourshared')}%`"></div>
-                                                                <span class="progress-pct" x-text="jobProgress(b,'fourshared') + '%'"></span>
-                                                            </div>
-                                                        </template>
-                                                        <button class="btn-link" @click.stop="openLogs(b, 'fourshared')">logs</button>
-                                                        <template x-for="j in completedJobs(b, 'fourshared')" :key="j.id">
-                                                            <span class="job-actions">
-                                                                <a class="btn-link" :href="`/api/jobs/${j.id}/download`" @click.stop>download</a>
-                                                                <button class="btn-link btn-danger" @click.stop="openDelete(j, b, 'fourshared')">delete</button>
-                                                            </span>
-                                                        </template>
-                                                    </div>
-                                                </template>
-                                                <template x-if="!jobStatus(b, 'fourshared')">
-                                                    <span>&mdash;</span>
-                                                </template>
-                                            </td>
-                                        </tr>
-                                        <tr x-show="b.expanded">
-                                            <td colspan="4" class="dir-tree">
-                                                <template x-for="d1 in dirLevel1(b)" :key="d1.id">
-                                                    <div>
-                                                        <div class="dir-level-1" x-text="d1.name"></div>
-                                                        <template x-for="d2 in dirLevel2(b, d1.path)" :key="d2.id">
-                                                            <div class="dir-level-2" x-text="d2.name"></div>
-                                                        </template>
-                                                    </div>
-                                                </template>
-                                            </td>
-                                        </tr>
-                                    </tbody>
-                                </table>
+                <template x-for="u in filteredUsers()" :key="u.email">
+                    <tbody class="record">
+                        <tr class="record-main">
+                            <td class="col-user">
+                                <div class="cell-primary" x-text="u.email"></div>
+                                <button class="expander" @click="toggleAccounts(u)">
+                                    Accounts: <span x-text="isAccountsOpen(u) ? 'collapse ▾' : 'expand ▸'"></span>
+                                </button>
+                            </td>
+                            <td class="col-title">
+                                <div class="cell-primary" x-text="u.backup ? (u.backup.title || '—') : '—'"></div>
+                                <button class="expander" x-show="u.zips && u.zips.length" @click="toggleFiles(u)">
+                                    Files: <span x-text="isFilesOpen(u) ? 'collapse ▾' : 'expand ▸'"></span>
+                                </button>
+                            </td>
+                            <td class="col-stored">
+                                <div x-show="u.backup"><span x-text="storedGB(u)"></span> GB</div>
+                                <div class="status" :class="'status-' + (recordStatus(u) || 'none')" x-text="recordStatusLabel(u)"></div>
+                            </td>
+                            <td class="col-created" x-text="recordCreated(u)"></td>
+                            <td class="col-actions">
+                                <button class="btn btn-purple btn-block" @click="openUpload(u)" x-text="u.backup ? 'Upload / Edit' : 'Upload'"></button>
+                                <button class="btn btn-pink btn-block" x-show="u.backup" @click="openDeleteRecord(u, true)">Delete Record And Files</button>
+                                <button class="btn btn-pink btn-block" x-show="u.backup" @click="openDeleteRecord(u, false)">Delete Record (not files)</button>
                             </td>
                         </tr>
-                    </template>
-                    <tr class="table-footer">
-                        <td colspan="2">Total backups: <strong x-text="filteredBackups().length"></strong></td>
-                        <td colspan="2">Total GB: <strong x-text="totalGB()"></strong></td>
+
+                        <!-- Expanded detail. One row so the accounts cards and the file tree sit
+                             side by side, each directly under its own toggle and aligned at the top. -->
+                        <tr class="record-expand" x-show="isAccountsOpen(u) || isFilesOpen(u)">
+                            <td class="col-user">
+                                <div class="provider-cards" x-show="isAccountsOpen(u)">
+                                    <template x-for="prov in ['mega', 'fourshared']" :key="prov">
+                                        <div class="provider-card" x-show="userAccount(u, prov)">
+                                            <div class="provider-card-head">
+                                                <span class="provider-name" x-text="prov === 'mega' ? 'Mega' : '4shared'"></span>
+                                                <span class="provider-quota">
+                                                    <span x-text="accountUsedGB(userAccount(u, prov)).toFixed(2)"></span> GB
+                                                    of <span x-text="accountTotalGB(userAccount(u, prov)).toFixed(2)"></span> GB
+                                                </span>
+                                            </div>
+                                            <div class="quota-bar"><div class="quota-fill" :style="`width:${accountPct(userAccount(u, prov))}%`"></div></div>
+
+                                            <div class="provider-actions">
+                                                <template x-if="providerStatus(u, prov)">
+                                                    <span class="chip" :class="'chip-' + providerDisplayStatus(u, prov)" x-text="providerDisplayStatus(u, prov)"></span>
+                                                </template>
+                                                <template x-if="!providerStatus(u, prov)">
+                                                    <span class="chip chip-none">no uploads</span>
+                                                </template>
+                                                <button class="btn btn-purple btn-sm" x-show="providerJobs(u, prov).length" @click="openLogs(u, prov)">Log</button>
+                                            </div>
+
+                                            <!-- Upload progress (current transfer) -->
+                                            <template x-if="providerStatus(u, prov) === 'in_progress'">
+                                                <div class="progress"><div class="progress-fill" :style="`width:${providerProgress(u, prov)}%`"></div></div>
+                                            </template>
+
+                                            <div class="provider-actions">
+                                                <template x-for="j in completedJobs(u, prov)" :key="j.id">
+                                                    <a class="btn btn-purple btn-sm" :href="`/api/jobs/${j.id}/download`" x-text="'Download ' + j.remote_name"></a>
+                                                </template>
+                                                <button class="btn btn-pink btn-sm" x-show="completedJobs(u, prov).length" @click="openDeleteProvider(u, prov)">Delete All</button>
+                                            </div>
+                                        </div>
+                                    </template>
+                                    <template x-if="!(u.accounts && u.accounts.length)">
+                                        <p class="muted">No accounts configured for this user.</p>
+                                    </template>
+                                </div>
+                            </td>
+                            <td class="col-title">
+                                <div x-show="isFilesOpen(u)">
+                                    <template x-for="z in u.zips" :key="z.id">
+                                        <div class="zip-block">
+                                            <div class="zip-head"><strong x-text="z.name"></strong> — <span x-text="(z.size_bytes / 1073741824).toFixed(2)"></span> GB</div>
+                                            <pre class="zip-tree" x-text="prettyTree(z)"></pre>
+                                        </div>
+                                    </template>
+                                </div>
+                            </td>
+                            <td colspan="3"></td>
+                        </tr>
+                    </tbody>
+                </template>
+                <tfoot>
+                    <tr>
+                        <td colspan="2">Total backup records: <strong x-text="totalRecords()"></strong></td>
+                        <td colspan="3">Total GB: <strong x-text="grandTotalGB()"></strong></td>
                     </tr>
-                </tbody>
+                </tfoot>
             </table>
         </div>
 
+        <!-- ===================== JOBS ===================== -->
         <div x-show="page === 'jobs'">
-            <h2>Jobs</h2>
-            <p>Job monitoring coming soon.</p>
+            <div class="panel"><p class="muted">Job monitoring coming soon.</p></div>
         </div>
 
+        <!-- ===================== ACCOUNTS ===================== -->
         <div x-show="page === 'accounts'">
-            <div class="page-toolbar">
-                <h2 style="margin-bottom:0; flex:1;">Accounts Available</h2>
-                <button class="btn btn-primary" @click="refreshQuotas()" :disabled="refreshingQuotas" x-text="refreshingQuotas ? 'Refreshing…' : 'Refresh quotas now'"></button>
+            <div class="toolbar">
+                <div></div>
+                <div class="toolbar-right">
+                    <button class="btn btn-purple" @click="refreshQuotas()" :disabled="refreshingQuotas" x-text="refreshingQuotas ? 'Refreshing…' : 'Refresh Quotas'"></button>
+                </div>
             </div>
-            <template x-if="accounts.length === 0">
-                <p style="color:#888;">No accounts found. Check your .env file — numbered accounts like <code>MEGA_ACCOUNT_1_EMAIL</code> appear here.</p>
+
+            <template x-for="prov in ['mega', 'fourshared']" :key="prov">
+                <div class="acct-group">
+                    <div class="acct-group-head" @click="toggleProvider(prov)">
+                        <span x-text="isProviderOpen(prov) ? '▾' : '▸'"></span>
+                        <span x-text="prov === 'mega' ? 'MEGA' : '4shared'"></span>
+                    </div>
+                    <div class="acct-grid" x-show="isProviderOpen(prov)">
+                        <template x-for="a in (prov === 'mega' ? megaAccounts() : foursharedAccounts())" :key="a.id">
+                            <div class="acct-card">
+                                <div class="acct-email" x-text="a.email"></div>
+                                <div class="acct-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
+                                <div class="acct-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
+                            </div>
+                        </template>
+                        <template x-if="(prov === 'mega' ? megaAccounts() : foursharedAccounts()).length === 0">
+                            <p class="muted" x-text="'No ' + (prov === 'mega' ? 'MEGA' : '4shared') + ' accounts configured.'"></p>
+                        </template>
+                    </div>
+                </div>
             </template>
-            <div class="accounts-columns" x-show="accounts.length > 0">
-                <div class="accounts-column">
-                    <h3 class="accounts-column-title">MEGA</h3>
-                    <template x-if="megaAccounts().length === 0">
-                        <p class="accounts-empty">No MEGA accounts configured.</p>
-                    </template>
-                    <template x-for="a in megaAccounts()" :key="a.id">
-                        <div class="account-card">
-                            <div class="account-email" x-text="a.email"></div>
-                            <div class="account-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
-                            <div class="account-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
-                        </div>
-                    </template>
-                </div>
-                <div class="accounts-column">
-                    <h3 class="accounts-column-title">4shared</h3>
-                    <template x-if="foursharedAccounts().length === 0">
-                        <p class="accounts-empty">No 4shared accounts configured.</p>
-                    </template>
-                    <template x-for="a in foursharedAccounts()" :key="a.id">
-                        <div class="account-card">
-                            <div class="account-email" x-text="a.email"></div>
-                            <div class="account-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
-                            <div class="account-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
-                        </div>
-                    </template>
-                </div>
-            </div>
         </div>
     </main>
 
-    <div x-show="showNewModal" class="modal-overlay" @click.self="showNewModal = false">
-        <div class="modal-card">
-            <h2>New Backup</h2>
-            <div class="form-field">
-                <label>Title</label>
-                <input type="text" x-model="newBackup.title" placeholder="Backup title">
-            </div>
-            <div class="form-field">
-                <label>Select Directory To Compress And Back Up</label>
-                <div class="path-input-row">
-                    <input type="text" x-model="newBackup.source_path" placeholder="C:\path\to\directory or /path/to/directory">
-                    <button type="button" class="btn btn-secondary" @click="browsePath()" :disabled="browseLoading" x-text="browseLoading ? 'Opening…' : 'Browse'"></button>
-                </div>
-            </div>
-            <div class="form-field" x-show="megaAccounts().length > 0">
-                <label>MEGA Accounts</label>
-                <template x-for="a in megaAccounts()" :key="a.id">
-                    <div class="account-checkbox">
-                        <input type="checkbox" :id="'acct-' + a.id" @change="toggleAccount(a.id)" :checked="newBackup.account_ids.includes(a.id)">
-                        <label :for="'acct-' + a.id" x-text="a.email + ' (' + a.quota_total_gb + ' GB)'"></label>
-                    </div>
-                </template>
-            </div>
-            <div class="form-field" x-show="foursharedAccounts().length > 0">
-                <label>4shared Accounts</label>
-                <template x-for="a in foursharedAccounts()" :key="a.id">
-                    <div class="account-checkbox">
-                        <input type="checkbox" :id="'acct-' + a.id" @change="toggleAccount(a.id)" :checked="newBackup.account_ids.includes(a.id)">
-                        <label :for="'acct-' + a.id" x-text="a.email + ' (' + a.quota_total_gb + ' GB)'"></label>
-                    </div>
-                </template>
-            </div>
-            <div class="form-error" x-show="error" x-text="error"></div>
-            <div class="modal-actions">
-                <button class="btn btn-primary" @click="createBackup()" :disabled="creating" x-text="creating ? 'Creating...' : 'Create Backup'"></button>
-                <button class="btn btn-secondary" @click="showNewModal = false">Cancel</button>
-            </div>
-        </div>
-    </div>
+    <footer class="site-footer">Copyright © 2026 SyncSystem. All rights reserved.</footer>
 
-    <div x-show="showLogsModal" class="modal-overlay" @click.self="showLogsModal = false">
+    <!-- ===================== MODALS ===================== -->
+    <div x-show="showUploadModal" class="modal-overlay" @click.self="showUploadModal = false" x-cloak>
         <div class="modal-card">
-            <h2 x-text="logsTitle"></h2>
-            <template x-if="logs.length === 0">
-                <p style="color:#888;">No log entries yet.</p>
-            </template>
-            <div class="log-list" x-show="logs.length > 0">
-                <template x-for="(l, i) in logs" :key="i">
-                    <div class="log-line" :class="'log-' + l.level">
-                        <span class="log-time" x-text="new Date(l.created_at).toLocaleString()"></span>
-                        <span class="log-level" x-text="l.level"></span>
-                        <span class="log-email" x-text="l.email"></span>
-                        <span class="log-msg" x-text="l.message"></span>
-                    </div>
-                </template>
-            </div>
-            <div class="modal-actions">
-                <button class="btn btn-secondary" @click="showLogsModal = false">Close</button>
-            </div>
-        </div>
-    </div>
-
-    <div x-show="showDeleteModal" class="modal-overlay" @click.self="showDeleteModal = false">
-        <div class="modal-card">
-            <h2>Delete backup file</h2>
-            <p>This permanently deletes <strong x-text="deleteTarget ? deleteTarget.label : ''"></strong> from the provider. The backup record and your copy on any other provider are kept. Type <code>DELETE</code> to confirm.</p>
-            <div class="form-field">
-                <input type="text" x-model="deleteConfirm" placeholder="DELETE">
-            </div>
-            <div class="form-error" x-show="error" x-text="error"></div>
-            <div class="modal-actions">
-                <button class="btn btn-danger" @click="confirmDelete()" :disabled="deleteConfirm !== 'DELETE' || deleting" x-text="deleting ? 'Deleting…' : 'Delete'"></button>
-                <button class="btn btn-secondary" @click="showDeleteModal = false">Cancel</button>
-            </div>
-        </div>
-    </div>
-
-    <div x-show="showConflictModal" class="modal-overlay" @click.self="showConflictModal = false">
-        <div class="modal-card">
-            <h2>File already exists</h2>
-            <p>A file with this name already exists on the following account(s). Choose what to do for each:</p>
-            <template x-for="c in conflicts" :key="c.account_id">
+            <div class="modal-head">Upload / Edit</div>
+            <div class="modal-body">
                 <div class="form-field">
-                    <label x-text="c.provider + ' — ' + c.email + ' (' + c.name + ')'"></label>
-                    <div class="conflict-choice">
-                        <label><input type="radio" :name="'cf-' + c.account_id" value="overwrite" x-model="conflictChoices[c.account_id]"> Overwrite</label>
-                        <label><input type="radio" :name="'cf-' + c.account_id" value="skip" x-model="conflictChoices[c.account_id]"> Skip</label>
+                    <label>Title</label>
+                    <input type="text" x-model="uploadForm.title" placeholder="Default name of zip when selected — editable">
+                </div>
+                <div class="form-field">
+                    <label>Select directory to compress and back up</label>
+                    <div class="path-row">
+                        <input type="text" x-model="uploadForm.source_path" placeholder="C:\path\to\directory or /path/to/directory">
+                        <button type="button" class="btn btn-purple" @click="browsePath()" :disabled="browseLoading" x-text="browseLoading ? 'Opening…' : 'Browse'"></button>
                     </div>
                 </div>
-            </template>
-            <div class="form-error" x-show="error" x-text="error"></div>
-            <div class="modal-actions">
-                <button class="btn btn-primary" @click="submitConflicts()" :disabled="creating" x-text="creating ? 'Working…' : 'Continue'"></button>
-                <button class="btn btn-secondary" @click="showConflictModal = false">Cancel</button>
+                <div class="form-error" x-show="error" x-text="error"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-purple" @click="submitUpload()" :disabled="uploading" x-text="uploading ? 'Working…' : 'Upload / Save'"></button>
+                    <button class="btn btn-grey" @click="showUploadModal = false">Cancel</button>
+                </div>
+
+                <div class="modal-accounts">
+                    <div class="modal-accounts-title">Accounts - MEGA</div>
+                    <template x-for="a in uploadForm.accounts.filter(a => a.provider === 'mega')" :key="a.id">
+                        <label class="acct-check">
+                            <input type="checkbox" :checked="uploadForm.account_ids.includes(a.id)" @change="toggleUploadAccount(a.id)">
+                            <span x-text="a.email + ' (' + (a.quota_total_gb || 0) + ' GB)'"></span>
+                        </label>
+                    </template>
+                    <template x-if="uploadForm.accounts.filter(a => a.provider === 'mega').length === 0">
+                        <p class="muted">No MEGA account for this user.</p>
+                    </template>
+
+                    <div class="modal-accounts-title">Accounts - 4shared</div>
+                    <template x-for="a in uploadForm.accounts.filter(a => a.provider === 'fourshared')" :key="a.id">
+                        <label class="acct-check">
+                            <input type="checkbox" :checked="uploadForm.account_ids.includes(a.id)" @change="toggleUploadAccount(a.id)">
+                            <span x-text="a.email + ' (' + (a.quota_total_gb || 0) + ' GB)'"></span>
+                        </label>
+                    </template>
+                    <template x-if="uploadForm.accounts.filter(a => a.provider === 'fourshared').length === 0">
+                        <p class="muted">No 4shared account for this user.</p>
+                    </template>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showLogsModal" class="modal-overlay" @click.self="showLogsModal = false" x-cloak>
+        <div class="modal-card">
+            <div class="modal-head" x-text="logsTitle"></div>
+            <div class="modal-body">
+                <template x-if="logs.length === 0"><p class="muted">No log entries yet.</p></template>
+                <div class="log-list" x-show="logs.length > 0">
+                    <template x-for="(l, i) in logs" :key="i">
+                        <div class="log-line" :class="'log-' + l.level">
+                            <span class="log-time" x-text="new Date(l.created_at).toLocaleString()"></span>
+                            <span class="log-level" x-text="l.level"></span>
+                            <span class="log-email" x-text="l.email"></span>
+                            <span class="log-msg" x-text="l.message"></span>
+                        </div>
+                    </template>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-grey" @click="showLogsModal = false">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showDeleteModal" class="modal-overlay" @click.self="showDeleteModal = false" x-cloak>
+        <div class="modal-card">
+            <div class="modal-head">Confirm delete</div>
+            <div class="modal-body">
+                <p x-text="deleteMessage()"></p>
+                <div class="form-field" x-show="deleteTarget && deleteTarget.requireType">
+                    <input type="text" x-model="deleteConfirm" placeholder="DELETE">
+                </div>
+                <div class="form-error" x-show="error" x-text="error"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-pink" @click="confirmDelete()" :disabled="!canConfirmDelete()" x-text="deleting ? 'Deleting…' : 'Delete'"></button>
+                    <button class="btn btn-grey" @click="showDeleteModal = false">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showConflictModal" class="modal-overlay" @click.self="showConflictModal = false" x-cloak>
+        <div class="modal-card">
+            <div class="modal-head">File already exists</div>
+            <div class="modal-body">
+                <p>A file with this name already exists on the following account(s). Choose what to do for each:</p>
+                <template x-for="c in conflicts" :key="c.account_id">
+                    <div class="form-field">
+                        <label x-text="c.provider + ' — ' + c.email + ' (' + c.name + ')'"></label>
+                        <div class="conflict-choice">
+                            <label><input type="radio" :name="'cf-' + c.account_id" value="overwrite" x-model="conflictChoices[c.account_id]"> Overwrite</label>
+                            <label><input type="radio" :name="'cf-' + c.account_id" value="skip" x-model="conflictChoices[c.account_id]"> Skip</label>
+                        </div>
+                    </div>
+                </template>
+                <div class="form-error" x-show="error" x-text="error"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-purple" @click="submitConflicts()" :disabled="uploading" x-text="uploading ? 'Working…' : 'Continue'"></button>
+                    <button class="btn btn-grey" @click="showConflictModal = false">Cancel</button>
+                </div>
             </div>
         </div>
     </div>

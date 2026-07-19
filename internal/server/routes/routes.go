@@ -20,6 +20,7 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 	mux.HandleFunc("/api/health", h.Health)
 	mux.HandleFunc("/api/accounts", handlers.GetAccountsHandler(db))
 	mux.HandleFunc("POST /api/accounts/quota-sync", handlers.QuotaSyncHandler(db, syncer))
+	mux.HandleFunc("GET /api/users", handlers.GetUsersHandler(db))
 	mux.HandleFunc("GET /api/search", handlers.SearchBackupsHandler(db))
 	mux.HandleFunc("/api/browse", handlers.BrowseHandler())
 	mux.HandleFunc("/api/backups", func(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +33,7 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("DELETE /api/backups/{id}", h.DeleteBackup)
 	mux.HandleFunc("GET /api/jobs/{id}/logs", handlers.GetJobLogsHandler(db))
 	mux.HandleFunc("GET /api/jobs/{id}/download", h.DownloadJob)
 	mux.HandleFunc("DELETE /api/jobs/{id}", h.DeleteJob)

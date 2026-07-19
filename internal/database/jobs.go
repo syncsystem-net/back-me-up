@@ -9,6 +9,7 @@ import (
 type Job struct {
 	ID             int64     `json:"id"`
 	BackupID       int64     `json:"backup_id"`
+	ZipID          int64     `json:"zip_id"`
 	AccountID      int64     `json:"account_id"`
 	Provider       string    `json:"provider"`
 	Email          string    `json:"email"`
@@ -24,10 +25,10 @@ type Job struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-func InsertJob(tx *sql.Tx, backupID, accountID int64, zipPath, remoteName string, totalBytes int64) (int64, error) {
+func InsertJob(tx *sql.Tx, backupID, zipID, accountID int64, zipPath, remoteName string, totalBytes int64) (int64, error) {
 	res, err := tx.Exec(
-		`INSERT INTO jobs (backup_id, account_id, zip_path, remote_name, total_bytes) VALUES (?, ?, ?, ?, ?)`,
-		backupID, accountID, zipPath, remoteName, totalBytes,
+		`INSERT INTO jobs (backup_id, zip_id, account_id, zip_path, remote_name, total_bytes) VALUES (?, ?, ?, ?, ?, ?)`,
+		backupID, zipID, accountID, zipPath, remoteName, totalBytes,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("inserting job: %w", err)
@@ -39,7 +40,7 @@ func InsertJob(tx *sql.Tx, backupID, accountID int64, zipPath, remoteName string
 	return id, nil
 }
 
-const jobColumns = `j.id, j.backup_id, j.account_id, a.provider, a.email, j.status,
+const jobColumns = `j.id, j.backup_id, COALESCE(j.zip_id, 0), j.account_id, a.provider, a.email, j.status,
 	COALESCE(j.zip_path, ''), COALESCE(j.remote_path, ''), COALESCE(j.remote_name, ''), j.total_bytes,
 	j.uploaded_bytes, j.chunks_total, j.chunks_uploaded, COALESCE(j.error_message, ''), j.created_at`
 
@@ -47,7 +48,7 @@ func scanJob(s interface {
 	Scan(...any) error
 }) (*Job, error) {
 	j := &Job{}
-	if err := s.Scan(&j.ID, &j.BackupID, &j.AccountID, &j.Provider, &j.Email, &j.Status,
+	if err := s.Scan(&j.ID, &j.BackupID, &j.ZipID, &j.AccountID, &j.Provider, &j.Email, &j.Status,
 		&j.ZipPath, &j.RemotePath, &j.RemoteName, &j.TotalBytes, &j.UploadedBytes, &j.ChunksTotal,
 		&j.ChunksUploaded, &j.ErrorMessage, &j.CreatedAt); err != nil {
 		return nil, err

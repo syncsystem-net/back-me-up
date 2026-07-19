@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -125,6 +126,117 @@ func assembleBackups(db *sql.DB, backups []*database.Backup) ([]backupResponse, 
 	return result, nil
 }
 
+// treeNode is a directory node serialized into a zip's tree_json. In 7a it
+// captures the two directory levels the scanner records; the full recursive tree
+// (with a configurable depth cap) lands in a later phase.
+type treeNode struct {
+	Name      string      `json:"name"`
+	SizeBytes int64       `json:"size_bytes,omitempty"`
+	Children  []*treeNode `json:"children,omitempty"`
+}
+
+// buildTreeJSON nests the flat scanner entries under a root named after the
+// source directory and returns the JSON the UI renders as a pretty tree.
+func buildTreeJSON(sourcePath string, entries []scanner.Entry) string {
+	root := &treeNode{Name: filepath.Base(filepath.Clean(sourcePath))}
+	l1 := make(map[string]*treeNode)
+	for _, e := range entries {
+		if e.Level == 1 {
+			n := &treeNode{Name: e.Name, SizeBytes: e.SizeBytes}
+			l1[e.Path] = n
+			root.Children = append(root.Children, n)
+		}
+	}
+	for _, e := range entries {
+		if e.Level == 2 {
+			if parent, ok := l1[path.Dir(e.Path)]; ok {
+				parent.Children = append(parent.Children, &treeNode{Name: e.Name, SizeBytes: e.SizeBytes})
+			}
+		}
+	}
+	b, err := json.Marshal(root)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// userResponse is one table row: a user (email) with their configured accounts
+// (across providers), their single backup record (nil if they never uploaded),
+// its accumulated zips, and every job. Users with configured accounts but no
+// uploads still appear, with a nil backup and empty zips/jobs.
+type userResponse struct {
+	Email    string                `json:"email"`
+	Accounts []*database.DBAccount `json:"accounts"`
+	Backup   *database.Backup      `json:"backup"`
+	Zips     []*database.Zip       `json:"zips"`
+	Jobs     []*database.Job       `json:"jobs"`
+}
+
+// GetUsersHandler returns the backups table grouped by user email. Route: GET
+// /api/users.
+func GetUsersHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		accts, err := database.ListDBAccounts(db)
+		if err != nil {
+			slog.Error("listing accounts for users view", "error", err)
+			jsonError(w, "failed to list users", http.StatusInternalServerError)
+			return
+		}
+		// Group accounts by email, preserving first-seen order (ListDBAccounts
+		// orders by provider, email).
+		order := make([]string, 0)
+		byEmail := make(map[string][]*database.DBAccount)
+		for _, a := range accts {
+			if _, seen := byEmail[a.Email]; !seen {
+				order = append(order, a.Email)
+			}
+			byEmail[a.Email] = append(byEmail[a.Email], a)
+		}
+
+		users := make([]userResponse, 0, len(order))
+		for _, email := range order {
+			u := userResponse{
+				Email:    email,
+				Accounts: byEmail[email],
+				Zips:     []*database.Zip{},
+				Jobs:     []*database.Job{},
+			}
+			backup, err := database.GetBackupByOwner(db, email)
+			if err != nil {
+				slog.Error("loading backup for user", "email", email, "error", err)
+				jsonError(w, "failed to load user backups", http.StatusInternalServerError)
+				return
+			}
+			if backup != nil {
+				u.Backup = backup
+				zips, err := database.ListZipsByBackup(db, backup.ID)
+				if err != nil {
+					slog.Error("listing zips", "backup", backup.ID, "error", err)
+					jsonError(w, "failed to list zips", http.StatusInternalServerError)
+					return
+				}
+				jobs, err := database.ListJobsByBackup(db, backup.ID)
+				if err != nil {
+					slog.Error("listing jobs", "backup", backup.ID, "error", err)
+					jsonError(w, "failed to list jobs", http.StatusInternalServerError)
+					return
+				}
+				if zips != nil {
+					u.Zips = zips
+				}
+				if jobs != nil {
+					u.Jobs = jobs
+				}
+			}
+			users = append(users, u)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(users)
+	}
+}
+
 func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		backups, err := database.ListBackups(db)
@@ -206,6 +318,7 @@ type conflictInfo struct {
 
 func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		OwnerEmail string  `json:"owner_email"`
 		Title      string  `json:"title"`
 		SourcePath string  `json:"source_path"`
 		AccountIDs []int64 `json:"account_ids"`
@@ -222,6 +335,11 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 
 	if req.Title == "" {
 		jsonError(w, "title is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.OwnerEmail == "" {
+		jsonError(w, "owner_email is required", http.StatusBadRequest)
 		return
 	}
 
@@ -256,6 +374,7 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "failed to scan source directory", http.StatusInternalServerError)
 		return
 	}
+	treeJSON := buildTreeJSON(req.SourcePath, entries)
 
 	zipPath, err := archive.Zip(req.SourcePath)
 	if err != nil {
@@ -306,35 +425,28 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	backupID, err := database.CreateBackup(tx, req.Title, req.SourcePath)
+	// One record per user, accumulating zips. Upsert the record (renaming it if a
+	// title was supplied), then attach this upload as a new zip with its tree.
+	backupID, err := database.UpsertBackupForUser(tx, req.OwnerEmail, req.Title, req.SourcePath)
 	if err != nil {
 		tx.Rollback()
 		os.Remove(zipPath)
-		slog.Error("creating backup record", "error", err)
+		slog.Error("upserting backup record", "error", err)
 		jsonError(w, "failed to create backup", http.StatusInternalServerError)
 		return
 	}
 
-	dirs := make([]database.Directory, 0, len(entries))
-	for _, e := range entries {
-		dirs = append(dirs, database.Directory{
-			Path:      e.Path,
-			Name:      e.Name,
-			Level:     e.Level,
-			SizeBytes: e.SizeBytes,
-		})
-	}
-
-	if err := database.InsertDirectories(tx, backupID, dirs); err != nil {
+	zipID, err := database.InsertZip(tx, backupID, remoteName, req.SourcePath, totalBytes, treeJSON)
+	if err != nil {
 		tx.Rollback()
 		os.Remove(zipPath)
-		slog.Error("inserting directories", "error", err)
-		jsonError(w, "failed to insert directories", http.StatusInternalServerError)
+		slog.Error("inserting zip", "error", err)
+		jsonError(w, "failed to record zip", http.StatusInternalServerError)
 		return
 	}
 
 	for _, accountID := range effective {
-		if _, err := database.InsertJob(tx, backupID, accountID, zipPath, remoteName, totalBytes); err != nil {
+		if _, err := database.InsertJob(tx, backupID, zipID, accountID, zipPath, remoteName, totalBytes); err != nil {
 			tx.Rollback()
 			os.Remove(zipPath)
 			slog.Error("inserting job", "account_id", accountID, "error", err)
@@ -534,6 +646,65 @@ func (h *Handlers) DeleteJob(w http.ResponseWriter, r *http.Request) {
 	if err := database.DeleteJob(h.db, id); err != nil {
 		slog.Error("delete: removing job record failed", "job", id, "error", err)
 		jsonError(w, "deleted from provider but failed to remove record", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeleteBackup removes a whole backup record. With {"delete_files":true} it also
+// deletes every uploaded zip from its provider(s) first (requiring
+// {"confirm":"DELETE"}); the record's zips, jobs, and logs cascade away. With
+// delete_files false only the local record is removed and remote files are left
+// in place. Route: DELETE /api/backups/{id}.
+func (h *Handlers) DeleteBackup(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		jsonError(w, "invalid backup id", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Confirm     string `json:"confirm"`
+		DeleteFiles bool   `json:"delete_files"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if body.DeleteFiles {
+		if body.Confirm != "DELETE" {
+			jsonError(w, `confirmation must be exactly "DELETE"`, http.StatusBadRequest)
+			return
+		}
+		jobs, err := database.ListJobsByBackup(h.db, id)
+		if err != nil {
+			slog.Error("delete backup: listing jobs", "backup", id, "error", err)
+			jsonError(w, "failed to load backup jobs", http.StatusInternalServerError)
+			return
+		}
+		// Remove every uploaded remote file first. On any failure, keep the record
+		// so the user can retry rather than orphaning cloud files.
+		for _, j := range jobs {
+			if j.RemotePath == "" {
+				continue
+			}
+			p, err := cloud.Connect(r.Context(), h.accounts, j.Provider, j.Email, h.chunkSize)
+			if err != nil {
+				slog.Error("delete backup: connect failed", "job", j.ID, "error", err)
+				jsonError(w, "could not connect to provider", http.StatusBadGateway)
+				return
+			}
+			if err := p.Delete(r.Context(), j.RemotePath); err != nil {
+				slog.Error("delete backup: remote delete failed", "job", j.ID, "error", err)
+				jsonError(w, "failed to delete a file from its provider", http.StatusBadGateway)
+				return
+			}
+		}
+	}
+
+	if err := database.DeleteBackupRecord(h.db, id); err != nil {
+		slog.Error("delete backup: removing record failed", "backup", id, "error", err)
+		jsonError(w, "failed to remove backup record", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
