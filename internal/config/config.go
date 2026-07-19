@@ -16,6 +16,7 @@ type Config struct {
 	Concurrency  ConcurrencyConfig  `yaml:"concurrency"`
 	Quota        QuotaConfig        `yaml:"quota"`
 	Verification VerificationConfig `yaml:"verification"`
+	Scan         ScanConfig         `yaml:"scan"`
 }
 
 type ServerConfig struct {
@@ -64,6 +65,13 @@ type VerificationConfig struct {
 	Enabled           bool `yaml:"enabled"`
 	VerifyOnUpload    bool `yaml:"verify_on_upload"`
 	PeriodicCheckDays int  `yaml:"periodic_check_days"`
+}
+
+// ScanConfig bounds the recursive directory walk that produces a zip's recorded
+// tree. MaxDepth counts directory levels below the source root, so the default 3
+// records the root plus three levels beneath it.
+type ScanConfig struct {
+	MaxDepth int `yaml:"max_depth"`
 }
 
 func Load(path string) (*Config, error) {
@@ -132,5 +140,8 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Verification.PeriodicCheckDays == 0 {
 		cfg.Verification.PeriodicCheckDays = 30
+	}
+	if cfg.Scan.MaxDepth <= 0 {
+		cfg.Scan.MaxDepth = 3
 	}
 }

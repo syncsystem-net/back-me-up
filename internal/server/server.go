@@ -31,7 +31,7 @@ func New(cfg *config.Config, db *sql.DB, accts *accounts.AccountStore, syncer *q
 	}
 
 	chunkSize := int64(cfg.Upload.ChunkSizeMB) << 20
-	h := handlers.New(db, accts, chunkSize)
+	h := handlers.New(db, accts, chunkSize, cfg.Scan.MaxDepth)
 	routes.Register(s.mux, h, db, syncer)
 
 	return s

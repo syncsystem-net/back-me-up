@@ -36,3 +36,9 @@ verification:
   enabled: true
   verify_on_upload: true
   periodic_check_days: 30
+
+scan:
+  # How many directory levels below the source root are recorded in a zip's
+  # tree. 3 records the root plus three levels beneath it. Directory names to
+  # leave out of the tree are managed in the app's Settings modal, not here.
+  max_depth: 3

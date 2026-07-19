@@ -9,11 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/archive"
@@ -28,9 +26,12 @@ type Handlers struct {
 	accounts  *accounts.AccountStore
 	tmpl      *template.Template
 	chunkSize int64
+	// scanMaxDepth caps the recursive directory walk that records a zip's tree
+	// (config scan.max_depth, default 3).
+	scanMaxDepth int
 }
 
-func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64) *Handlers {
+func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth int) *Handlers {
 	tmplPath := filepath.Join("web", "templates", "*.html")
 	tmpl, err := template.ParseGlob(tmplPath)
 	if err != nil {
@@ -39,10 +40,11 @@ func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64) *Handlers {
 	}
 
 	return &Handlers{
-		db:        db,
-		accounts:  accts,
-		tmpl:      tmpl,
-		chunkSize: chunkSize,
+		db:           db,
+		accounts:     accts,
+		tmpl:         tmpl,
+		chunkSize:    chunkSize,
+		scanMaxDepth: scanMaxDepth,
 	}
 }
 
@@ -80,85 +82,6 @@ func GetAccountsHandler(db *sql.DB) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(accts)
 	}
-}
-
-// backupResponse is the JSON shape the frontend row template renders: a backup
-// with its directories and provider jobs attached. Shared by /api/backups and
-// /api/search so search results render with the same template.
-type backupResponse struct {
-	ID          int64                 `json:"id"`
-	Title       string                `json:"title"`
-	SourcePath  string                `json:"source_path"`
-	CreatedAt   time.Time             `json:"created_at"`
-	Directories []*database.Directory `json:"directories"`
-	Jobs        []*database.Job       `json:"jobs"`
-}
-
-// assembleBackups attaches each backup's directories and jobs, producing the
-// response shape the UI expects. A query/scan failure is returned so the caller
-// can emit an HTTP error.
-func assembleBackups(db *sql.DB, backups []*database.Backup) ([]backupResponse, error) {
-	result := make([]backupResponse, 0, len(backups))
-	for _, b := range backups {
-		dirs, err := database.ListDirectoriesByBackup(db, b.ID)
-		if err != nil {
-			return nil, fmt.Errorf("listing directories for backup %d: %w", b.ID, err)
-		}
-		jobs, err := database.ListJobsByBackup(db, b.ID)
-		if err != nil {
-			return nil, fmt.Errorf("listing jobs for backup %d: %w", b.ID, err)
-		}
-		if dirs == nil {
-			dirs = []*database.Directory{}
-		}
-		if jobs == nil {
-			jobs = []*database.Job{}
-		}
-		result = append(result, backupResponse{
-			ID:          b.ID,
-			Title:       b.Title,
-			SourcePath:  b.SourcePath,
-			CreatedAt:   b.CreatedAt,
-			Directories: dirs,
-			Jobs:        jobs,
-		})
-	}
-	return result, nil
-}
-
-// treeNode is a directory node serialized into a zip's tree_json. In 7a it
-// captures the two directory levels the scanner records; the full recursive tree
-// (with a configurable depth cap) lands in a later phase.
-type treeNode struct {
-	Name      string      `json:"name"`
-	SizeBytes int64       `json:"size_bytes,omitempty"`
-	Children  []*treeNode `json:"children,omitempty"`
-}
-
-// buildTreeJSON nests the flat scanner entries under a root named after the
-// source directory and returns the JSON the UI renders as a pretty tree.
-func buildTreeJSON(sourcePath string, entries []scanner.Entry) string {
-	root := &treeNode{Name: filepath.Base(filepath.Clean(sourcePath))}
-	l1 := make(map[string]*treeNode)
-	for _, e := range entries {
-		if e.Level == 1 {
-			n := &treeNode{Name: e.Name, SizeBytes: e.SizeBytes}
-			l1[e.Path] = n
-			root.Children = append(root.Children, n)
-		}
-	}
-	for _, e := range entries {
-		if e.Level == 2 {
-			if parent, ok := l1[path.Dir(e.Path)]; ok {
-				parent.Children = append(parent.Children, &treeNode{Name: e.Name, SizeBytes: e.SizeBytes})
-			}
-		}
-	}
-	b, err := json.Marshal(root)
-	if err != nil {
-		return "{}"
-	}
-	return string(b)
 }
 
 // userResponse is one table row: a user (email) with their configured accounts
@@ -237,52 +160,163 @@ func GetUsersHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func GetBackupsHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		backups, err := database.ListBackups(db)
-		if err != nil {
-			slog.Error("listing backups", "error", err)
-			jsonError(w, "failed to list backups", http.StatusInternalServerError)
-			return
-		}
-
-		result, err := assembleBackups(db, backups)
-		if err != nil {
-			slog.Error("assembling backups", "error", err)
-			jsonError(w, "failed to assemble backups", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(result)
-	}
+// searchMatch is one directory inside one zip's recorded tree that matched the
+// query, attributed back to the record, zip, and accounts holding it.
+type searchMatch struct {
+	BackupID   int64    `json:"backup_id"`
+	Title      string   `json:"title"`
+	OwnerEmail string   `json:"owner_email"`
+	ZipID      int64    `json:"zip_id"`
+	ZipName    string   `json:"zip_name"`
+	Accounts   []string `json:"accounts"`
+	// Path is the matching directory's location within the tree, joined with
+	// "/" from the root, so the user can see where in the structure it sits.
+	Path string `json:"path"`
+	Name string `json:"name"`
 }
 
-// SearchBackupsHandler returns backups that have a subdirectory name matching
-// q, in the same JSON shape as /api/backups so the UI reuses the row template.
-// An empty q returns an empty list (the client falls back to the in-memory
-// list). Route: GET /api/search?q=.
-func SearchBackupsHandler(db *sql.DB) http.HandlerFunc {
+// SearchTreesHandler searches every zip's recorded directory tree for q,
+// case- and accent-insensitively, and returns each matching directory with the
+// backup, zip, and accounts that hold it. An empty q returns an empty list.
+// Route: GET /api/search?q=.
+func SearchTreesHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
 		w.Header().Set("Content-Type", "application/json")
 		if q == "" {
-			json.NewEncoder(w).Encode([]backupResponse{})
+			json.NewEncoder(w).Encode([]searchMatch{})
 			return
 		}
-		backups, err := database.SearchBackupsByDirectory(db, q)
+
+		zips, err := database.ListSearchableZips(db)
 		if err != nil {
-			slog.Error("searching backups", "q", q, "error", err)
-			jsonError(w, "failed to search backups", http.StatusInternalServerError)
+			slog.Error("loading zips for search", "q", q, "error", err)
+			jsonError(w, "failed to search", http.StatusInternalServerError)
 			return
 		}
-		result, err := assembleBackups(db, backups)
+
+		matches := make([]searchMatch, 0)
+		for _, z := range zips {
+			var root scanner.Node
+			if err := json.Unmarshal([]byte(z.TreeJSON), &root); err != nil {
+				// A zip with an unparseable or empty tree simply contributes no
+				// matches; one bad row must not fail the whole search.
+				continue
+			}
+			for _, hit := range searchNode(&root, nil, q) {
+				matches = append(matches, searchMatch{
+					BackupID:   z.BackupID,
+					Title:      z.Title,
+					OwnerEmail: z.OwnerEmail,
+					ZipID:      z.ZipID,
+					ZipName:    z.ZipName,
+					Accounts:   z.Accounts,
+					Path:       hit.path,
+					Name:       hit.name,
+				})
+			}
+		}
+		json.NewEncoder(w).Encode(matches)
+	}
+}
+
+type treeHit struct {
+	name string
+	path string
+}
+
+// searchNode walks a recorded tree and collects every node whose name matches q.
+// ancestors carries the names from the root down to (but excluding) n, so a hit
+// can report its full path.
+func searchNode(n *scanner.Node, ancestors []string, q string) []treeHit {
+	if n == nil {
+		return nil
+	}
+	here := append(append([]string{}, ancestors...), n.Name)
+
+	var hits []treeHit
+	if scanner.Matches(n.Name, q) {
+		hits = append(hits, treeHit{name: n.Name, path: strings.Join(here, "/")})
+	}
+	for _, c := range n.Children {
+		hits = append(hits, searchNode(c, here, q)...)
+	}
+	return hits
+}
+
+// GetSettingsHandler returns the user-editable settings. Route: GET
+// /api/settings.
+func GetSettingsHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		terms, err := database.GetExcludeTerms(db)
 		if err != nil {
-			slog.Error("assembling search results", "error", err)
-			jsonError(w, "failed to assemble search results", http.StatusInternalServerError)
+			slog.Error("loading settings", "error", err)
+			jsonError(w, "failed to load settings", http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(result)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"exclude_terms": terms})
+	}
+}
+
+// PutSettingsHandler replaces the exclude terms. Terms take effect on the next
+// backup; trees already recorded are left alone. Route: PUT /api/settings.
+func PutSettingsHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ExcludeTerms []string `json:"exclude_terms"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if err := database.SetExcludeTerms(db, body.ExcludeTerms); err != nil {
+			slog.Error("saving settings", "error", err)
+			jsonError(w, "failed to save settings", http.StatusInternalServerError)
+			return
+		}
+		terms, err := database.GetExcludeTerms(db)
+		if err != nil {
+			slog.Error("reloading settings", "error", err)
+			jsonError(w, "failed to reload settings", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"exclude_terms": terms})
+	}
+}
+
+// PatchBackupHandler renames a record without re-uploading, backing a save in
+// the Upload/Edit modal where the user changed only the title. Route: PATCH
+// /api/backups/{id}.
+func PatchBackupHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			jsonError(w, "invalid backup id", http.StatusBadRequest)
+			return
+		}
+		var body struct {
+			Title string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		title := strings.TrimSpace(body.Title)
+		if title == "" {
+			jsonError(w, "title is required", http.StatusBadRequest)
+			return
+		}
+		if err := database.UpdateBackupTitle(db, id, title); err == sql.ErrNoRows {
+			jsonError(w, "backup not found", http.StatusNotFound)
+			return
+		} else if err != nil {
+			slog.Error("renaming backup", "backup", id, "error", err)
+			jsonError(w, "failed to rename backup", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
@@ -368,13 +402,24 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := scanner.Scan(req.SourcePath)
+	// Exclude terms shape only the recorded tree — the zip below still archives
+	// every directory, so the uploaded copy stays complete. A settings read
+	// failure degrades to "exclude nothing" rather than blocking the backup.
+	excludeTerms, err := database.GetExcludeTerms(h.db)
+	if err != nil {
+		slog.Warn("could not load exclude terms; recording full tree", "error", err)
+		excludeTerms = nil
+	}
+	root, err := scanner.Tree(req.SourcePath, scanner.Options{
+		MaxDepth:     h.scanMaxDepth,
+		ExcludeTerms: excludeTerms,
+	})
 	if err != nil {
 		slog.Error("scanning directory", "path", req.SourcePath, "error", err)
 		jsonError(w, "failed to scan source directory", http.StatusInternalServerError)
 		return
 	}
-	treeJSON := buildTreeJSON(req.SourcePath, entries)
+	treeJSON := scanner.TreeJSON(root)
 
 	zipPath, err := archive.Zip(req.SourcePath)
 	if err != nil {

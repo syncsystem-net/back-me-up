@@ -21,18 +21,12 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 	mux.HandleFunc("/api/accounts", handlers.GetAccountsHandler(db))
 	mux.HandleFunc("POST /api/accounts/quota-sync", handlers.QuotaSyncHandler(db, syncer))
 	mux.HandleFunc("GET /api/users", handlers.GetUsersHandler(db))
-	mux.HandleFunc("GET /api/search", handlers.SearchBackupsHandler(db))
+	mux.HandleFunc("GET /api/search", handlers.SearchTreesHandler(db))
+	mux.HandleFunc("GET /api/settings", handlers.GetSettingsHandler(db))
+	mux.HandleFunc("PUT /api/settings", handlers.PutSettingsHandler(db))
 	mux.HandleFunc("/api/browse", handlers.BrowseHandler())
-	mux.HandleFunc("/api/backups", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			handlers.GetBackupsHandler(db)(w, r)
-		case http.MethodPost:
-			h.PostBackups(w, r)
-		default:
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		}
-	})
+	mux.HandleFunc("POST /api/backups", h.PostBackups)
+	mux.HandleFunc("PATCH /api/backups/{id}", handlers.PatchBackupHandler(db))
 	mux.HandleFunc("DELETE /api/backups/{id}", h.DeleteBackup)
 	mux.HandleFunc("GET /api/jobs/{id}/logs", handlers.GetJobLogsHandler(db))
 	mux.HandleFunc("GET /api/jobs/{id}/download", h.DownloadJob)
