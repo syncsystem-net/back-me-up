@@ -32,8 +32,10 @@
 .DS_Store
 Thumbs.db
 
-# Dev tools output
-dev-tools/prompts/output/
+# Dev tools
+dev-tools/
+.claude/
+# dev-tools/prompts/output/
 
 # Temp zips
 *.zip.tmp

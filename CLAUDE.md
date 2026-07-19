@@ -198,9 +198,21 @@ Ticket #7 was too large for one PR. Detailed plan (local, gitignored): `dev-tool
 
 **Phase 7a — redesign + per-user model: DONE.** `backups.owner_email`, `backup_zips` (with `tree_json`), `jobs.zip_id`, `GET /api/users`, record-level delete, full CSS/HTML rewrite to the Figma design.
 
-**Phase 7b — NEXT:** recursive scanner with a new `scan.max_depth` config (default 3); accent-insensitive exclude terms; DB-backed **Settings** UI (wire the currently-disabled Settings button); interactive expand-all/per-node JSON tree replacing the read-only `<pre>`; title edit updates the file JSON; global JSON search across `backup_zips.tree_json`. Legacy `backup_directories` + `GET /api/backups` are now unused and can be removed.
+**Phase 7b — DONE** (PR #8, branch `pr/8-full-tree-settings-search`). Shipped: recursive `scanner.Tree` with `scan.max_depth` (default 3, root + N levels below it); accent-insensitive exclude terms (`scanner.Fold`/`Matches`, hand-rolled fold table — `golang.org/x/text` is **not** in the module cache); DB-backed `settings` key/value table + `GET`/`PUT /api/settings` behind the now-enabled Settings button; interactive tree UI; `PATCH /api/backups/{id}` for title-only saves; `GET /api/search` retargeted at `backup_zips.tree_json`, reporting backup/zip/account per hit. Removed: `backup_directories` (dropped in migration), `directories.go`, `SearchBackupsByDirectory`, `GetBackupsHandler`, `assembleBackups`, `buildTreeJSON`, `prettyTree`, `GET /api/backups`.
 
-**Phase 7c:** auto-sync remote crawl (wire the disabled **Auto-Sync** button). Needs a new `List` method on `provider.Provider` — MEGA can use `FS.GetChildren`, 4shared already has `listFolderFiles` (add a `Size` field). Reuse `cloud.Connect` + the `quota.SyncAll` iteration pattern.
+**Exclude terms filter the recorded tree only — never the zip.** Decided with the user: the uploaded archive stays a complete copy of the source, so a term is a display/search filter, not a backup policy. Changing terms or `max_depth` does not rewrite trees already recorded.
+
+**Phase 7c — NEXT: auto-sync remote crawl.** For when a user already has archives sitting in a remote account: crawl the provider, reconcile what's there into the local DB, and wire the currently-disabled **Auto-Sync** button behind an explicit warning + confirmation modal (the ticket calls for both).
+
+Shape of the work, from the 7a/7b explorations:
+
+- **`provider.Provider` has no listing method.** Its interface (`internal/provider/provider.go`) is `Name/Login/Upload/Download/FindByName/Delete/GetQuota`. Add `List(ctx) ([]RemoteFile, error)` returning `{ID, Name, Size}`, and one implementation per backend — the registry is the only place that imports concrete providers, so nothing else ripples.
+- **MEGA already does this internally**: `FindByName` in `internal/provider/mega/mega.go` calls `c.m.FS.GetChildren(c.m.FS.GetRoot())`; nodes expose `GetName()`/`GetHash()`. Generalize that into `List`.
+- **4shared already lists**: `listFolderFiles(ctx, rootFolderID)` probes `/folders/{id}/files` then `/folder/{id}/files` (the spelling is genuinely ambiguous — see the 4shared notes below). Its `fileEntry` struct carries only `ID`/`Name`; **add `Size`** if the API returns it.
+- **Reuse the existing connect/iterate pattern**: `cloud.Connect(ctx, store, provider, email, chunkSize)` over `store.Accounts`, exactly as `quota.SyncAll`/`syncOne` does.
+- **Reconciliation** writes discovered archives as `backup_zips` rows under the owning user's record, creating the record when absent. Open question to settle with the user: a crawled zip has **no local tree**, so decide whether `tree_json` stays empty (the UI already renders "No directory tree recorded for this zip" — 7b added that fallback) or is derived by downloading and reading the zip's central directory. Empty is the cheap, honest default.
+- **Matching remote files to existing records** needs a rule: by `remote_name` against `backup_zips.name` is the obvious one. Decide what happens to a remote file that matches nothing (adopt it? ignore it?) and to a local zip row whose remote copy has vanished.
+- **This writes to the user's database from remote state**, so it is the most destructive-feeling feature so far. Confirmation modal, a dry-run/preview of what would change, and no deletions without explicit opt-in.
 
 ---
 
@@ -240,6 +252,22 @@ The `accounts` table must use `UNIQUE(provider, email)` — not `UNIQUE` on `ema
 
 ---
 
+### Directory scanning and exclude terms
+
+**Accent folding is hand-rolled on purpose.** `internal/scanner/normalize.go` maps accented Latin runes to their base letters instead of using `golang.org/x/text/unicode/norm`. That module is **not in the module cache** (only `x/crypto`, `x/mod`, `x/sync`, `x/sys`, `x/tools` are), so depending on it means a network fetch — the same reason `internal/ratelimit` is a hand-written token bucket. Check the cache before reaching for an `x/` package.
+
+**Fold both Unicode forms, not just precomposed.** An accented name arrives as NFC (one rune, `U+00E9`) on Windows but NFD (base letter + combining mark) on macOS/APFS. Mapping only precomposed runes means "Conteúdo" silently fails to match `conteudo` on macOS — the exact promise the feature makes. `Fold` therefore strips combining marks (`U+0300`–`U+036F`) *and* maps precomposed runes. The JS side (`fold()` in `app.js`) mirrors this with `normalize('NFD')` + the same range strip. Tests must use explicit `́` escapes: a literal `ú` in a Go or JS source file is stored precomposed and will not exercise the NFD path.
+
+**`Fold`/`Matches` are shared by exclude terms and global search** so the two features can never disagree about what "matches" means. A change to folding affects both — and the client-side table filter mirrors it, so all three stay consistent.
+
+**Don't substring-match the raw `tree_json`.** The serialized tree contains the literal keys `children` and `size_bytes`, so matching the raw string means typing either one matches every record that has a tree. Match the extracted directory *names* (`treeNames` in `app.js`, `searchNode` in Go).
+
+**A blank exclude term must never match.** Substring matching means an empty term matches every directory name and would silently empty every recorded tree. Blanks are rejected on write (`normalizeTerms`) *and* ignored on read (`Matches`) — belt and braces, because a corrupt settings row could otherwise bypass the write-side check.
+
+**Depth semantics: `max_depth` counts levels *below* the root.** `3` records the root plus three levels. The root is never excluded even if its name matches a term — the user explicitly chose that directory.
+
+---
+
 ### Alpine.js
 
 **Use methods, not getters, in `Alpine.data()`**
@@ -252,6 +280,15 @@ get megaAccounts() { return this.accounts.filter(...) }
 megaAccounts() { return this.accounts.filter(...) }
 ```
 In templates: `x-for="a in megaAccounts()"`, not `x-for="a in megaAccounts"`.
+
+**Alpine's `x-for` cannot recurse — flatten instead**
+There is no clean way to render a recursive tree with `x-for` alone. The file tree walks the parsed `tree_json` into a **flat array of currently-visible rows** (`treeRows` in `app.js`), each carrying a `depth`, and renders it with a single `x-for`, expressing nesting as `padding-left: depth * 16px`. Collapsed subtrees are simply not emitted.
+
+**Parsed JSON must be memoised outside the reactive proxy**
+`treeCache` lives at module scope, not on the Alpine component. The page replaces `this.users` every 2 seconds and templates re-render constantly, so `JSON.parse` on every render is real cost — and letting Alpine proxy a large read-only tree adds more. Cache by zip id, keyed on the raw string so an edited tree re-parses.
+
+**Any UI state must be keyed to survive the 2s poll**
+`loadUsers()` replaces the whole user list every 2 seconds, so state stored positionally (indexes, object identity) is destroyed on every tick. Key expansion state by stable identifiers: `expandedAccounts`/`expandedFiles` by email, tree nodes by `` `${zipId}:${nodePath}` ``. Tree nodes use **two** lists (`expandedNodes` + `collapsedNodes`) because the default is "root open, rest closed" — one list cannot distinguish "explicitly collapsed root" from "never touched".
 
 **`x-cloak` to prevent blank flash on load**
 Add `x-cloak` to any element that should be hidden until Alpine initialises, and add `[x-cloak] { display: none !important; }` at the top of the CSS file.
