@@ -3,7 +3,6 @@ package database
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -102,41 +101,20 @@ func DeleteBackupRecord(db *sql.DB, id int64) error {
 	return nil
 }
 
-// SearchBackupsByDirectory returns the distinct backups whose title, or one of
-// whose subdirectory names (level 1 or 2), contains term, ordered newest first.
-// The LEFT JOIN keeps title-only matches (backups with no recorded directories).
-// The term's LIKE wildcards (% and _) and the escape char are escaped so it
-// matches literally.
-func SearchBackupsByDirectory(db *sql.DB, term string) ([]*Backup, error) {
-	pattern := "%" + escapeLike(term) + "%"
-	rows, err := db.Query(
-		`SELECT DISTINCT b.id, b.title, b.source_path, b.created_at
-		 FROM backups b
-		 LEFT JOIN backup_directories d ON d.backup_id = b.id
-		 WHERE b.title LIKE ? ESCAPE '\' OR d.name LIKE ? ESCAPE '\'
-		 ORDER BY b.created_at DESC`,
-		pattern, pattern,
-	)
+// UpdateBackupTitle renames a record without touching its zips or jobs, backing
+// the title-only save in the Upload/Edit modal. Returns sql.ErrNoRows when no
+// record has that id.
+func UpdateBackupTitle(db *sql.DB, id int64, title string) error {
+	res, err := db.Exec(`UPDATE backups SET title = ? WHERE id = ?`, title, id)
 	if err != nil {
-		return nil, fmt.Errorf("searching backups by directory: %w", err)
+		return fmt.Errorf("updating backup title: %w", err)
 	}
-	defer rows.Close()
-
-	var backups []*Backup
-	for rows.Next() {
-		b := &Backup{}
-		if err := rows.Scan(&b.ID, &b.Title, &b.SourcePath, &b.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scanning backup row: %w", err)
-		}
-		backups = append(backups, b)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking updated rows: %w", err)
 	}
-	return backups, rows.Err()
-}
-
-// escapeLike escapes the LIKE special characters (\, %, _) so a user's search
-// term is matched literally rather than interpreted as wildcards. Used with
-// `ESCAPE '\'`.
-func escapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }

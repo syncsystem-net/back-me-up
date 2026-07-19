@@ -46,6 +46,73 @@ func scanZip(s interface{ Scan(...any) error }) (*Zip, error) {
 	return z, nil
 }
 
+// SearchableZip is one zip paired with the record it belongs to and the accounts
+// that hold it, so a tree-JSON hit can be attributed back to a backup, a zip, and
+// an account. Accounts come from the zip's jobs — a zip that never uploaded
+// anywhere still appears, with an empty Accounts list.
+type SearchableZip struct {
+	ZipID      int64
+	ZipName    string
+	TreeJSON   string
+	BackupID   int64
+	Title      string
+	OwnerEmail string
+	Accounts   []string
+}
+
+// ListSearchableZips returns every recorded zip with its owning record and the
+// provider/email pairs holding it. The whole set is loaded because matching is
+// done in Go: exclude terms and search share accent-insensitive folding (see
+// scanner.Fold), which SQL LIKE cannot do. One row per zip keeps this small.
+func ListSearchableZips(db *sql.DB) ([]*SearchableZip, error) {
+	rows, err := db.Query(
+		`SELECT z.id, z.name, COALESCE(z.tree_json, ''), b.id, b.title, COALESCE(b.owner_email, '')
+		 FROM backup_zips z
+		 JOIN backups b ON b.id = z.backup_id
+		 ORDER BY z.created_at DESC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying searchable zips: %w", err)
+	}
+	defer rows.Close()
+
+	var zips []*SearchableZip
+	byID := make(map[int64]*SearchableZip)
+	for rows.Next() {
+		z := &SearchableZip{Accounts: []string{}}
+		if err := rows.Scan(&z.ZipID, &z.ZipName, &z.TreeJSON, &z.BackupID, &z.Title, &z.OwnerEmail); err != nil {
+			return nil, fmt.Errorf("scanning searchable zip: %w", err)
+		}
+		zips = append(zips, z)
+		byID[z.ZipID] = z
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	acctRows, err := db.Query(
+		`SELECT DISTINCT j.zip_id, a.provider, a.email
+		 FROM jobs j JOIN accounts a ON a.id = j.account_id
+		 WHERE j.zip_id IS NOT NULL`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying zip accounts: %w", err)
+	}
+	defer acctRows.Close()
+
+	for acctRows.Next() {
+		var zipID int64
+		var provider, email string
+		if err := acctRows.Scan(&zipID, &provider, &email); err != nil {
+			return nil, fmt.Errorf("scanning zip account: %w", err)
+		}
+		if z, ok := byID[zipID]; ok {
+			z.Accounts = append(z.Accounts, provider+" — "+email)
+		}
+	}
+	return zips, acctRows.Err()
+}
+
 // ListZipsByBackup returns a record's archives, newest first.
 func ListZipsByBackup(db *sql.DB, backupID int64) ([]*Zip, error) {
 	rows, err := db.Query(`SELECT `+zipColumns+` FROM backup_zips WHERE backup_id = ? ORDER BY created_at DESC`, backupID)

@@ -102,6 +102,35 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_jobs_zip_id ON jobs(zip_id)`); err != nil {
 		return fmt.Errorf("jobs.zip_id index: %w", err)
 	}
+	// PR #8: backup_zips.tree_json fully replaced backup_directories, and nothing
+	// has written to that table since 7a. Drop it now that the last reader
+	// (the legacy /api/backups + /api/search path) is gone.
+	if err := dropLegacyDirectories(db); err != nil {
+		return fmt.Errorf("dropping backup_directories: %w", err)
+	}
+	return nil
+}
+
+// dropLegacyDirectories removes the dead backup_directories table. Its rows are
+// deleted first: nothing references them, but the table references backups, and
+// clearing before the drop keeps the pattern consistent with the FK-safe
+// migrations above. Absent on a fresh database, where the drop is a no-op.
+func dropLegacyDirectories(db *sql.DB) error {
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='backup_directories'`).Scan(&name)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking backup_directories table: %w", err)
+	}
+	slog.Info("dropping legacy backup_directories table (superseded by backup_zips.tree_json)")
+	if _, err := db.Exec(`DELETE FROM backup_directories`); err != nil {
+		return fmt.Errorf("clearing backup_directories: %w", err)
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS backup_directories`); err != nil {
+		return fmt.Errorf("dropping table: %w", err)
+	}
 	return nil
 }
 
@@ -150,7 +179,8 @@ func clearBackupsIfLegacy(db *sql.DB) error {
 	for _, stmt := range []string{
 		`DELETE FROM job_logs`,
 		`DELETE FROM jobs`,
-		`DELETE FROM backup_directories`,
+		// backup_directories rows cascade away with their backups, and the table
+		// itself is dropped later in migrate().
 		`DELETE FROM backups`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -235,15 +265,10 @@ CREATE TABLE IF NOT EXISTS backup_zips (
     FOREIGN KEY (backup_id) REFERENCES backups(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS backup_directories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    backup_id INTEGER NOT NULL,
-    path TEXT NOT NULL,
-    name TEXT NOT NULL,
-    level INTEGER NOT NULL,
-    size_bytes INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (backup_id) REFERENCES backups(id) ON DELETE CASCADE
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -289,11 +314,9 @@ CREATE TABLE IF NOT EXISTS job_logs (
     FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_backup_directories_backup_id ON backup_directories(backup_id);
 CREATE INDEX IF NOT EXISTS idx_backup_zips_backup_id ON backup_zips(backup_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_backup_id ON jobs(backup_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_account_id ON jobs(account_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(job_id);
-CREATE INDEX IF NOT EXISTS idx_backup_directories_name ON backup_directories(name);
 `

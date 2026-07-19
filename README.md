@@ -9,8 +9,11 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - A background worker pool uploads in chunks with live progress (polled every 2s), automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit.
 - On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to your main account.
 - Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
-- Per-provider Download and Delete-All actions, plus record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
-- Real-time search filters the backups table by user, title, or file name as you type; an "Accounts" view groups each provider's accounts in expandable cards with used/total quota and when it was last synced.
+- **Download** on an account card fetches every zip stored on that account (one file at a time — the browser asks once for permission to download multiple files); the `(download file)` link on a tree's root row — `bkup003 (download file)` — fetches just that archive. Plus per-provider Delete-All and record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
+- Each zip's **full directory tree** is recorded (down to `scan.max_depth`, default 3 levels) and browsable as an interactive tree — expand the whole zip at once or one node at a time.
+- **Exclude terms** (Settings) keep noisy directories out of the recorded tree. Matching ignores case *and* accents, so one `conteudo` entry covers "Conteúdo", "conteudo", and "CONTEÚDO". Terms affect the recorded tree only — the uploaded zip still contains every directory.
+- Two kinds of search, both accent-insensitive: typing filters the table in real time by user, title, or directory name, while the **▶ button runs a global search** across every recorded tree and reports which backup, zip, and account holds each matching directory.
+- An "Accounts" view groups each provider's accounts in expandable cards with used/total quota and when it was last synced.
 - Quotas refresh automatically on a background interval (`quota.sync_interval_minutes`) and on demand via the "Refresh quotas now" button, in addition to refreshing after each successful upload.
 - Per-provider rate limiting (`rate_limits.<provider>`) paces API requests and upload bandwidth so a large backup stays within each provider's limits.
 - Periodic re-verification (`verification.periodic_check_days`) re-downloads the first chunk of a random sample of already-uploaded files on a schedule and compares it to the checksum recorded at upload time; mismatches surface in the per-job logs modal.
@@ -58,7 +61,7 @@ internal/
   config/              - YAML configuration loader
   accounts/            - .env account parser (passwords + OAuth app/tokens)
   database/            - SQLite setup, schema, and per-entity queries
-  scanner/             - Directory scanner (2 levels deep)
+  scanner/             - Recursive directory scanner (depth-capped, accent-insensitive excludes)
   archive/             - Zip creation
   worker/              - Background upload pool: claim, retry, verify, DB backup
   provider/            - Cloud provider interface + Progress/OAuth types
@@ -91,8 +94,18 @@ Application behavior is tuned in `config.yml`; every value has a sensible defaul
 | `verification.enabled` / `verify_on_upload` | `true` / `true` | Download the first chunk and compare checksum after upload |
 | `verification.periodic_check_days` | `30` | Re-verify a completed file if it hasn't been re-checked within this many days (an omitted/`0` value falls back to 30). Turn periodic re-verification off with `verification.enabled: false`. |
 | `quota.sync_interval_minutes` | `60` | How often the background poller refreshes every account's cached quota (also refreshed after each upload and via "Refresh quotas now") |
+| `scan.max_depth` | `3` | Directory levels below the source root recorded in a zip's tree. `3` records the root plus three levels; an omitted, `0`, or negative value falls back to 3 |
 
 Credentials are **not** in `config.yml` — they live in `.env` (see below).
+
+### Settings stored in the app (not config.yml)
+
+**Exclude terms** are managed in the UI (the **Settings** button on the backups view) and stored in the database, so they're editable without a restart. A directory whose name contains one of the terms is left out of the recorded tree along with its whole subtree. Matching ignores case *and* accents — one `conteudo` entry covers "Conteúdo", "conteudo", and "CONTEÚDO".
+
+Two things worth being clear about:
+
+- Exclude terms shape the **recorded tree only**. The uploaded zip still contains every directory, so the archive stays a complete copy of the source.
+- Terms and `scan.max_depth` apply to the **next** backup. Trees already recorded are never rewritten — re-upload a record to refresh its tree.
 
 ## .env Account Structure
 
@@ -224,4 +237,7 @@ After each update, do the following:
 - **MEGA upload fails with "Object (typically, node or user) not found" at login**: MEGA reports invalid credentials this way. The usual cause is a password containing `$` (or other special characters) that was silently corrupted by `.env` variable expansion — see the next item. Otherwise confirm you can log in with that exact email and password at <https://mega.nz>, that there are no stray spaces in `.env`, and that the account does not require two-factor authentication (2FA is not currently supported).
 - **A password/secret with `$`, `#`, backticks or spaces isn't accepted**: Unquoted and double-quoted `.env` values undergo variable expansion, so `PASSWORD=paSs1$2178` becomes `paSs1`. Wrap such values in **single** quotes to keep them literal: `MEGA_ACCOUNT_1_PASSWORD='paSs1$2178'`. (OAuth tokens are hex and don't need quoting.)
 - **4shared upload fails with `401 ... "token ... expired, rejected or does not exist"` (code `401.0301`)**: The account's OAuth access token is no longer valid server-side. **There is no token-expiry setting in this app** — the application sets no lifetime on tokens; an OAuth 1.0 access token's validity is controlled entirely by 4shared's servers, so it cannot be extended or configured from here. A token can become invalid because 4shared expired it, because the app was re-authorized (which invalidates the previous token), or because it was revoked. 4shared does not publish the exact lifetime. The fix is always to re-mint the token: re-run `go run ./cmd/fourshared-auth -account <n>` and paste the freshly printed `FOURSHARED_ACCOUNT_<n>_OAUTH_TOKEN`/`_SECRET` into `.env`, then restart the server. Run `go run ./cmd/fourshared-test -account <n>` (add `FOURSHARED_DEBUG=1` for verbose signing logs) to verify a token in isolation.
+- **A directory I expected is missing from a zip's file tree**: Three possible causes, in order of likelihood. (1) It matches an **exclude term** — check the Settings modal; matching ignores case and accents, so `conteudo` also hides "Conteúdo". (2) It sits deeper than `scan.max_depth` (default 3 levels below the source root). (3) The tree was recorded **before** the term or depth changed — trees are captured at upload time and never rewritten, so re-upload the record to refresh it. Note that in every case the directory is still **inside the uploaded zip**; only the recorded tree is filtered.
+- **An exclude term emptied the whole tree**: A blank or whitespace-only term would match every directory name, so blanks are rejected on save and ignored on read. If a tree is unexpectedly empty, check the saved terms with `sqlite3 backmeup.db "select * from settings;"` — a very short term like `a` matches far more than intended, since matching is substring-based.
+- **Global search finds nothing for a folder I know exists**: The ▶ button searches **directory names inside recorded trees** — not file names (individual files aren't recorded) and not trees recorded before this feature shipped in their old 2-level form. Typing in the box filters the visible table in real time; the ▶ button is the one that runs the global search.
 - **"database is locked (SQLITE_BUSY)" in the logs**: Fixed — the database connection pool is pinned to a single connection so concurrent workers serialize instead of contending. If you still see it, make sure no other process (e.g. a second `go run ./cmd/server`) has the same `backmeup.db` open.
