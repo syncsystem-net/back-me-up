@@ -40,9 +40,45 @@
             <div class="search-wrap">
                 <span class="search-tab">search</span>
                 <div class="search-row">
-                    <input type="text" class="search-input" placeholder="Search users, titles or files…" x-model="search">
-                    <button class="search-btn" @click="void 0" aria-label="search">▶</button>
+                    <input type="text" class="search-input" placeholder="Search users, titles or files…" x-model="search" @keydown.enter="runSearch()">
+                    <button class="search-btn" @click="runSearch()" :disabled="searching" aria-label="search">▶</button>
                 </div>
+            </div>
+
+            <!-- Global search results. The table below stays live-filtered by the same
+                 input; this panel only appears once the ▶ search has actually run. -->
+            <div class="search-results" x-show="searchRan">
+                <div class="search-results-head">
+                    <span>
+                        <strong x-text="searchResults.length"></strong>
+                        <span x-text="searchResults.length === 1 ? ' match' : ' matches'"></span>
+                        for “<span x-text="search"></span>”
+                    </span>
+                    <button class="btn btn-grey btn-sm" @click="clearSearchResults()">Back to table</button>
+                </div>
+                <div class="form-error" x-show="searchError" x-text="searchError"></div>
+                <p class="muted" x-show="!searchError && searchResults.length === 0">No directories match that term.</p>
+                <template x-for="(m, i) in searchResults" :key="i">
+                    <div class="search-result">
+                        <div class="search-result-name" x-text="m.name"></div>
+                        <div class="search-result-path" x-text="m.path"></div>
+                        <div class="search-result-meta">
+                            <span x-text="m.title || '(untitled)'"></span>
+                            <span>·</span>
+                            <span x-text="m.owner_email"></span>
+                            <span>·</span>
+                            <span x-text="m.zip_name"></span>
+                        </div>
+                        <div class="search-result-accounts">
+                            <template x-for="(a, ai) in (m.accounts || [])" :key="ai">
+                                <span class="chip chip-complete" x-text="a"></span>
+                            </template>
+                            <template x-if="!(m.accounts && m.accounts.length)">
+                                <span class="chip chip-none">not uploaded</span>
+                            </template>
+                        </div>
+                    </div>
+                </template>
             </div>
 
             <div class="toolbar">
@@ -51,7 +87,7 @@
                 </button>
                 <div class="toolbar-right">
                     <button class="btn btn-pink" disabled title="Coming in a later phase">Auto-Sync</button>
-                    <button class="btn btn-pink" disabled title="Coming in a later phase">Settings</button>
+                    <button class="btn btn-pink" @click="openSettings()">Settings</button>
                 </div>
             </div>
 
@@ -123,10 +159,12 @@
                                                 <div class="progress"><div class="progress-fill" :style="`width:${providerProgress(u, prov)}%`"></div></div>
                                             </template>
 
+                                            <!-- One Download for the whole account (every zip stored on it);
+                                                 per-zip downloads live next to each zip's tree. -->
                                             <div class="provider-actions">
-                                                <template x-for="j in completedJobs(u, prov)" :key="j.id">
-                                                    <a class="btn btn-purple btn-sm" :href="`/api/jobs/${j.id}/download`" x-text="'Download ' + j.remote_name"></a>
-                                                </template>
+                                                <button class="btn btn-purple btn-sm" x-show="completedJobs(u, prov).length"
+                                                        @click="downloadAll(u, prov)"
+                                                        x-text="downloadAllLabel(u, prov)"></button>
                                                 <button class="btn btn-pink btn-sm" x-show="completedJobs(u, prov).length" @click="openDeleteProvider(u, prov)">Delete All</button>
                                             </div>
                                         </div>
@@ -141,7 +179,39 @@
                                     <template x-for="z in u.zips" :key="z.id">
                                         <div class="zip-block">
                                             <div class="zip-head"><strong x-text="z.name"></strong> — <span x-text="(z.size_bytes / 1073741824).toFixed(2)"></span> GB</div>
-                                            <pre class="zip-tree" x-text="prettyTree(z)"></pre>
+                                            <div class="zip-tree-actions">
+                                                <button class="btn btn-purple btn-sm" x-show="hasTree(z)" @click="setZipTreeOpen(z, true)">Expand All</button>
+                                                <button class="btn btn-purple btn-sm" x-show="hasTree(z)" @click="setZipTreeOpen(z, false)">Collapse All</button>
+                                            </div>
+                                            <!-- Flat list of visible nodes; depth is rendered as indentation
+                                                 because Alpine's x-for cannot recurse. -->
+                                            <div class="zip-tree" x-show="hasTree(z)">
+                                                <template x-for="row in treeRows(z)" :key="row.path">
+                                                    <div class="tree-row" :style="`padding-left:${row.depth * 16}px`">
+                                                        <button class="tree-toggle" x-show="row.hasChildren"
+                                                                @click="toggleNode(z.id, row)"
+                                                                x-text="row.expanded ? '▾' : '▸'"></button>
+                                                        <span class="tree-toggle tree-toggle-empty" x-show="!row.hasChildren">·</span>
+                                                        <span class="tree-name" x-text="row.name"></span>
+                                                        <span class="tree-size" x-show="row.size" x-text="formatSize(row.size)"></span>
+                                                        <!-- The root row IS the zip, so its download link sits inline with
+                                                             the archive's own name: "bkup003 (download file)". -->
+                                                        <template x-if="row.depth === 0 && zipDownloadJob(u, z)">
+                                                            <a class="tree-download" :href="`/api/jobs/${zipDownloadJob(u, z).id}/download`"
+                                                               :title="`Download ${z.name} from ${zipDownloadJob(u, z).provider}`">(download file)</a>
+                                                        </template>
+                                                    </div>
+                                                </template>
+                                            </div>
+                                            <!-- No tree to hang the root link off, so it goes here instead —
+                                                 the archive is still downloadable. -->
+                                            <p class="muted" x-show="!hasTree(z)">
+                                                No directory tree recorded for this zip.
+                                                <template x-if="zipDownloadJob(u, z)">
+                                                    <a class="tree-download" :href="`/api/jobs/${zipDownloadJob(u, z).id}/download`"
+                                                       :title="`Download ${z.name} from ${zipDownloadJob(u, z).provider}`">(download file)</a>
+                                                </template>
+                                            </p>
                                         </div>
                                     </template>
                                 </div>
@@ -216,7 +286,7 @@
                 </div>
                 <div class="form-error" x-show="error" x-text="error"></div>
                 <div class="modal-actions">
-                    <button class="btn btn-purple" @click="submitUpload()" :disabled="uploading" x-text="uploading ? 'Working…' : 'Upload / Save'"></button>
+                    <button class="btn btn-purple" @click="submitUpload()" :disabled="uploading" x-text="uploading ? 'Working…' : (isTitleOnly() ? 'Save Title' : 'Upload')"></button>
                     <button class="btn btn-grey" @click="showUploadModal = false">Cancel</button>
                 </div>
 
@@ -304,6 +374,41 @@
                 <div class="modal-actions">
                     <button class="btn btn-purple" @click="submitConflicts()" :disabled="uploading" x-text="uploading ? 'Working…' : 'Continue'"></button>
                     <button class="btn btn-grey" @click="showConflictModal = false">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div x-show="showSettingsModal" class="modal-overlay" @click.self="cancelSettings()" x-cloak>
+        <div class="modal-card">
+            <div class="modal-head">Settings</div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label>Exclude terms</label>
+                    <p class="muted settings-hint">
+                        A directory whose name contains one of these terms is left out of the recorded
+                        file tree, along with everything inside it. Matching ignores case and accents,
+                        so “conteudo” also matches “Conteúdo”. This affects the recorded tree only — the
+                        uploaded zip still contains every file. Changes apply to the next backup.
+                    </p>
+                    <div class="term-list">
+                        <template x-for="(t, i) in excludeTerms" :key="t">
+                            <div class="term-row">
+                                <span x-text="t"></span>
+                                <button class="btn btn-pink btn-sm" @click="removeTerm(i)">Remove</button>
+                            </div>
+                        </template>
+                        <p class="muted" x-show="excludeTerms.length === 0">No exclude terms yet.</p>
+                    </div>
+                    <div class="path-row term-add">
+                        <input type="text" x-model="newTerm" placeholder="Add a term…" @keydown.enter.prevent="addTerm()">
+                        <button type="button" class="btn btn-purple" @click="addTerm()">Add</button>
+                    </div>
+                </div>
+                <div class="form-error" x-show="settingsError" x-text="settingsError"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-purple" @click="saveSettings()" :disabled="settingsSaving" x-text="settingsSaving ? 'Saving…' : 'Save'"></button>
+                    <button class="btn btn-grey" @click="cancelSettings()">Cancel</button>
                 </div>
             </div>
         </div>
