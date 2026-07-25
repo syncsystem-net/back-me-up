@@ -40,6 +40,33 @@ func InsertJob(tx *sql.Tx, backupID, zipID, accountID int64, zipPath, remoteName
 	return id, nil
 }
 
+// InsertAdoptedJob records a job for an archive discovered on a provider by the
+// auto-sync crawl rather than uploaded by this install. It is written already
+// 'complete' with the provider's handle in remote_path, which is all the
+// existing Download and Delete actions need, so an adopted archive is as
+// actionable in the UI as an uploaded one.
+//
+// zip_path is empty on purpose: no local temp zip ever existed. verify_checksum
+// is left NULL too, so the periodic re-verifier skips these rows — there is no
+// local original to have hashed, and it must never report a mismatch it cannot
+// substantiate.
+func InsertAdoptedJob(tx *sql.Tx, backupID, zipID, accountID int64, remoteName, remotePath string, totalBytes int64) (int64, error) {
+	res, err := tx.Exec(
+		`INSERT INTO jobs (backup_id, zip_id, account_id, status, zip_path, remote_path, remote_name,
+		                   total_bytes, uploaded_bytes, completed_at)
+		 VALUES (?, ?, ?, 'complete', '', ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		backupID, zipID, accountID, remotePath, remoteName, totalBytes, totalBytes,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("inserting adopted job: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("getting last insert id: %w", err)
+	}
+	return id, nil
+}
+
 const jobColumns = `j.id, j.backup_id, COALESCE(j.zip_id, 0), j.account_id, a.provider, a.email, j.status,
 	COALESCE(j.zip_path, ''), COALESCE(j.remote_path, ''), COALESCE(j.remote_name, ''), j.total_bytes,
 	j.uploaded_bytes, j.chunks_total, j.chunks_uploaded, COALESCE(j.error_message, ''), j.created_at`

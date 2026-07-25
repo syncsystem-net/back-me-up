@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
+	"github.com/syncsystem-net/back-me-up/internal/autosync"
 	"github.com/syncsystem-net/back-me-up/internal/config"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/server/handlers"
@@ -32,7 +33,11 @@ func New(cfg *config.Config, db *sql.DB, accts *accounts.AccountStore, syncer *q
 
 	chunkSize := int64(cfg.Upload.ChunkSizeMB) << 20
 	h := handlers.New(db, accts, chunkSize, cfg.Scan.MaxDepth)
-	routes.Register(s.mux, h, db, syncer)
+	// One Manager for the process: Auto-Sync is a single global action over every
+	// configured account, and it holds the in-flight run's state between the
+	// preview request and the apply the user confirms.
+	syncMgr := autosync.New(db, accts, chunkSize, cfg.Scan.MaxDepth)
+	routes.Register(s.mux, h, db, syncer, syncMgr)
 
 	return s
 }

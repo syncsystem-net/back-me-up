@@ -4,11 +4,12 @@ import (
 	"database/sql"
 	"net/http"
 
+	"github.com/syncsystem-net/back-me-up/internal/autosync"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/server/handlers"
 )
 
-func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quota.Syncer) {
+func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quota.Syncer, sync *autosync.Manager) {
 	staticFS := http.StripPrefix("/static/", http.FileServer(http.Dir("web/static")))
 	mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -24,6 +25,10 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 	mux.HandleFunc("GET /api/search", handlers.SearchTreesHandler(db))
 	mux.HandleFunc("GET /api/settings", handlers.GetSettingsHandler(db))
 	mux.HandleFunc("PUT /api/settings", handlers.PutSettingsHandler(db))
+	mux.HandleFunc("GET /api/autosync", handlers.AutoSyncStatusHandler(sync))
+	mux.HandleFunc("POST /api/autosync/preview", handlers.AutoSyncPreviewHandler(sync))
+	mux.HandleFunc("POST /api/autosync/apply", handlers.AutoSyncApplyHandler(sync))
+	mux.HandleFunc("POST /api/autosync/cancel", handlers.AutoSyncCancelHandler(sync))
 	mux.HandleFunc("/api/browse", handlers.BrowseHandler())
 	mux.HandleFunc("POST /api/backups", h.PostBackups)
 	mux.HandleFunc("PATCH /api/backups/{id}", handlers.PatchBackupHandler(db))

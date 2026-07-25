@@ -346,10 +346,87 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 	return nil
 }
 
-// fileEntry mirrors the fields we consume from a folder's file listing.
+// ReadRange asks 4shared for a byte range of a file.
+//
+// 4shared's download endpoint has no documented Range support, so this is a
+// probe rather than a contract: a 206 means the range was honoured and the body
+// is exactly the requested span; a 200 means the server ignored the header and
+// is streaming the whole file from byte 0. Treating that 200's leading bytes as
+// if they started at off would silently return the wrong data — a parsed ZIP
+// central directory would come out as plausible-looking garbage — so the 200
+// case closes the body unread and reports ErrRangeUnsupported, leaving the
+// caller to decide (auto-sync falls back to downloading the whole archive once).
+func (c *Client) ReadRange(ctx context.Context, remoteRef string, p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("4shared read range: negative offset %d", off)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+"/files/"+remoteRef+"/download", nil)
+	if err != nil {
+		return 0, err
+	}
+	end := off + int64(len(p)) - 1
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
+	// The Range header is not an OAuth signature input, so signing is unchanged.
+	c.signer.Sign(req, nil)
+
+	resp, err := c.do(req)
+	if err != nil {
+		return 0, fmt.Errorf("GET /files/%s/download (range): %w", remoteRef, err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		// Honoured. Read at most len(p) bytes; a shorter body means we asked past
+		// the end of the file, which is a normal io.ReaderAt EOF.
+		n, err := io.ReadFull(io.LimitReader(resp.Body, int64(len(p))), p)
+		if err == io.ErrUnexpectedEOF {
+			err = io.EOF
+		}
+		if c.debug {
+			slog.Info("4shared ranged read", "ref", remoteRef, "offset", off, "want", len(p), "got", n)
+		}
+		return n, err
+	case http.StatusRequestedRangeNotSatisfiable:
+		return 0, io.EOF
+	case http.StatusOK:
+		// Range ignored — the body is the whole file starting at 0.
+		slog.Warn("4shared ignored a Range request (returned 200, not 206); ranged reads unavailable for this account",
+			"ref", remoteRef, "offset", off)
+		return 0, provider.ErrRangeUnsupported
+	default:
+		return 0, apiError("ranged download", resp)
+	}
+}
+
+// fileEntry mirrors the fields we consume from a folder's file listing. Size is
+// decoded defensively: 4shared's listing shape is only loosely documented, so a
+// listing that omits it leaves the size at 0 rather than failing the crawl.
 type fileEntry struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+// List returns the files in the account's root folder, reusing the same probed
+// folder-listing path FindByName relies on.
+func (c *Client) List(ctx context.Context) ([]provider.RemoteFile, error) {
+	u, err := c.getUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	files, err := c.listFolderFiles(ctx, u.RootFolderID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]provider.RemoteFile, 0, len(files))
+	for _, f := range files {
+		out = append(out, provider.RemoteFile{ID: f.ID, Name: f.Name, Size: f.Size})
+	}
+	return out, nil
 }
 
 // folderFilesPaths are the candidate URL templates (relative to apiBase) for
@@ -363,11 +440,7 @@ var folderFilesPaths = []string{"/folders/%s/files", "/folder/%s/files"}
 // FindByName lists the account's root folder and returns the id of the first
 // file whose name matches.
 func (c *Client) FindByName(ctx context.Context, name string) (string, bool, error) {
-	u, err := c.getUser(ctx)
-	if err != nil {
-		return "", false, err
-	}
-	files, err := c.listFolderFiles(ctx, u.RootFolderID)
+	files, err := c.List(ctx)
 	if err != nil {
 		return "", false, err
 	}

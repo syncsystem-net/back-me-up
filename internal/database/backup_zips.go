@@ -113,6 +113,15 @@ func ListSearchableZips(db *sql.DB) ([]*SearchableZip, error) {
 	return zips, acctRows.Err()
 }
 
+// GetZip loads a single archive row by id.
+func GetZip(db *sql.DB, id int64) (*Zip, error) {
+	z, err := scanZip(db.QueryRow(`SELECT `+zipColumns+` FROM backup_zips WHERE id = ?`, id))
+	if err != nil {
+		return nil, fmt.Errorf("scanning zip: %w", err)
+	}
+	return z, nil
+}
+
 // ListZipsByBackup returns a record's archives, newest first.
 func ListZipsByBackup(db *sql.DB, backupID int64) ([]*Zip, error) {
 	rows, err := db.Query(`SELECT `+zipColumns+` FROM backup_zips WHERE backup_id = ? ORDER BY created_at DESC`, backupID)

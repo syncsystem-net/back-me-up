@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 
 	gomega "github.com/t3rm1n4l/go-mega"
@@ -158,23 +159,166 @@ func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) er
 }
 
 func (c *Client) FindByName(ctx context.Context, name string) (string, bool, error) {
-	if err := ctx.Err(); err != nil {
+	files, err := c.List(ctx)
+	if err != nil {
 		return "", false, err
 	}
+	for _, f := range files {
+		if f.Name == name {
+			return f.ID, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// List returns the files in the account's cloud root. Folder nodes are skipped:
+// the crawl only cares about the archives Upload writes at the root.
+func (c *Client) List(ctx context.Context) ([]provider.RemoteFile, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := c.wait(ctx); err != nil {
-		return "", false, err
+		return nil, err
 	}
 	root := c.m.FS.GetRoot()
 	children, err := c.m.FS.GetChildren(root)
 	if err != nil {
-		return "", false, fmt.Errorf("listing mega root: %w", err)
+		return nil, fmt.Errorf("listing mega root: %w", err)
 	}
+	files := make([]provider.RemoteFile, 0, len(children))
 	for _, n := range children {
-		if n.GetName() == name {
-			return n.GetHash(), true, nil
+		if n.GetType() != gomega.FILE {
+			continue
 		}
+		files = append(files, provider.RemoteFile{
+			ID:   n.GetHash(),
+			Name: n.GetName(),
+			Size: n.GetSize(),
+		})
 	}
-	return "", false, nil
+	return files, nil
+}
+
+// ReadRange serves a byte range out of a MEGA object. MEGA supports genuine
+// random access: a download session exposes each chunk's offset and size, and a
+// chunk can be fetched (and decrypted) on its own, so a range maps to the chunks
+// it overlaps. Only those chunks are transferred, which is what makes reading a
+// large archive's central directory cheap.
+//
+// Finish is still called so the session is closed cleanly.
+func (c *Client) ReadRange(ctx context.Context, remoteRef string, p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("mega read range: negative offset %d", off)
+	}
+	node := c.m.FS.HashLookup(remoteRef)
+	if node == nil {
+		return 0, fmt.Errorf("mega node %q not found", remoteRef)
+	}
+	if off >= node.GetSize() {
+		return 0, io.EOF
+	}
+
+	d, err := c.m.NewDownload(node)
+	if err != nil {
+		return 0, fmt.Errorf("starting mega download: %w", err)
+	}
+
+	n, readErr := readRangeFrom(ctx, d, p, off, c.wait, c.waitBytes)
+
+	// go-mega returns nil from Finish for a partial download — it cannot check
+	// the MAC of a transfer it only saw part of — so this is normally a no-op.
+	// It is NOT a no-op when the requested range happened to cover the whole
+	// file, in which case the MAC is checked for real. The read still stands
+	// (the bytes are the caller's to use, and this is a directory listing, not a
+	// restore), but a genuine integrity failure must not vanish silently.
+	if err := d.Finish(); err != nil {
+		slog.Warn("mega: integrity check failed after a ranged read covering the whole file",
+			"ref", remoteRef, "error", err)
+	}
+	return n, readErr
+}
+
+// chunkSource is the slice of go-mega's *Download that ranged reads need. It is
+// an interface so the chunk-to-range mapping below can be tested against a
+// synthetic chunk table instead of a live MEGA session.
+type chunkSource interface {
+	Chunks() int
+	ChunkLocation(id int) (position int64, size int, err error)
+	DownloadChunk(id int) ([]byte, error)
+}
+
+// readRangeFrom copies the bytes covering [off, off+len(p)) out of src, fetching
+// only the chunks that overlap the range. MEGA dictates its own chunk
+// boundaries, so a range routinely starts and ends mid-chunk; each fetched chunk
+// is clipped to the overlap and placed at its own offset within p.
+//
+// It follows io.ReaderAt semantics: a short read is always accompanied by an
+// error, and a range extending past the end of the file yields io.EOF along with
+// whatever did exist.
+func readRangeFrom(ctx context.Context, src chunkSource, p []byte, off int64,
+	wait func(context.Context) error, waitBytes func(context.Context, int) error) (int, error) {
+
+	end := off + int64(len(p)) // exclusive
+	var n int
+	for id := 0; id < src.Chunks(); id++ {
+		if err := ctx.Err(); err != nil {
+			return n, err
+		}
+		pos, size, err := src.ChunkLocation(id)
+		if err != nil {
+			return n, fmt.Errorf("locating chunk %d: %w", id, err)
+		}
+		chunkEnd := pos + int64(size)
+		if chunkEnd <= off {
+			continue // entirely before the range
+		}
+		if pos >= end {
+			break // chunks are ordered, so everything after this is past the range
+		}
+		if err := wait(ctx); err != nil {
+			return n, err
+		}
+		if err := waitBytes(ctx, size); err != nil {
+			return n, err
+		}
+		chunk, err := src.DownloadChunk(id)
+		if err != nil {
+			return n, fmt.Errorf("downloading chunk %d: %w", id, err)
+		}
+		// Clip to the overlap. The bounds are re-derived from the chunk actually
+		// returned rather than trusted from ChunkLocation, so a short chunk
+		// cannot slice out of range.
+		from := max64(off, pos) - pos
+		to := min64(end, chunkEnd) - pos
+		if to > int64(len(chunk)) {
+			to = int64(len(chunk))
+		}
+		if from < 0 || from >= to {
+			continue
+		}
+		n += copy(p[max64(off, pos)-off:], chunk[from:to])
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (c *Client) Delete(ctx context.Context, remoteRef string) error {

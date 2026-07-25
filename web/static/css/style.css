@@ -329,3 +329,42 @@ main { flex: 1; max-width: 1120px; width: calc(100% - 48px); margin: 20px auto 4
 .log-time { color: var(--muted); }
 .log-level { text-transform: uppercase; }
 .log-email { color: var(--purple-mid); overflow: hidden; text-overflow: ellipsis; }
+
+/* ===== Auto-Sync modal ===== */
+.modal-card-wide { max-width: 760px; }
+.warn-box {
+    background: #fff6e5; border: 1px solid #f0d9a8; border-left: 4px solid var(--pink);
+    border-radius: 6px; padding: 14px 16px; margin-bottom: 16px; font-size: 14px;
+}
+.warn-box > strong { display: block; color: var(--purple-dark); margin-bottom: 8px; }
+.warn-box p { margin-bottom: 8px; }
+.warn-box ul { margin: 0 0 0 18px; }
+.warn-box li { margin-bottom: 4px; }
+.sync-progress { font-size: 15px; color: var(--purple-mid); margin-bottom: 6px; }
+.sync-summary { font-size: 15px; margin-bottom: 14px; }
+.sync-legend { margin-bottom: 14px; }
+.sync-legend-toggle {
+    background: none; border: none; cursor: pointer; padding: 0;
+    color: var(--purple-mid); font-family: inherit; font-size: 13px; font-weight: 700;
+}
+.sync-legend-body {
+    margin-top: 8px; background: #fff; border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.sync-legend-row { display: flex; gap: 10px; align-items: baseline; font-size: 13px; }
+.sync-legend-row .chip { flex-shrink: 0; }
+.sync-legend-text { color: var(--text); }
+.sync-account { background: #fff; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 10px; overflow: hidden; }
+.sync-account-head {
+    display: flex; gap: 8px; align-items: baseline; cursor: pointer;
+    padding: 10px 14px; background: var(--grey-band); font-size: 14px;
+}
+.sync-counts { color: var(--muted); margin-left: auto; font-size: 13px; }
+.sync-account .form-error { margin: 10px 14px; }
+.sync-detail { padding: 10px 14px 14px; max-height: 320px; overflow: auto; }
+.sync-list { margin-bottom: 12px; }
+.sync-list-title { font-size: 13px; color: var(--purple-mid); font-weight: 700; margin-bottom: 6px; }
+.sync-item { display: flex; gap: 8px; align-items: baseline; font-size: 13px; padding: 3px 0; }
+.sync-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-item-size { color: var(--muted); }
+.sync-item-note { flex-basis: 100%; color: #8a5a00; font-size: 12px; }
