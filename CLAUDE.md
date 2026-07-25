@@ -202,17 +202,11 @@ Ticket #7 was too large for one PR. Detailed plan (local, gitignored): `dev-tool
 
 **Exclude terms filter the recorded tree only — never the zip.** Decided with the user: the uploaded archive stays a complete copy of the source, so a term is a display/search filter, not a backup policy. Changing terms or `max_depth` does not rewrite trees already recorded.
 
-**Phase 7c — NEXT: auto-sync remote crawl.** For when a user already has archives sitting in a remote account: crawl the provider, reconcile what's there into the local DB, and wire the currently-disabled **Auto-Sync** button behind an explicit warning + confirmation modal (the ticket calls for both).
+**Phase 7c — DONE** (PR #9, branch `pr/9-auto-sync-remote-crawl`). The **Auto-Sync** button crawls every configured account's cloud root, reads the archives actually there, and reconciles them into the DB as *warning → dry-run preview → apply on confirm*, deleting nothing. Shipped: `provider.List` + `provider.ReadRange` (with `ErrRangeUnsupported`) on both backends; `internal/autosync` (pure `Plan`, `ziptree`, block-cached `remotereader`, background `Manager`); `database.InsertAdoptedJob`/`GetZip`; four `/api/autosync` routes (preview/apply/cancel/status). **No schema change** — an adopted archive is a synthetic `complete` job (`remote_path` set, empty `zip_path`, NULL `verify_checksum`) that the existing Download/Delete handlers already key on and the re-verifier correctly skips.
 
-Shape of the work, from the 7a/7b explorations:
+Decisions locked with the user, all implemented: crawled `tree_json` **is** derived from the remote ZIP's central directory (not empty); match by remote name against `backup_zips.name`, adopt unmatched `.zip`s, create the record if absent; a local row whose remote copy is gone is **report-only, never modified**; one global action, preview then confirm. See the 7c technical notes below for the ranged-read, idempotency, and cross-account-dedup lessons.
 
-- **`provider.Provider` has no listing method.** Its interface (`internal/provider/provider.go`) is `Name/Login/Upload/Download/FindByName/Delete/GetQuota`. Add `List(ctx) ([]RemoteFile, error)` returning `{ID, Name, Size}`, and one implementation per backend — the registry is the only place that imports concrete providers, so nothing else ripples.
-- **MEGA already does this internally**: `FindByName` in `internal/provider/mega/mega.go` calls `c.m.FS.GetChildren(c.m.FS.GetRoot())`; nodes expose `GetName()`/`GetHash()`. Generalize that into `List`.
-- **4shared already lists**: `listFolderFiles(ctx, rootFolderID)` probes `/folders/{id}/files` then `/folder/{id}/files` (the spelling is genuinely ambiguous — see the 4shared notes below). Its `fileEntry` struct carries only `ID`/`Name`; **add `Size`** if the API returns it.
-- **Reuse the existing connect/iterate pattern**: `cloud.Connect(ctx, store, provider, email, chunkSize)` over `store.Accounts`, exactly as `quota.SyncAll`/`syncOne` does.
-- **Reconciliation** writes discovered archives as `backup_zips` rows under the owning user's record, creating the record when absent. Open question to settle with the user: a crawled zip has **no local tree**, so decide whether `tree_json` stays empty (the UI already renders "No directory tree recorded for this zip" — 7b added that fallback) or is derived by downloading and reading the zip's central directory. Empty is the cheap, honest default.
-- **Matching remote files to existing records** needs a rule: by `remote_name` against `backup_zips.name` is the obvious one. Decide what happens to a remote file that matches nothing (adopt it? ignore it?) and to a local zip row whose remote copy has vanished.
-- **This writes to the user's database from remote state**, so it is the most destructive-feeling feature so far. Confirmation modal, a dry-run/preview of what would change, and no deletions without explicit opt-in.
+**Exclude terms filter the recorded tree only — never the zip.** Decided with the user: the uploaded archive stays a complete copy of the source, so a term is a display/search filter, not a backup policy. Changing terms or `max_depth` does not rewrite trees already recorded. (Ticket #7 is now fully shipped across 7a/7b/7c.)
 
 ---
 
@@ -406,6 +400,26 @@ Adding a provider = implement `Provider` in a new subpackage + add one `case` in
 - **Diagnostics:** `go run ./cmd/fourshared-test -account <n>` checks one account's creds in isolation; `FOURSHARED_DEBUG=1` logs the OAuth signature base string, Authorization header, and raw responses. Reach for these before guessing.
 - **`403 ... "already exists" (`403.0201`)` on upload-init.** Unlike MEGA (which allows duplicate names), 4shared **refuses** to create a second file with an existing name at `POST /upload` time instead of overwriting. The UI conflict pre-check (`handlers.resolveConflicts`) deletes a duplicate before queuing when the user picks "overwrite", but it can miss one — most often a **prior upload that failed partway leaves the name reserved without appearing in the folder listing** (so `FindByName` returns not-found and never prompts). Fix: `fourshared.startUpload` takes an `allowReplace` guard — on `403.0201` it `FindByName`s the existing file, `Delete`s it, and retries the init once. This is safe because a queued job means the user already opted to upload to that account ("skip" creates no job). If the name is reserved but *not* listable (a true ghost/incomplete upload), the replace can't find it; the error then tells the user to delete it from the 4shared web UI. `isAlreadyExists()` matches both the `403.0201` code and the "already exists" message.
 - **`401 ... "token ... expired, rejected or does not exist"` (`401.0301`)** means the OAuth access token is no longer valid server-side. **We set no token lifetime anywhere** — OAuth 1.0 access tokens have no client-configurable expiry, so there is nothing to tune in config; validity is entirely 4shared's call. Causes: 4shared expired it, the app was re-authorized (invalidates the previous token), or it was revoked. 4shared does not publish the TTL. Fix is always the same: re-run `cmd/fourshared-auth -account <n>` and replace the token in `.env`.
+
+---
+
+### Auto-Sync remote crawl (phase 7c)
+
+`internal/autosync` crawls each account's cloud root and reconciles what's there into the DB. Hard-won facts:
+
+**Read the ZIP central directory with ranged reads, not full downloads.** `provider.ReadRange` has `io.ReaderAt` semantics; `remotereader.go` wraps it (with a small block cache — the stdlib issues several small reads near the directory) and hands it to `zip.NewReader(r, size)`, which seeks to and parses the central directory itself, transferring only the archive's tail. Build the tree from entry **path components**, not `Mode().IsDir()` — a directory can be implied by a nested entry with no explicit directory entry of its own. Reuse `scanner.Excluded`/`Fold` and `scan.max_depth` so a crawled tree and an uploaded tree can never disagree about matching or depth.
+
+**MEGA supports true random access; 4shared may not.** MEGA maps a byte range onto go-mega's download chunks (`Download.ChunkLocation`/`DownloadChunk`), clipping straddling chunks. 4shared's `Range` support is **undocumented**: `ReadRange` treats `206` as honored, `416` as EOF, and **`200` as "range ignored"** — it returns `ErrRangeUnsupported` rather than mis-slicing a full-body response (silently wrong offsets would corrupt every parsed tree). On that sentinel the indexer falls back to one full download to a temp file.
+
+**Cap the fallback download on bytes received, never on advertised size.** `Download` streams without announcing a length, and 4shared's listing may report `size 0`, so a pre-flight size check is bypassable — a size-0 archive would download unbounded. `cappedWriter` fails the write that crosses the ceiling. An over-cap or otherwise unreadable archive is still **adopted, with a note** explaining it has no tree.
+
+**Idempotency is a design property, so keep `Plan` pure.** `autosync.Plan(remote, local)` returns adopt/link/matched/missing without touching either side; feeding it the state a previous apply left must yield zero proposals. Two traps that break it: (1) tree serialization must be **deterministic** — sort children before emitting, or Go's random map order re-serializes an unchanged archive differently every run; (2) same-named zip rows (a record legitimately accumulates zips) must be disambiguated by a **rank** preferring the row with a usable remote handle for this account, else a link attaches to the wrong row.
+
+**Cross-account adoption dedups at apply, not plan.** Every account is planned before any is applied, so an archive on two accounts is proposed `adopt` by both — applying verbatim makes two rows for one archive. `applyOne` re-resolves against **live DB state** before inserting: first account adopts, the rest degrade to a link against the row that now exists.
+
+**A missing remote is report-only.** No code path in the package issues `UPDATE`/`DELETE` for a `missing` row — a transient listing failure must never delete a user's records. A per-account listing failure surfaces as a **visible error** in the preview, never as "nothing found" (same degradation as the 4shared conflict-detection path).
+
+**Start/poll, not one long HTTP request.** A crawl runs minutes; the four routes return immediately and the UI polls `GET /api/autosync`, so the 2s table refresh never blocks and the run is cancellable.
 
 ---
 

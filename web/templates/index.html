@@ -86,7 +86,7 @@
                     <span x-text="allExpanded ? '▾ Collapse All' : '▸ Expand All'"></span>
                 </button>
                 <div class="toolbar-right">
-                    <button class="btn btn-pink" disabled title="Coming in a later phase">Auto-Sync</button>
+                    <button class="btn btn-pink" @click="openAutoSync()">Auto-Sync</button>
                     <button class="btn btn-pink" @click="openSettings()">Settings</button>
                 </div>
             </div>
@@ -410,6 +410,148 @@
                     <button class="btn btn-purple" @click="saveSettings()" :disabled="settingsSaving" x-text="settingsSaving ? 'Saving…' : 'Save'"></button>
                     <button class="btn btn-grey" @click="cancelSettings()">Cancel</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Auto-Sync. One modal walks the whole flow: warning → dry-run preview →
+         apply on confirm. Nothing is written until the user presses Apply. -->
+    <div x-show="showAutoSyncModal" class="modal-overlay" @click.self="closeAutoSync()" x-cloak>
+        <div class="modal-card modal-card-wide">
+            <div class="modal-head">Auto-Sync</div>
+            <div class="modal-body">
+                <!-- Step 1: the warning. -->
+                <template x-if="autoSyncPhase() === 'warning'">
+                    <div>
+                        <div class="warn-box">
+                            <strong>This reads your cloud accounts and writes to your local database.</strong>
+                            <p>
+                                Auto-Sync crawls the root of every configured account and compares what is stored there
+                                against your database — so backups uploaded before you used this tool, or lost with a
+                                previous database, show up in the table again. When you apply it will only ever:
+                            </p>
+                            <ul>
+                                <li><strong>Create a new record</strong> for an archive that is in your account but not yet in your database (its file tree is read too).</li>
+                                <li><strong>Connect an account</strong> to an archive your database already knows, when that account turns out to hold a copy, so Download and Delete work there.</li>
+                            </ul>
+                            <p>It will <strong>never</strong>:</p>
+                            <ul>
+                                <li>Delete anything, on the cloud or locally. A record whose remote file has vanished is only reported.</li>
+                                <li>Rewrite or replace an existing record or its file tree.</li>
+                            </ul>
+                            <p class="muted">
+                                Reading each archive's file list is network-bound and can take several minutes. You will
+                                see exactly what would change, and confirm, before anything is written.
+                            </p>
+                        </div>
+                        <div class="modal-actions">
+                            <button class="btn btn-purple" @click="startAutoSyncPreview()">Scan Accounts</button>
+                            <button class="btn btn-grey" @click="closeAutoSync()">Cancel</button>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Step 2/4: a run is working. -->
+                <template x-if="autoSyncPhase() === 'previewing' || autoSyncPhase() === 'applying'">
+                    <div>
+                        <p class="sync-progress" x-text="autoSyncRun.progress || 'Working…'"></p>
+                        <p class="muted">This can take a few minutes. You can leave this open — the table keeps refreshing behind it.</p>
+                        <div class="modal-actions">
+                            <button class="btn btn-pink" @click="cancelAutoSync()">Cancel Run</button>
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Step 3/5: the preview, and the same view again once applied. -->
+                <template x-if="['preview_ready', 'applied', 'cancelled', 'failed'].includes(autoSyncPhase())">
+                    <div>
+                        <div class="form-error" x-show="autoSyncRun.error" x-text="autoSyncRun.error"></div>
+                        <p class="sync-summary" x-text="autoSyncSummary()"></p>
+
+                        <!-- Legend: what each outcome means before the user has to read a
+                             row of them. Collapsible so it's out of the way on a re-scan. -->
+                        <div class="sync-legend">
+                            <button class="sync-legend-toggle" @click="toggleSyncLegend()">
+                                <span x-text="showSyncLegend ? '▾' : '▸'"></span> What these outcomes mean
+                            </button>
+                            <div class="sync-legend-body" x-show="showSyncLegend" x-cloak>
+                                <template x-for="item in syncLegend()" :key="item.key">
+                                    <div class="sync-legend-row">
+                                        <span class="chip" :class="item.cls" x-text="item.label"></span>
+                                        <span class="sync-legend-text" x-text="item.text"></span>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
+                        <template x-for="acct in (autoSyncRun.accounts || [])" :key="acct.provider + '|' + acct.email">
+                            <div class="sync-account">
+                                <div class="sync-account-head" @click="toggleSyncAccount(acct)">
+                                    <span x-text="isSyncAccountOpen(acct) ? '▾' : '▸'"></span>
+                                    <strong x-text="(acct.provider === 'mega' ? 'MEGA' : '4shared') + ' — ' + acct.email"></strong>
+                                    <span class="sync-counts" x-text="syncAccountCounts(acct)"></span>
+                                </div>
+
+                                <!-- A listing failure is its own line, never silence. An account
+                                     that could not be read has NOT been found empty. -->
+                                <div class="form-error" x-show="acct.error" x-text="acct.error"></div>
+                                <div class="form-error" x-show="acct.apply_error" x-text="acct.apply_error"></div>
+
+                                <div class="sync-detail" x-show="isSyncAccountOpen(acct) && !acct.error">
+                                    <template x-if="(acct.proposed || []).length">
+                                        <div class="sync-list">
+                                            <div class="sync-list-title">Will be added to your database</div>
+                                            <template x-for="p in acct.proposed" :key="p.name">
+                                                <div class="sync-item">
+                                                    <span class="chip" :class="syncActionChipClass(p.action)" x-text="syncActionLabel(p.action)"></span>
+                                                    <span class="sync-item-name" x-text="p.name"></span>
+                                                    <span class="sync-item-size" x-text="formatSize(p.size_bytes)"></span>
+                                                    <span class="sync-item-note" x-show="p.note" x-text="p.note"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+
+                                    <template x-if="(acct.missing || []).length">
+                                        <div class="sync-list">
+                                            <div class="sync-list-title">Your database references these, but they are no longer on this account (reported only — nothing is changed)</div>
+                                            <template x-for="mz in acct.missing" :key="mz.zip_id">
+                                                <div class="sync-item">
+                                                    <span class="chip chip-failed">not found</span>
+                                                    <span class="sync-item-name" x-text="mz.name"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+
+                                    <template x-if="(acct.matched || []).length">
+                                        <div class="sync-list">
+                                            <div class="sync-list-title">Already in sync (nothing will happen)</div>
+                                            <template x-for="mz in acct.matched" :key="mz.zip_id">
+                                                <div class="sync-item">
+                                                    <span class="chip chip-none">in sync</span>
+                                                    <span class="sync-item-name" x-text="mz.name"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+
+                                    <p class="muted" x-show="!(acct.proposed || []).length && !(acct.missing || []).length && !(acct.matched || []).length">
+                                        No archives found on this account.
+                                    </p>
+                                </div>
+                            </div>
+                        </template>
+
+                        <div class="modal-actions">
+                            <button class="btn btn-purple" x-show="autoSyncPhase() === 'preview_ready' && autoSyncProposedCount() > 0"
+                                    @click="applyAutoSync()"
+                                    x-text="`Apply ${autoSyncProposedCount()} Change${autoSyncProposedCount() === 1 ? '' : 's'}`"></button>
+                            <button class="btn btn-purple" x-show="autoSyncPhase() !== 'preview_ready'" @click="startAutoSyncPreview()">Scan Again</button>
+                            <button class="btn btn-grey" @click="closeAutoSync()">Close</button>
+                        </div>
+                    </div>
+                </template>
             </div>
         </div>
     </div>

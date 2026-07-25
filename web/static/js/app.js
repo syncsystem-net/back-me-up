@@ -100,6 +100,17 @@ document.addEventListener('alpine:init', () => {
         settingsSaving: false,
         settingsError: '',
 
+        // Auto-Sync (remote crawl). The run lives on the server; this is a view of
+        // it, refreshed by the same 2s tick while the modal is open. openedFromWarning
+        // keeps the modal on the warning step until the user actually starts a scan,
+        // since a finished run from earlier in the session is still on the server.
+        showAutoSyncModal: false,
+        autoSyncRun: { phase: 'idle', accounts: [] },
+        autoSyncStarted: false,
+        // Which account sections are expanded, keyed by provider|email so the 2s
+        // refresh (which replaces autoSyncRun wholesale) cannot lose the state.
+        expandedSyncAccounts: [],
+
         // Global tree search (server-side, accent-insensitive). Separate from the
         // real-time `search` filtering, which stays purely client-side.
         searchResults: [],
@@ -115,6 +126,9 @@ document.addEventListener('alpine:init', () => {
             if (document.hidden) return;
             await this.loadUsers();
             if (this.hasActiveJobs()) await this.loadAccounts();
+            // Only poll the crawl while its modal is open — it is a deliberate,
+            // user-triggered operation, not background state the table needs.
+            if (this.showAutoSyncModal && this.autoSyncStarted) await this.loadAutoSync();
         },
         async loadUsers() {
             const r = await fetch('/api/users');
@@ -599,6 +613,135 @@ document.addEventListener('alpine:init', () => {
             this.showSettingsModal = false;
             await this.loadSettings();
         },
+
+        // ---- Auto-Sync (remote crawl) ----
+        // Always opens on the warning: this writes to the database from remote
+        // state, so the user confirms the intent, then confirms the concrete plan.
+        async openAutoSync() {
+            this.autoSyncStarted = false;
+            this.autoSyncRun = { phase: 'idle', accounts: [] };
+            this.showAutoSyncModal = true;
+            // A run started earlier is still going server-side even if the modal
+            // was closed. Rejoin it rather than showing a warning whose "Scan"
+            // button would only be rejected as already-in-progress.
+            await this.loadAutoSync();
+            const p = this.autoSyncRun.phase;
+            if (p === 'previewing' || p === 'applying') this.autoSyncStarted = true;
+        },
+        closeAutoSync() {
+            // A run that is still crawling keeps going server-side; reopening the
+            // modal and scanning again picks up wherever it got to.
+            this.showAutoSyncModal = false;
+        },
+        // 'warning' is a client-side step with no server equivalent — it is what we
+        // show before the user has started anything in this sitting.
+        autoSyncPhase() {
+            if (!this.autoSyncStarted) return 'warning';
+            return (this.autoSyncRun && this.autoSyncRun.phase) || 'idle';
+        },
+        async loadAutoSync() {
+            const r = await fetch('/api/autosync');
+            if (!r.ok) return;
+            this.autoSyncRun = await r.json() || { phase: 'idle', accounts: [] };
+        },
+        async startAutoSyncPreview() {
+            const r = await fetch('/api/autosync/preview', { method: 'POST' });
+            const body = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                this.autoSyncRun = { phase: 'failed', accounts: [], error: body.error || 'Could not start the scan' };
+                this.autoSyncStarted = true;
+                return;
+            }
+            this.autoSyncRun = body;
+            this.autoSyncStarted = true;
+        },
+        async applyAutoSync() {
+            const r = await fetch('/api/autosync/apply', { method: 'POST' });
+            const body = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                this.autoSyncRun = { ...this.autoSyncRun, error: body.error || 'Could not apply the changes' };
+                return;
+            }
+            this.autoSyncRun = body;
+        },
+        async cancelAutoSync() {
+            const r = await fetch('/api/autosync/cancel', { method: 'POST' });
+            if (r.ok) this.autoSyncRun = await r.json() || this.autoSyncRun;
+        },
+        autoSyncProposedCount() {
+            return (this.autoSyncRun.accounts || []).reduce((n, a) => n + (a.proposed || []).length, 0);
+        },
+        autoSyncSummary() {
+            const accts = this.autoSyncRun.accounts || [];
+            const failed = accts.filter(a => a.error).length;
+            const phase = this.autoSyncPhase();
+            if (phase === 'applied') {
+                const applied = accts.reduce((n, a) => n + (a.applied || 0), 0);
+                return `Added ${applied} record${applied === 1 ? '' : 's'} across ${accts.length} account${accts.length === 1 ? '' : 's'}.`;
+            }
+            if (phase === 'cancelled') return 'Run cancelled. Anything already written is kept; scan again to see what is left.';
+            const n = this.autoSyncProposedCount();
+            const base = n === 0
+                ? 'Nothing to add — every archive found is already recorded.'
+                : `${n} archive${n === 1 ? '' : 's'} would be added.`;
+            // A failed account is called out here too: "nothing to add" would be a
+            // lie if an account could not be read at all.
+            return failed ? `${base} ${failed} account${failed === 1 ? '' : 's'} could not be read (see below).` : base;
+        },
+        syncAccountCounts(a) {
+            if (a.error) return 'could not be read';
+            const parts = [];
+            if ((a.proposed || []).length) parts.push(`${a.proposed.length} to add`);
+            if ((a.missing || []).length) parts.push(`${a.missing.length} missing remotely`);
+            if ((a.matched || []).length) parts.push(`${a.matched.length} in sync`);
+            return parts.length ? parts.join(' · ') : 'nothing found';
+        },
+        // Outcome vocabulary. The server's action names ('adopt', 'link') are
+        // internal jargon — and "link" in a web UI reads as a hyperlink — so the
+        // preview never shows them raw. Each outcome gets a plain-language chip
+        // and a sentence saying what it will do to the database.
+        syncActionLabel(action) {
+            return action === 'adopt' ? 'new record' : 'connect account';
+        },
+        syncActionChipClass(action) {
+            return action === 'adopt' ? 'chip-complete' : 'chip-in_progress';
+        },
+        // The legend, in the order a user meets these: things that change the
+        // database first, then the two that never do.
+        syncLegend() {
+            return [
+                {
+                    key: 'adopt',
+                    label: 'new record',
+                    cls: 'chip-complete',
+                    text: 'This archive is in your account but not in your database. A new record will be created for it, including its file tree.',
+                },
+                {
+                    key: 'link',
+                    label: 'connect account',
+                    cls: 'chip-in_progress',
+                    text: 'Your database already knows this archive, but not that this account holds a copy. A reference will be added so Download and Delete work here. The existing record and its file tree are left unchanged.',
+                },
+                {
+                    key: 'matched',
+                    label: 'in sync',
+                    cls: 'chip-none',
+                    text: 'Already recorded for this account. Nothing will happen.',
+                },
+                {
+                    key: 'missing',
+                    label: 'not found',
+                    cls: 'chip-failed',
+                    text: 'Your database references a file that is no longer in this account. Nothing will be changed — this is reported for your information only.',
+                },
+            ];
+        },
+        showSyncLegend: true,
+        toggleSyncLegend() { this.showSyncLegend = !this.showSyncLegend; },
+
+        syncAccountKey(a) { return `${a.provider}|${a.email}`; },
+        isSyncAccountOpen(a) { return this.expandedSyncAccounts.includes(this.syncAccountKey(a)); },
+        toggleSyncAccount(a) { this._toggle(this.expandedSyncAccounts, this.syncAccountKey(a)); },
 
         // ---- Global search across every stored tree ----
         async runSearch() {

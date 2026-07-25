@@ -6,8 +6,26 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"io"
 )
+
+// ErrRangeUnsupported is returned by ReadRange when the backend cannot serve a
+// partial read — either it has no range support at all, or the server ignored
+// the request and answered with the whole object. Callers must treat it as
+// "ranged access is not available here" and fall back explicitly (e.g. download
+// the whole file) rather than assuming the bytes they got start at the offset
+// they asked for. Mis-slicing a full response as if it were a range would
+// silently produce garbage.
+var ErrRangeUnsupported = errors.New("provider does not support ranged reads")
+
+// RemoteFile is one object in an account's cloud root as reported by List. Size
+// is best-effort: a backend whose listing omits it reports 0.
+type RemoteFile struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
 
 // Progress reports the cumulative state of an in-flight upload. It is delivered
 // to the worker after each chunk so progress can be persisted to the database.
@@ -41,6 +59,22 @@ type Provider interface {
 
 	// Download streams the object identified by remoteRef into w.
 	Download(ctx context.Context, remoteRef string, w io.Writer) error
+
+	// List returns every file in the account's cloud root (the location Upload
+	// writes to). Directories are not reported — only files. It backs the
+	// auto-sync crawl, which reconciles what is actually stored on an account
+	// against the local database.
+	List(ctx context.Context) ([]RemoteFile, error)
+
+	// ReadRange reads up to len(p) bytes of remoteRef starting at byte offset
+	// off, following io.ReaderAt semantics: it returns a short read only
+	// together with an error, and io.EOF once off is at or past the end of the
+	// object. It exists so a remote ZIP's central directory (which lives at the
+	// tail of the archive) can be read without transferring the whole file.
+	//
+	// A backend that cannot serve partial reads must return ErrRangeUnsupported
+	// rather than the whole object's leading bytes.
+	ReadRange(ctx context.Context, remoteRef string, p []byte, off int64) (int, error)
 
 	// FindByName looks for a file with the given name in the account's cloud
 	// root (the same location Upload writes to). It returns the matching

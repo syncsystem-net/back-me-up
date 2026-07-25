@@ -13,6 +13,7 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - Each zip's **full directory tree** is recorded (down to `scan.max_depth`, default 3 levels) and browsable as an interactive tree — expand the whole zip at once or one node at a time.
 - **Exclude terms** (Settings) keep noisy directories out of the recorded tree. Matching ignores case *and* accents, so one `conteudo` entry covers "Conteúdo", "conteudo", and "CONTEÚDO". Terms affect the recorded tree only — the uploaded zip still contains every directory.
 - Two kinds of search, both accent-insensitive: typing filters the table in real time by user, title, or directory name, while the **▶ button runs a global search** across every recorded tree and reports which backup, zip, and account holds each matching directory.
+- **Auto-Sync** discovers archives already sitting in your cloud accounts (from before you used this tool, or lost with a previous database) and reconciles them into the table. It shows a dry-run preview of every change before writing anything and never deletes — see "Auto-Sync" below.
 - An "Accounts" view groups each provider's accounts in expandable cards with used/total quota and when it was last synced.
 - Quotas refresh automatically on a background interval (`quota.sync_interval_minutes`) and on demand via the "Refresh quotas now" button, in addition to refreshing after each successful upload.
 - Per-provider rate limiting (`rate_limits.<provider>`) paces API requests and upload bandwidth so a large backup stays within each provider's limits.
@@ -106,6 +107,19 @@ Two things worth being clear about:
 
 - Exclude terms shape the **recorded tree only**. The uploaded zip still contains every directory, so the archive stays a complete copy of the source.
 - Terms and `scan.max_depth` apply to the **next** backup. Trees already recorded are never rewritten — re-upload a record to refresh its tree.
+
+## Auto-Sync
+
+If you already have `.zip` archives in a cloud account — uploaded before you used this tool, or lost when a previous database went away — **Auto-Sync** pulls them back into the table without re-uploading anything. The **Auto-Sync** button (top bar) opens a warning, then runs a read-only crawl of every configured account's cloud root and shows a **preview** of exactly what it would change, grouped per account:
+
+- **new record** — an archive in the account your database has never seen. Adopting it creates a record and reads the archive's directory tree (so it's searchable like an uploaded one).
+- **connect account** — an archive your database already knows (uploaded to a sibling account) that this account also holds. A reference is added so Download/Delete work here; the existing record and its tree are left unchanged.
+- **in sync** — already recorded; nothing happens. (A second run with no remote changes proposes nothing.)
+- **not found** — a record pointing at a file no longer in the account. **Reported only** — nothing is modified or deleted, so a transient API error can never lose your data.
+
+Nothing is written until you confirm. Auto-Sync never deletes anything, cloud or local.
+
+Notes and limits: only each account's **cloud root** is crawled (no nested folders), and only `.zip` files are adopted. A discovered archive's tree is read straight from the ZIP's central directory using ranged reads, so only the tail of the file is transferred — **except on 4shared**, whose ranged-read and file-size support are undocumented: if it can't range-read, the archive is downloaded once to read its directory (capped at ~2 GB — a larger archive is still adopted, just without a tree). Adopted archives aren't periodically re-verified (there's no upload-time checksum for them).
 
 ## .env Account Structure
 
