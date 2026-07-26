@@ -210,6 +210,29 @@ Decisions locked with the user, all implemented: crawled `tree_json` **is** deri
 
 ---
 
+## Roadmap: Pre-Launch Refinement — shipping in phases
+
+Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Each phase is its own branch cut from `main`, with its own ticket, validation checklist and PR description.
+
+**Decisions locked with the user (do not re-litigate):**
+- A record renders **one** file tree; each zip is a top-level node with its own size and download link, its directories nested beneath. The zip node replaces the tree's root — they denote the same directory.
+- Large archives are handled by **splitting into standalone zips** (bin-packed first-level subdirectories), never raw byte-split parts, with the threshold configured **per provider and per account tier** in the Settings modal and defaulted from each provider's real caps.
+- Credentials are encrypted with AES-256-GCM, key derived from a `.env` passphrase plus a random per-install salt stored in the DB. **Losing the passphrase loses every stored credential** — say so loudly in docs and UI.
+- The main account becomes **per-provider** (`MEGA_ACCOUNT_MAIN_*`); `MAIN_ACCOUNT_PROVIDER` goes away, and a provider with no main account configured is skipped silently.
+- **No `+ New Backup` button**, even though the Figma file shows one (carries over from 7a).
+
+**Provider caps that drive phase 5** — 4shared free: **2 GB max file size**, 15 GB storage, ~3 GB/day (documented as *download*) traffic. MEGA free: no file-size limit, 20 GB storage, ~5 GB per rolling 6h by IP. A ~4.3 GB archive therefore **cannot reach a free 4shared account at all**; this is a per-file cap, not a traffic problem, and it is the real launch blocker.
+
+**There is no 4shared token refresh to automate** — OAuth 1.0 has no refresh-token concept. The remedy is re-authorization, bundled into phase 4 so the new token can be written to the DB from an in-app button.
+
+**Phase 1 — Figma layout + rem + merged tree + poll interval: DONE** (PR #22, branch `pr/10-figma-layout-rem-merged-tree`). Rebuilt against Figma nodes `2-4`/`30-295`/`31-674`; SVG assets in `web/static/img/`; stylesheet fully in `rem`; merged record-level tree; `ui.poll_seconds`/`ui.active_poll_seconds`.
+
+**Phase 2 — Resilient deletes: NEXT.** Ticket written at `dev-tools/prompts/output/tickets/11-resilient-deletes.md`. Deleting a record with files currently fails outright and the record becomes unremovable — "remote file already gone" is treated as an error, and the loop aborts on the first failure so one expired credential blocks everything.
+
+**Phase 3** — per-provider main account. **Phase 4** — credentials into the DB, encrypted, plus 4shared re-authorize. **Phase 5** — per-provider/tier size caps and archive splitting.
+
+---
+
 ## Technical Notes
 
 Lessons learned and recurring patterns from development. Reference before implementing related features.
@@ -279,10 +302,16 @@ In templates: `x-for="a in megaAccounts()"`, not `x-for="a in megaAccounts"`.
 There is no clean way to render a recursive tree with `x-for` alone. The file tree walks the parsed `tree_json` into a **flat array of currently-visible rows** (`treeRows` in `app.js`), each carrying a `depth`, and renders it with a single `x-for`, expressing nesting as `padding-left: depth * 16px`. Collapsed subtrees are simply not emitted.
 
 **Parsed JSON must be memoised outside the reactive proxy**
-`treeCache` lives at module scope, not on the Alpine component. The page replaces `this.users` every 2 seconds and templates re-render constantly, so `JSON.parse` on every render is real cost — and letting Alpine proxy a large read-only tree adds more. Cache by zip id, keyed on the raw string so an edited tree re-parses.
+`treeCache` lives at module scope, not on the Alpine component. The page replaces `this.users` on every poll tick and templates re-render constantly, so `JSON.parse` on every render is real cost — and letting Alpine proxy a large read-only tree adds more. Cache by zip id, keyed on the raw string so an edited tree re-parses.
 
-**Any UI state must be keyed to survive the 2s poll**
-`loadUsers()` replaces the whole user list every 2 seconds, so state stored positionally (indexes, object identity) is destroyed on every tick. Key expansion state by stable identifiers: `expandedAccounts`/`expandedFiles` by email, tree nodes by `` `${zipId}:${nodePath}` ``. Tree nodes use **two** lists (`expandedNodes` + `collapsedNodes`) because the default is "root open, rest closed" — one list cannot distinguish "explicitly collapsed root" from "never touched".
+**Any UI state must be keyed to survive the poll**
+`loadUsers()` replaces the whole user list on every tick, so state stored positionally (indexes, object identity) is destroyed each time. Key expansion state by stable identifiers: `expandedAccounts`/`expandedFiles` by email, tree nodes by `` `${zipId}:${nodePath}` ``. Tree nodes use **two** lists (`expandedNodes` + `collapsedNodes`) because the default is "root open, rest closed" — one list cannot distinguish "explicitly collapsed root" from "never touched".
+
+**A self-rescheduling poll must reschedule in `finally`**
+The refresh loop is a `setTimeout` that re-arms itself (two cadences: `ui.poll_seconds` idle, `ui.active_poll_seconds` while a job or an Auto-Sync crawl is running — a fixed `setInterval` cannot switch between them). That makes one rejected `fetch` fatal in a way `setInterval` never was: if the re-arm sits after an `await` that throws, polling stops **permanently and silently** for the rest of the session. Schedule the next tick in a `finally`, and keep the timer handle so an action that creates work (Upload, Auto-Sync) can re-arm immediately instead of waiting out an already-armed idle timer.
+
+**Deriving "is anything happening" from job rows alone misses Auto-Sync**
+An adopted archive is inserted as a `complete` job, so a running crawl creates nothing that `hasActiveJobs()` can see. Anything gating on "work in progress" must check the crawl phase too, or a multi-minute crawl reports its progress at the idle cadence.
 
 **`x-cloak` to prevent blank flash on load**
 Add `x-cloak` to any element that should be hidden until Alpine initialises, and add `[x-cloak] { display: none !important; }` at the top of the CSS file.

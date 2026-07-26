@@ -1,0 +1,8 @@
+<svg width="1920" height="34" viewBox="0 0 1920 34" fill="none" xmlns="http://www.w3.org/2000/svg">
+<!-- The dip is a bite out of the top of the bar. It is painted in the masthead
+     band colour rather than left transparent so the asset is opaque: the CSS puts
+     a flat purple behind it to cover viewports wider than the artwork, and a
+     transparent bite would let that flat colour fill the notch back in. -->
+<rect width="1920" height="34" fill="#D9DDE6"/>
+<path id="Subtract" d="M1920 34H0V0H877C897.5 0 898.616 5.95333 909 11.6162C923.425 19.4827 931.816 24.8693 955 25.8398V25.8799C955.167 25.8739 955.334 25.8658 955.5 25.8594C955.666 25.8658 955.833 25.8739 956 25.8799V25.8398C979.184 24.8693 987.575 19.4827 1002 11.6162C1012.38 5.95333 1013.5 0 1034 0H1920V34Z" fill="#462261"/>
+</svg>

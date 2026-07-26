@@ -17,6 +17,7 @@ type Config struct {
 	Quota        QuotaConfig        `yaml:"quota"`
 	Verification VerificationConfig `yaml:"verification"`
 	Scan         ScanConfig         `yaml:"scan"`
+	UI           UIConfig           `yaml:"ui"`
 }
 
 type ServerConfig struct {
@@ -72,6 +73,16 @@ type VerificationConfig struct {
 // records the root plus three levels beneath it.
 type ScanConfig struct {
 	MaxDepth int `yaml:"max_depth"`
+}
+
+// UIConfig controls how often the browser re-fetches the table. Two cadences
+// rather than one: a single slow interval would make an in-flight upload's
+// progress bar visibly stutter, while a single fast one polls hard for data
+// that does not change when nothing is uploading. ActivePollSeconds is used
+// only while a job is pending or in progress.
+type UIConfig struct {
+	PollSeconds       int `yaml:"poll_seconds"`
+	ActivePollSeconds int `yaml:"active_poll_seconds"`
 }
 
 func Load(path string) (*Config, error) {
@@ -143,5 +154,17 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Scan.MaxDepth <= 0 {
 		cfg.Scan.MaxDepth = 3
+	}
+	if cfg.UI.PollSeconds <= 0 {
+		cfg.UI.PollSeconds = 10
+	}
+	if cfg.UI.ActivePollSeconds <= 0 {
+		cfg.UI.ActivePollSeconds = 2
+	}
+	// An active cadence slower than the idle one is almost certainly a mistake
+	// (it would make the page *less* responsive exactly when something is
+	// happening), so clamp it rather than honouring it.
+	if cfg.UI.ActivePollSeconds > cfg.UI.PollSeconds {
+		cfg.UI.ActivePollSeconds = cfg.UI.PollSeconds
 	}
 }
