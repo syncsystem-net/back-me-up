@@ -6,21 +6,24 @@
     <title>{{.Title}}</title>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <link rel="stylesheet" href="/static/css/style.css">
+    <!-- Poll cadences come from config.yml via the template: the page needs them
+         before its first fetch, so an endpoint would itself have to be polled. -->
+    <script>
+        window.APP_CONFIG = { pollMS: {{.PollMS}}, activePollMS: {{.ActivePollMS}} };
+    </script>
 </head>
 <body x-data="app">
-    <!-- Logo band -->
-    <div class="logo-band">
-        <div class="logo">
-            <span class="logo-word">Sync</span><span class="logo-s">S</span><span class="logo-word">ystem</span>
-            <span class="logo-sub">b a c k m e u p</span>
+    <!-- Masthead: logotype on the grey band, closed by the notched purple bar
+         that carries the running totals. -->
+    <header class="masthead">
+        <img class="masthead-logo" src="/static/img/logo-backmeup.svg" alt="SyncSystem BackMeUp">
+        <div class="masthead-bar">
+            <div class="masthead-stats">
+                Active Accounts: <strong x-text="activeAccountsCount()"></strong>
+                | Total: <strong x-text="totalUsedGB()"></strong> GB / <strong x-text="totalFreeGB()"></strong> GB (free)
+            </div>
         </div>
-    </div>
-
-    <!-- Dark summary bar -->
-    <div class="topbar">
-        Active Accounts: <strong x-text="activeAccountsCount()"></strong>
-        | Total: <strong x-text="totalUsedGB()"></strong> GB / <strong x-text="totalFreeGB()"></strong> GB (free)
-    </div>
+    </header>
 
     <!-- Tabs -->
     <nav class="tabs" x-cloak>
@@ -41,7 +44,7 @@
                 <span class="search-tab">search</span>
                 <div class="search-row">
                     <input type="text" class="search-input" placeholder="Search users, titles or files…" x-model="search" @keydown.enter="runSearch()">
-                    <button class="search-btn" @click="runSearch()" :disabled="searching" aria-label="search">▶</button>
+                    <button class="search-btn" @click="runSearch()" :disabled="searching" aria-label="search"></button>
                 </div>
             </div>
 
@@ -136,12 +139,14 @@
                                     <template x-for="prov in ['mega', 'fourshared']" :key="prov">
                                         <div class="provider-card" x-show="userAccount(u, prov)">
                                             <div class="provider-card-head">
-                                                <span class="provider-name" x-text="prov === 'mega' ? 'Mega' : '4shared'"></span>
+                                                <span class="provider-name" x-text="(prov === 'mega' ? 'Mega' : '4shared') + ':'"></span>
                                                 <span class="provider-quota">
-                                                    <span x-text="accountUsedGB(userAccount(u, prov)).toFixed(2)"></span> GB
-                                                    of <span x-text="accountTotalGB(userAccount(u, prov)).toFixed(2)"></span> GB
+                                                    <span class="used" x-text="accountUsedGB(userAccount(u, prov)).toFixed(2) + ' GB'"></span>
+                                                    of
+                                                    <span class="total" x-text="accountTotalGB(userAccount(u, prov)).toFixed(2) + ' GB'"></span>
                                                 </span>
                                             </div>
+                                            <!-- Stored quota for the account as a whole. -->
                                             <div class="quota-bar"><div class="quota-fill" :style="`width:${accountPct(userAccount(u, prov))}%`"></div></div>
 
                                             <div class="provider-actions">
@@ -154,19 +159,19 @@
                                                 <button class="btn btn-purple btn-sm" x-show="providerJobs(u, prov).length" @click="openLogs(u, prov)">Log</button>
                                             </div>
 
-                                            <!-- Upload progress (current transfer) -->
-                                            <template x-if="providerStatus(u, prov) === 'in_progress'">
-                                                <div class="progress"><div class="progress-fill" :style="`width:${providerProgress(u, prov)}%`"></div></div>
-                                            </template>
-
                                             <!-- One Download for the whole account (every zip stored on it);
-                                                 per-zip downloads live next to each zip's tree. -->
+                                                 per-zip downloads live on each zip's node in the tree. -->
                                             <div class="provider-actions">
                                                 <button class="btn btn-purple btn-sm" x-show="completedJobs(u, prov).length"
                                                         @click="downloadAll(u, prov)"
                                                         x-text="downloadAllLabel(u, prov)"></button>
                                                 <button class="btn btn-pink btn-sm" x-show="completedJobs(u, prov).length" @click="openDeleteProvider(u, prov)">Delete All</button>
                                             </div>
+
+                                            <!-- Current transfer, distinct from the stored-quota bar above. -->
+                                            <template x-if="providerStatus(u, prov) === 'in_progress'">
+                                                <div class="progress"><div class="progress-fill" :style="`width:${providerProgress(u, prov)}%`"></div></div>
+                                            </template>
                                         </div>
                                     </template>
                                     <template x-if="!(u.accounts && u.accounts.length)">
@@ -175,45 +180,36 @@
                                 </div>
                             </td>
                             <td class="col-title">
+                                <!-- One tree for the whole record. Every zip is a top-level node
+                                     carrying its own download link, with its directories nested
+                                     beneath it — the archives belong to this record and read as
+                                     one structure, not as detached blocks. -->
                                 <div x-show="isFilesOpen(u)">
-                                    <template x-for="z in u.zips" :key="z.id">
-                                        <div class="zip-block">
-                                            <div class="zip-head"><strong x-text="z.name"></strong> — <span x-text="(z.size_bytes / 1073741824).toFixed(2)"></span> GB</div>
-                                            <div class="zip-tree-actions">
-                                                <button class="btn btn-purple btn-sm" x-show="hasTree(z)" @click="setZipTreeOpen(z, true)">Expand All</button>
-                                                <button class="btn btn-purple btn-sm" x-show="hasTree(z)" @click="setZipTreeOpen(z, false)">Collapse All</button>
-                                            </div>
-                                            <!-- Flat list of visible nodes; depth is rendered as indentation
-                                                 because Alpine's x-for cannot recurse. -->
-                                            <div class="zip-tree" x-show="hasTree(z)">
-                                                <template x-for="row in treeRows(z)" :key="row.path">
-                                                    <div class="tree-row" :style="`padding-left:${row.depth * 16}px`">
-                                                        <button class="tree-toggle" x-show="row.hasChildren"
-                                                                @click="toggleNode(z.id, row)"
-                                                                x-text="row.expanded ? '▾' : '▸'"></button>
-                                                        <span class="tree-toggle tree-toggle-empty" x-show="!row.hasChildren">·</span>
-                                                        <span class="tree-name" x-text="row.name"></span>
-                                                        <span class="tree-size" x-show="row.size" x-text="formatSize(row.size)"></span>
-                                                        <!-- The root row IS the zip, so its download link sits inline with
-                                                             the archive's own name: "bkup003 (download file)". -->
-                                                        <template x-if="row.depth === 0 && zipDownloadJob(u, z)">
-                                                            <a class="tree-download" :href="`/api/jobs/${zipDownloadJob(u, z).id}/download`"
-                                                               :title="`Download ${z.name} from ${zipDownloadJob(u, z).provider}`">(download file)</a>
-                                                        </template>
-                                                    </div>
+                                    <div class="tree-actions" x-show="hasExpandableTree(u)">
+                                        <button class="btn btn-purple btn-sm" @click="setRecordTreeOpen(u, true)">Expand All</button>
+                                        <button class="btn btn-purple btn-sm" @click="setRecordTreeOpen(u, false)">Collapse All</button>
+                                    </div>
+                                    <!-- Flat list of visible nodes; depth is rendered as indentation
+                                         because Alpine's x-for cannot recurse. -->
+                                    <div class="zip-tree">
+                                        <template x-for="row in recordTreeRows(u)" :key="row.key">
+                                            <div class="tree-row" :class="{ 'tree-zip': row.isZip }" :style="`padding-left:${row.depth}rem`">
+                                                <button class="tree-toggle" x-show="row.hasChildren"
+                                                        @click="toggleTreeNode(row)"
+                                                        x-text="row.expanded ? '▾' : '▸'"></button>
+                                                <span class="tree-toggle tree-toggle-empty" x-show="!row.hasChildren">·</span>
+                                                <span class="tree-name" x-text="row.name"></span>
+                                                <span class="tree-size" x-show="row.size" x-text="formatSize(row.size)"></span>
+                                                <!-- Each archive's own download link, on the archive's own node. -->
+                                                <template x-if="row.downloadJob">
+                                                    <a class="tree-download" :href="`/api/jobs/${row.downloadJob.id}/download`"
+                                                       :title="`Download ${row.name} from ${row.downloadJob.provider}`">(download file)</a>
                                                 </template>
+                                                <span class="tree-size" x-show="row.noTree">(no tree recorded)</span>
                                             </div>
-                                            <!-- No tree to hang the root link off, so it goes here instead —
-                                                 the archive is still downloadable. -->
-                                            <p class="muted" x-show="!hasTree(z)">
-                                                No directory tree recorded for this zip.
-                                                <template x-if="zipDownloadJob(u, z)">
-                                                    <a class="tree-download" :href="`/api/jobs/${zipDownloadJob(u, z).id}/download`"
-                                                       :title="`Download ${z.name} from ${zipDownloadJob(u, z).provider}`">(download file)</a>
-                                                </template>
-                                            </p>
-                                        </div>
-                                    </template>
+                                        </template>
+                                    </div>
+                                    <p class="muted" x-show="!(u.zips && u.zips.length)">No files recorded for this record yet.</p>
                                 </div>
                             </td>
                             <td colspan="3"></td>
@@ -286,7 +282,7 @@
                 </div>
                 <div class="form-error" x-show="error" x-text="error"></div>
                 <div class="modal-actions">
-                    <button class="btn btn-purple" @click="submitUpload()" :disabled="uploading" x-text="uploading ? 'Working…' : (isTitleOnly() ? 'Save Title' : 'Upload')"></button>
+                    <button class="btn btn-purple" @click="submitUpload()" :disabled="uploading" x-text="uploading ? 'Working…' : (isTitleOnly() ? 'Save Title' : 'Upload / Save')"></button>
                     <button class="btn btn-grey" @click="showUploadModal = false">Cancel</button>
                 </div>
 

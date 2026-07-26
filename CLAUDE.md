@@ -279,10 +279,16 @@ In templates: `x-for="a in megaAccounts()"`, not `x-for="a in megaAccounts"`.
 There is no clean way to render a recursive tree with `x-for` alone. The file tree walks the parsed `tree_json` into a **flat array of currently-visible rows** (`treeRows` in `app.js`), each carrying a `depth`, and renders it with a single `x-for`, expressing nesting as `padding-left: depth * 16px`. Collapsed subtrees are simply not emitted.
 
 **Parsed JSON must be memoised outside the reactive proxy**
-`treeCache` lives at module scope, not on the Alpine component. The page replaces `this.users` every 2 seconds and templates re-render constantly, so `JSON.parse` on every render is real cost — and letting Alpine proxy a large read-only tree adds more. Cache by zip id, keyed on the raw string so an edited tree re-parses.
+`treeCache` lives at module scope, not on the Alpine component. The page replaces `this.users` on every poll tick and templates re-render constantly, so `JSON.parse` on every render is real cost — and letting Alpine proxy a large read-only tree adds more. Cache by zip id, keyed on the raw string so an edited tree re-parses.
 
-**Any UI state must be keyed to survive the 2s poll**
-`loadUsers()` replaces the whole user list every 2 seconds, so state stored positionally (indexes, object identity) is destroyed on every tick. Key expansion state by stable identifiers: `expandedAccounts`/`expandedFiles` by email, tree nodes by `` `${zipId}:${nodePath}` ``. Tree nodes use **two** lists (`expandedNodes` + `collapsedNodes`) because the default is "root open, rest closed" — one list cannot distinguish "explicitly collapsed root" from "never touched".
+**Any UI state must be keyed to survive the poll**
+`loadUsers()` replaces the whole user list on every tick, so state stored positionally (indexes, object identity) is destroyed each time. Key expansion state by stable identifiers: `expandedAccounts`/`expandedFiles` by email, tree nodes by `` `${zipId}:${nodePath}` ``. Tree nodes use **two** lists (`expandedNodes` + `collapsedNodes`) because the default is "root open, rest closed" — one list cannot distinguish "explicitly collapsed root" from "never touched".
+
+**A self-rescheduling poll must reschedule in `finally`**
+The refresh loop is a `setTimeout` that re-arms itself (two cadences: `ui.poll_seconds` idle, `ui.active_poll_seconds` while a job or an Auto-Sync crawl is running — a fixed `setInterval` cannot switch between them). That makes one rejected `fetch` fatal in a way `setInterval` never was: if the re-arm sits after an `await` that throws, polling stops **permanently and silently** for the rest of the session. Schedule the next tick in a `finally`, and keep the timer handle so an action that creates work (Upload, Auto-Sync) can re-arm immediately instead of waiting out an already-armed idle timer.
+
+**Deriving "is anything happening" from job rows alone misses Auto-Sync**
+An adopted archive is inserted as a `complete` job, so a running crawl creates nothing that `hasActiveJobs()` can see. Anything gating on "work in progress" must check the crawl phase too, or a multi-minute crawl reports its progress at the idle cadence.
 
 **`x-cloak` to prevent blank flash on load**
 Add `x-cloak` to any element that should be hidden until Alpine initialises, and add `[x-cloak] { display: none !important; }` at the top of the CSS file.

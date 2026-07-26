@@ -6,11 +6,11 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 
 - The backups table is grouped by **user** (account email): the same email configured on both MEGA and 4shared shows as one row, and every configured account appears even before its first upload.
 - Point at a directory from a user's row (Upload / Edit), give the backup a title (defaults to the folder name), and it uploads to that user's accounts. A record belongs to one user and **accumulates zips** over time — each upload adds another archive, and every zip's directory tree is recorded and shown under "Files: expand".
-- A background worker pool uploads in chunks with live progress (polled every 2s), automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit.
+- A background worker pool uploads in chunks with live progress, automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit. The table refreshes every `ui.poll_seconds` (default 10) while idle and speeds up to `ui.active_poll_seconds` (default 2) while a job is running.
 - On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to your main account.
 - Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
-- **Download** on an account card fetches every zip stored on that account (one file at a time — the browser asks once for permission to download multiple files); the `(download file)` link on a tree's root row — `bkup003 (download file)` — fetches just that archive. Plus per-provider Delete-All and record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
-- Each zip's **full directory tree** is recorded (down to `scan.max_depth`, default 3 levels) and browsable as an interactive tree — expand the whole zip at once or one node at a time.
+- **Download** on an account card fetches every zip stored on that account (one file at a time — the browser asks once for permission to download multiple files); the `(download file)` link on a zip's own node in the tree fetches just that archive. Plus per-provider Delete-All and record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
+- A record's archives are shown as **one tree**: every zip is a top-level node carrying its own size and download link, with that archive's full directory tree (down to `scan.max_depth`, default 3 levels) nested beneath it. Expand the whole record at once or one node at a time.
 - **Exclude terms** (Settings) keep noisy directories out of the recorded tree. Matching ignores case *and* accents, so one `conteudo` entry covers "Conteúdo", "conteudo", and "CONTEÚDO". Terms affect the recorded tree only — the uploaded zip still contains every directory.
 - Two kinds of search, both accent-insensitive: typing filters the table in real time by user, title, or directory name, while the **▶ button runs a global search** across every recorded tree and reports which backup, zip, and account holds each matching directory.
 - **Auto-Sync** discovers archives already sitting in your cloud accounts (from before you used this tool, or lost with a previous database) and reconciles them into the table. It shows a dry-run preview of every change before writing anything and never deletes — see "Auto-Sync" below.
@@ -96,6 +96,8 @@ Application behavior is tuned in `config.yml`; every value has a sensible defaul
 | `verification.periodic_check_days` | `30` | Re-verify a completed file if it hasn't been re-checked within this many days (an omitted/`0` value falls back to 30). Turn periodic re-verification off with `verification.enabled: false`. |
 | `quota.sync_interval_minutes` | `60` | How often the background poller refreshes every account's cached quota (also refreshed after each upload and via "Refresh quotas now") |
 | `scan.max_depth` | `3` | Directory levels below the source root recorded in a zip's tree. `3` records the root plus three levels; an omitted, `0`, or negative value falls back to 3 |
+| `ui.poll_seconds` | `10` | How often the browser re-fetches the table while nothing is uploading |
+| `ui.active_poll_seconds` | `2` | Refresh cadence used **only** while a job is pending or in progress, so progress bars stay smooth without polling hard when idle. Clamped to at most `poll_seconds` |
 
 Credentials are **not** in `config.yml` — they live in `.env` (see below).
 
@@ -217,7 +219,7 @@ Once the consumer key/secret, the domain, and each account's token are in `.env`
 Creating a backup writes one `pending` job per selected account. A background worker pool (its goroutine count is `concurrency.max_workers`, with a hard ceiling of `concurrency.max_concurrent_uploads` simultaneous uploads and `concurrency.max_concurrent_per_account` per account) then runs each job:
 
 1. Claims each pending job atomically and marks it `in_progress`.
-2. Uploads the zip in chunks (`upload.chunk_size_mb`), persisting progress after each chunk — the Backups table shows a live progress bar, polled every 2s.
+2. Uploads the zip in chunks (`upload.chunk_size_mb`), persisting progress after each chunk — the Backups table shows a live progress bar, polled every `ui.active_poll_seconds` (default 2s) while the job runs.
 3. Retries on failure with exponential backoff (`retry_policy`).
 4. On success: verifies the first chunk's checksum, refreshes the account quota, deletes the temp zip (once every sibling job for that backup is done), and uploads a copy of the metadata DB to the main account.
 5. On failure (after retries): marks the job `failed`, records the error, and keeps the temp zip for a future retry.

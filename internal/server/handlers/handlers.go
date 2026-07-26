@@ -21,6 +21,16 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/scanner"
 )
 
+// UI carries the presentation settings the page needs at render time. It is a
+// struct rather than more positional arguments to New so that adding a knob
+// later does not ripple through every call site.
+type UI struct {
+	// PollSeconds is the idle refresh cadence; ActivePollSeconds is used while a
+	// job is running. Both come from the ui block in config.yml.
+	PollSeconds       int
+	ActivePollSeconds int
+}
+
 type Handlers struct {
 	db        *sql.DB
 	accounts  *accounts.AccountStore
@@ -29,9 +39,10 @@ type Handlers struct {
 	// scanMaxDepth caps the recursive directory walk that records a zip's tree
 	// (config scan.max_depth, default 3).
 	scanMaxDepth int
+	ui           UI
 }
 
-func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth int) *Handlers {
+func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth int, ui UI) *Handlers {
 	tmplPath := filepath.Join("web", "templates", "*.html")
 	tmpl, err := template.ParseGlob(tmplPath)
 	if err != nil {
@@ -45,6 +56,7 @@ func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth
 		tmpl:         tmpl,
 		chunkSize:    chunkSize,
 		scanMaxDepth: scanMaxDepth,
+		ui:           ui,
 	}
 }
 
@@ -54,8 +66,13 @@ func (h *Handlers) Home(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Poll cadences reach the page as template data rather than through an extra
+	// endpoint: they are needed before the first fetch, and a request for them
+	// would itself be a poll.
 	data := map[string]any{
-		"Title": "BackMeUp",
+		"Title":        "BackMeUp",
+		"PollMS":       h.ui.PollSeconds * 1000,
+		"ActivePollMS": h.ui.ActivePollSeconds * 1000,
 	}
 	if err := h.tmpl.ExecuteTemplate(w, "index.html", data); err != nil {
 		slog.Error("template error", "error", err)

@@ -37,6 +37,14 @@ verification:
   verify_on_upload: true
   periodic_check_days: 30
 
+ui:
+  # How often the browser re-fetches the table, in seconds. active_poll_seconds
+  # is used only while an upload is pending or in progress, so progress bars stay
+  # smooth without polling hard when nothing is happening. It is clamped to at
+  # most poll_seconds.
+  poll_seconds: 10
+  active_poll_seconds: 2
+
 scan:
   # How many directory levels below the source root are recorded in a zip's
   # tree. 3 records the root plus three levels beneath it. Directory names to

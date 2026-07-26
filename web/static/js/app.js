@@ -1,6 +1,6 @@
 // Parsed tree_json cache, deliberately OUTSIDE Alpine.data so the parsed objects
 // never get wrapped in a reactive proxy — the trees are read-only render input and
-// proxying them would cost on every one of the many re-renders the 2s poll triggers.
+// proxying them would cost on every one of the many re-renders the poll triggers.
 // Keyed by zip id; the raw string is stored alongside so an edited tree re-parses.
 const treeCache = new Map();
 
@@ -59,7 +59,7 @@ document.addEventListener('alpine:init', () => {
         refreshingQuotas: false,
         error: '',
 
-        // Expansion state is keyed by email so it survives the 2s polling refresh.
+        // Expansion state is keyed by email so it survives the polling refresh.
         expandedAccounts: [],
         expandedFiles: [],
         allExpanded: false,
@@ -101,13 +101,13 @@ document.addEventListener('alpine:init', () => {
         settingsError: '',
 
         // Auto-Sync (remote crawl). The run lives on the server; this is a view of
-        // it, refreshed by the same 2s tick while the modal is open. openedFromWarning
+        // it, refreshed by the same poll tick while the modal is open. openedFromWarning
         // keeps the modal on the warning step until the user actually starts a scan,
         // since a finished run from earlier in the session is still on the server.
         showAutoSyncModal: false,
         autoSyncRun: { phase: 'idle', accounts: [] },
         autoSyncStarted: false,
-        // Which account sections are expanded, keyed by provider|email so the 2s
+        // Which account sections are expanded, keyed by provider|email so the
         // refresh (which replaces autoSyncRun wholesale) cannot lose the state.
         expandedSyncAccounts: [],
 
@@ -120,7 +120,34 @@ document.addEventListener('alpine:init', () => {
 
         async init() {
             await Promise.all([this.loadUsers(), this.loadAccounts(), this.loadSettings()]);
-            setInterval(() => this.refresh(), 2000);
+            this.scheduleRefresh();
+        },
+        // Two cadences, both from config.yml: a slow idle tick, and a faster one
+        // while something is actually happening so progress bars stay smooth.
+        // Rescheduled after each refresh rather than run on a fixed setInterval,
+        // so the cadence can change the moment work starts or finishes.
+        //
+        // The handle is kept so an action that creates work can re-arm the timer
+        // immediately: without that, clicking Upload would leave the already-armed
+        // idle timer in flight and the first progress update could be a full
+        // poll_seconds away.
+        _refreshTimer: null,
+        scheduleRefresh() {
+            const cfg = window.APP_CONFIG || {};
+            const idle = cfg.pollMS > 0 ? cfg.pollMS : 10000;
+            const active = cfg.activePollMS > 0 ? cfg.activePollMS : 2000;
+            const delay = this.needsFastPoll() ? active : idle;
+            if (this._refreshTimer) clearTimeout(this._refreshTimer);
+            this._refreshTimer = setTimeout(async () => {
+                // The next tick is scheduled in `finally`: a rejected refresh (a
+                // server restart under Air, a network blip, a non-JSON error body)
+                // must not silently kill polling for the rest of the session.
+                try {
+                    await this.refresh();
+                } finally {
+                    this.scheduleRefresh();
+                }
+            }, delay);
         },
         async refresh() {
             if (document.hidden) return;
@@ -132,15 +159,25 @@ document.addEventListener('alpine:init', () => {
         },
         async loadUsers() {
             const r = await fetch('/api/users');
+            if (!r.ok) return;
             this.users = await r.json() || [];
         },
         async loadAccounts() {
             const r = await fetch('/api/accounts');
+            if (!r.ok) return;
             this.accounts = await r.json() || [];
         },
         hasActiveJobs() {
             return this.users.some(u => (u.jobs || []).some(j => j.status === 'pending' || j.status === 'in_progress'));
         },
+        // An Auto-Sync crawl runs for minutes and reports progress through the same
+        // tick, but creates no upload job — so it has to opt into the fast cadence
+        // explicitly or its modal would update at the idle rate.
+        autoSyncRunning() {
+            const p = this.autoSyncRun && this.autoSyncRun.phase;
+            return this.showAutoSyncModal && (p === 'previewing' || p === 'applying');
+        },
+        needsFastPoll() { return this.hasActiveJobs() || this.autoSyncRunning(); },
 
         // ---- Header totals ----
         activeAccountsCount() { return this.accounts.length; },
@@ -368,6 +405,9 @@ document.addEventListener('alpine:init', () => {
                 this.showUploadModal = false;
                 this.showConflictModal = false;
                 await this.loadUsers();
+                // Jobs now exist, so switch to the fast cadence straight away rather
+                // than waiting out the idle timer that is already armed.
+                this.scheduleRefresh();
             } finally {
                 this.uploading = false;
             }
@@ -487,30 +527,60 @@ document.addEventListener('alpine:init', () => {
         },
 
         // ---- Files tree ----
-        // Alpine cannot recurse with x-for, so the nested tree is flattened into the
-        // list of rows that are currently VISIBLE (collapsed subtrees are skipped) and
-        // rendered by one x-for, with depth expressed as left padding.
-        treeRows(zip) {
-            const root = parseTreeJSON(zip);
-            if (!root) return [];
+        // ONE tree per record. Each zip contributes a depth-0 node — the archive
+        // itself, carrying its own download link — and that zip's directories nest
+        // beneath it. The parsed tree's root IS the archive (same directory), so its
+        // *children* are emitted at depth 1 rather than repeating the same name twice.
+        //
+        // Alpine cannot recurse with x-for, so the result is flattened to the rows
+        // that are currently VISIBLE (collapsed subtrees are skipped) and rendered by
+        // a single x-for, with depth expressed as left padding.
+        recordTreeRows(u) {
             const rows = [];
-            const walk = (node, parentPath, depth) => {
-                const name = node.name || '(unnamed)';
-                const path = parentPath ? `${parentPath}/${name}` : name;
-                const children = node.children || [];
-                const expanded = this.isNodeOpen(zip.id, path, depth);
+            for (const z of (u.zips || [])) {
+                const root = parseTreeJSON(z);
+                const children = root ? (root.children || []) : [];
+                // The zip node's path is empty: it stands in for the tree root, so it
+                // inherits the root's "open by default" behaviour via depth 0.
+                const zipOpen = this.isNodeOpen(z.id, '', 0);
                 rows.push({
-                    path, name, depth,
-                    size: node.size_bytes || 0,
+                    key: this.nodeKey(z.id, ''),
+                    isZip: true,
+                    zipId: z.id,
+                    path: '',
+                    name: z.name || '(unnamed)',
+                    depth: 0,
+                    size: z.size_bytes || 0,
                     hasChildren: children.length > 0,
-                    expanded,
+                    // Distinct from hasChildren: an archive whose tree was recorded
+                    // but is empty (an empty source directory) has a tree, and must
+                    // not be labelled as having none.
+                    noTree: root === null,
+                    expanded: zipOpen,
+                    downloadJob: this.zipDownloadJob(u, z),
                 });
-                if (children.length && expanded) for (const c of children) walk(c, path, depth + 1);
-            };
-            walk(root, '', 0);
+                if (!zipOpen) continue;
+                const walk = (node, parentPath, depth) => {
+                    const name = node.name || '(unnamed)';
+                    const path = parentPath ? `${parentPath}/${name}` : name;
+                    const kids = node.children || [];
+                    const open = this.isNodeOpen(z.id, path, depth);
+                    rows.push({
+                        key: this.nodeKey(z.id, path),
+                        isZip: false,
+                        zipId: z.id,
+                        path, name, depth,
+                        size: node.size_bytes || 0,
+                        hasChildren: kids.length > 0,
+                        expanded: open,
+                        downloadJob: null,
+                    });
+                    if (kids.length && open) for (const c of kids) walk(c, path, depth + 1);
+                };
+                for (const c of children) walk(c, '', 1);
+            }
             return rows;
         },
-        hasTree(zip) { return parseTreeJSON(zip) !== null; },
         nodeKey(zipId, path) { return `${zipId}:${path}`; },
         // Default state: root open, everything below closed. An explicit entry in
         // either list overrides that default.
@@ -520,38 +590,53 @@ document.addEventListener('alpine:init', () => {
             if (this.collapsedNodes.includes(k)) return false;
             return depth === 0;
         },
-        toggleNode(zipId, row) {
-            const k = this.nodeKey(zipId, row.path);
+        toggleTreeNode(row) {
+            const k = this.nodeKey(row.zipId, row.path);
             const open = row.expanded;
             this.expandedNodes = this.expandedNodes.filter(x => x !== k);
             this.collapsedNodes = this.collapsedNodes.filter(x => x !== k);
             if (open) this.collapsedNodes.push(k);
             else this.expandedNodes.push(k);
         },
-        // Every path in the zip that has children — the only nodes expand/collapse-all
-        // needs to record. Walks the full tree, not just the visible rows.
-        allNodePaths(zip) {
-            const root = parseTreeJSON(zip);
-            if (!root) return [];
-            const paths = [];
-            const walk = (node, parentPath) => {
-                const name = node.name || '(unnamed)';
-                const path = parentPath ? `${parentPath}/${name}` : name;
-                const children = node.children || [];
-                if (children.length) {
-                    paths.push(path);
-                    for (const c of children) walk(c, path);
-                }
-            };
-            walk(root, '');
-            return paths;
+        // Every node key in the record that has children — the only nodes
+        // expand/collapse-all needs to record. Walks the full tree of every zip,
+        // not just the visible rows, and includes each zip's own node.
+        allRecordNodeKeys(u) {
+            const keys = [];
+            for (const z of (u.zips || [])) {
+                const root = parseTreeJSON(z);
+                const children = root ? (root.children || []) : [];
+                if (children.length) keys.push(this.nodeKey(z.id, ''));
+                const walk = (node, parentPath) => {
+                    const name = node.name || '(unnamed)';
+                    const path = parentPath ? `${parentPath}/${name}` : name;
+                    const kids = node.children || [];
+                    if (kids.length) {
+                        keys.push(this.nodeKey(z.id, path));
+                        for (const c of kids) walk(c, path);
+                    }
+                };
+                for (const c of children) walk(c, '');
+            }
+            return keys;
         },
-        setZipTreeOpen(zip, open) {
-            const keys = this.allNodePaths(zip).map(p => this.nodeKey(zip.id, p));
-            // Drop this zip's existing entries from both lists first so the two lists
-            // never disagree about the same node.
-            this.expandedNodes = this.expandedNodes.filter(k => !keys.includes(k));
-            this.collapsedNodes = this.collapsedNodes.filter(k => !keys.includes(k));
+        // Whether this record has anything to expand — a record whose zips carry no
+        // recorded tree would otherwise show Expand All / Collapse All buttons that
+        // silently do nothing.
+        hasExpandableTree(u) {
+            return (u.zips || []).some(z => {
+                const root = parseTreeJSON(z);
+                return !!(root && (root.children || []).length);
+            });
+        },
+        setRecordTreeOpen(u, open) {
+            // A Set, not includes(): this filters both lists once per key, which is
+            // quadratic over a record with several large trees.
+            const keys = new Set(this.allRecordNodeKeys(u));
+            // Drop this record's existing entries from both lists first so the two
+            // lists never disagree about the same node.
+            this.expandedNodes = this.expandedNodes.filter(k => !keys.has(k));
+            this.collapsedNodes = this.collapsedNodes.filter(k => !keys.has(k));
             if (open) this.expandedNodes.push(...keys);
             else this.collapsedNodes.push(...keys);
         },
@@ -654,6 +739,9 @@ document.addEventListener('alpine:init', () => {
             }
             this.autoSyncRun = body;
             this.autoSyncStarted = true;
+            // A crawl is now running: re-arm so its progress reports at the fast
+            // cadence instead of the idle one already in flight.
+            this.scheduleRefresh();
         },
         async applyAutoSync() {
             const r = await fetch('/api/autosync/apply', { method: 'POST' });
@@ -663,6 +751,7 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
             this.autoSyncRun = body;
+            this.scheduleRefresh();
         },
         async cancelAutoSync() {
             const r = await fetch('/api/autosync/cancel', { method: 'POST' });
