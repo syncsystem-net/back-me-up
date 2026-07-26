@@ -210,6 +210,29 @@ Decisions locked with the user, all implemented: crawled `tree_json` **is** deri
 
 ---
 
+## Roadmap: Pre-Launch Refinement — shipping in phases
+
+Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Each phase is its own branch cut from `main`, with its own ticket, validation checklist and PR description.
+
+**Decisions locked with the user (do not re-litigate):**
+- A record renders **one** file tree; each zip is a top-level node with its own size and download link, its directories nested beneath. The zip node replaces the tree's root — they denote the same directory.
+- Large archives are handled by **splitting into standalone zips** (bin-packed first-level subdirectories), never raw byte-split parts, with the threshold configured **per provider and per account tier** in the Settings modal and defaulted from each provider's real caps.
+- Credentials are encrypted with AES-256-GCM, key derived from a `.env` passphrase plus a random per-install salt stored in the DB. **Losing the passphrase loses every stored credential** — say so loudly in docs and UI.
+- The main account becomes **per-provider** (`MEGA_ACCOUNT_MAIN_*`); `MAIN_ACCOUNT_PROVIDER` goes away, and a provider with no main account configured is skipped silently.
+- **No `+ New Backup` button**, even though the Figma file shows one (carries over from 7a).
+
+**Provider caps that drive phase 5** — 4shared free: **2 GB max file size**, 15 GB storage, ~3 GB/day (documented as *download*) traffic. MEGA free: no file-size limit, 20 GB storage, ~5 GB per rolling 6h by IP. A ~4.3 GB archive therefore **cannot reach a free 4shared account at all**; this is a per-file cap, not a traffic problem, and it is the real launch blocker.
+
+**There is no 4shared token refresh to automate** — OAuth 1.0 has no refresh-token concept. The remedy is re-authorization, bundled into phase 4 so the new token can be written to the DB from an in-app button.
+
+**Phase 1 — Figma layout + rem + merged tree + poll interval: DONE** (PR #22, branch `pr/10-figma-layout-rem-merged-tree`). Rebuilt against Figma nodes `2-4`/`30-295`/`31-674`; SVG assets in `web/static/img/`; stylesheet fully in `rem`; merged record-level tree; `ui.poll_seconds`/`ui.active_poll_seconds`.
+
+**Phase 2 — Resilient deletes: NEXT.** Ticket written at `dev-tools/prompts/output/tickets/11-resilient-deletes.md`. Deleting a record with files currently fails outright and the record becomes unremovable — "remote file already gone" is treated as an error, and the loop aborts on the first failure so one expired credential blocks everything.
+
+**Phase 3** — per-provider main account. **Phase 4** — credentials into the DB, encrypted, plus 4shared re-authorize. **Phase 5** — per-provider/tier size caps and archive splitting.
+
+---
+
 ## Technical Notes
 
 Lessons learned and recurring patterns from development. Reference before implementing related features.
