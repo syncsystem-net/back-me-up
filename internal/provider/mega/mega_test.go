@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
+
+	gomega "github.com/t3rm1n4l/go-mega"
 )
 
 // fakeDownload is a chunkSource over a fixed byte slice, split at the given
@@ -247,5 +250,30 @@ func TestReadRangeFromPropagatesLimiterErrors(t *testing.T) {
 	}
 	if len(fd.fetched) != 0 {
 		t.Errorf("a blocked read still fetched chunks %v", fd.fetched)
+	}
+}
+
+// MEGA answers a wrong email or password with its generic ENOENT ("Object
+// (typically, node or user) not found"), which reads as a missing file rather
+// than a rejected credential. Login has to translate it, or the UI ends up
+// telling the user their archive is gone when their password is wrong.
+func TestLoginClassifiesBadCredentials(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"ENOENT is bad credentials", gomega.ENOENT, true},
+		{"EARGS is bad credentials", gomega.EARGS, true},
+		{"wrapped ENOENT is bad credentials", fmt.Errorf("login: %w", gomega.ENOENT), true},
+		{"rate limiting is not", gomega.ETOOMANY, false},
+		{"transport failure is not", errors.New("dial tcp: connection refused"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBadCredentials(tt.err); got != tt.want {
+				t.Fatalf("isBadCredentials(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }

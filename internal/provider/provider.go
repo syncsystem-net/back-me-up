@@ -19,6 +19,25 @@ import (
 // silently produce garbage.
 var ErrRangeUnsupported = errors.New("provider does not support ranged reads")
 
+// ErrNotFound reports that the object a call names does not exist on the
+// provider. Backends must wrap it (`fmt.Errorf("...: %w", provider.ErrNotFound)`)
+// so callers can match with errors.Is instead of sniffing message text.
+//
+// It matters most to Delete: "the object is not there" is the state a delete is
+// trying to reach, so a caller removing a file should treat it as success. The
+// database legitimately holds rows pointing at archives that no longer exist —
+// Auto-Sync reports a vanished remote copy but never modifies the record — so
+// this is normal operation, not an edge case. Read paths (Download, ReadRange)
+// return the same sentinel but must still treat it as the failure it is.
+var ErrNotFound = errors.New("object not found on provider")
+
+// ErrAuthExpired reports that the account's stored credentials were rejected by
+// the provider: the token expired, was revoked, or the password no longer works.
+// It is distinct from a transport failure because the remedy is different — the
+// user must re-authorize the account, and retrying changes nothing. Callers use
+// it to say so plainly rather than surfacing a raw provider error code.
+var ErrAuthExpired = errors.New("provider rejected the account credentials")
+
 // RemoteFile is one object in an account's cloud root as reported by List. Size
 // is best-effort: a backend whose listing omits it reports 0.
 type RemoteFile struct {
@@ -83,7 +102,10 @@ type Provider interface {
 	// can choose to overwrite or skip.
 	FindByName(ctx context.Context, name string) (remoteRef string, found bool, err error)
 
-	// Delete removes the object identified by remoteRef from the provider.
+	// Delete removes the object identified by remoteRef from the provider. If
+	// the object is already absent it must return an error wrapping ErrNotFound
+	// rather than an opaque one, so the caller can recognise that the desired
+	// end state already holds.
 	Delete(ctx context.Context, remoteRef string) error
 
 	// GetQuota returns the account's total and used capacity in bytes.

@@ -158,6 +158,9 @@ FOURSHARED_ACCOUNT_1_OAUTH_TOKEN_SECRET=...
   - One to carry out the work.
   - The other to verify if the work is being done according to plan.
 
+### Deferred Items
+Known rough edges we consciously decided not to fix live in `dev-tools/prompts/output/deferred-items.md` (local, gitignored). Read it before proposing a "fix" — the entry probably explains why it is that way. Add to it whenever a review or validation pass surfaces something real that we wave through, and delete the entry when it ships.
+
 ### Ticket Stories
 Before starting each PR, write a ticket story in `dev-tools/prompts/output/tickets/pr-number-slug.md`.
 Write it as a product or engineering management ask — not a retrospective. The format:
@@ -227,7 +230,7 @@ Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-re
 
 **Phase 1 — Figma layout + rem + merged tree + poll interval: DONE** (PR #22, branch `pr/10-figma-layout-rem-merged-tree`). Rebuilt against Figma nodes `2-4`/`30-295`/`31-674`; SVG assets in `web/static/img/`; stylesheet fully in `rem`; merged record-level tree; `ui.poll_seconds`/`ui.active_poll_seconds`.
 
-**Phase 2 — Resilient deletes: NEXT.** Ticket written at `dev-tools/prompts/output/tickets/11-resilient-deletes.md`. Deleting a record with files currently fails outright and the record becomes unremovable — "remote file already gone" is treated as an error, and the loop aborts on the first failure so one expired credential blocks everything.
+**Phase 2 — Resilient deletes: DONE** (PR #23, branch `pr/11-resilient-deletes`). Ticket `dev-tools/prompts/output/tickets/11-resilient-deletes.md`. Shipped: `provider.ErrNotFound` + `provider.ErrAuthExpired` sentinels (MEGA nil `HashLookup` and rejected login; 4shared 404 and 401), delete treats not-found as success, `DeleteBackup` attempts every job and reports per-archive failures as **409 + structured body**, an explicit "remove the record anyway" force step, and a `connect` seam on `Handlers` so the delete paths are testable against a stub backend. See the "Resilient deletes" technical note below.
 
 **Phase 3** — per-provider main account. **Phase 4** — credentials into the DB, encrypted, plus 4shared re-authorize. **Phase 5** — per-provider/tier size caps and archive splitting.
 
@@ -449,6 +452,24 @@ Adding a provider = implement `Provider` in a new subpackage + add one `case` in
 **A missing remote is report-only.** No code path in the package issues `UPDATE`/`DELETE` for a `missing` row — a transient listing failure must never delete a user's records. A per-account listing failure surfaces as a **visible error** in the preview, never as "nothing found" (same degradation as the 4shared conflict-detection path).
 
 **Start/poll, not one long HTTP request.** A crawl runs minutes; the four routes return immediately and the UI polls `GET /api/autosync`, so the 2s table refresh never blocks and the run is cancellable.
+
+---
+
+### Resilient deletes (pre-launch phase 2)
+
+**"Already gone" is success, not failure.** A delete exists to reach the state "the object is not on the provider". If the provider says it is not there, that state holds. Treating it as an error made records unremovable, and it is *guaranteed* to happen: Auto-Sync deliberately reports a vanished remote copy without modifying the record, so the DB is expected to hold rows pointing at absent archives. `provider.ErrNotFound` is the sentinel; only the delete path may swallow it — `Download`/`ReadRange` return the same sentinel but must still fail.
+
+**Two sentinels, matched with `errors.Is`, never by message text.** `ErrNotFound` and `ErrAuthExpired` live in `internal/provider`. MEGA: nil `HashLookup` → `ErrNotFound` (all three sites), and a rejected login → `ErrAuthExpired` — MEGA answers a wrong password with its generic `ENOENT` ("Object … not found"), so without translation the UI would tell the user their archive is gone when their password is wrong. 4shared: `statusError` maps 404 → `ErrNotFound` and 401 → `ErrAuthExpired`, leaving **403 alone** so the `403.0201` "already exists" upload rejection is not swept up.
+
+**Never abort a multi-target operation on the first failure.** One expired credential used to block deleting even the copies that were reachable, leaving "delete the record but not the files" (which orphans everything) as the only escape. `deleteRemoteFiles` attempts every job and collects failures.
+
+**Partial failure is `409` with a structured body, not `502`.** The client must distinguish "nothing happened" from "some things happened, here is what did not" in order to offer the force step. Body: `{error, deleted, failures:[{job_id, provider, email, archive, reason, message}]}`, `reason` being `credentials` or `provider`. **On partial failure the local record is kept** — nothing in the DB changes.
+
+**A retry after a partial failure converges.** The copies deleted on the first pass now answer `ErrNotFound`, which is success. That is why the record can safely be kept rather than half-deleted.
+
+**The force step deletes the local record only and contacts no provider.** Re-attempting there would be pointless (the previous request just tried) and risks claiming a remote delete that did not happen. It still requires the typed `DELETE`, so a stray `force` flag cannot remove a record on its own.
+
+**`Handlers.connect` is a seam, like `autosync.Manager.connect`.** The delete paths are *entirely about* how they behave when a backend fails, which is unreachable without injecting one. It wraps `cloud.Connect` in production; tests supply a stub provider.
 
 ---
 

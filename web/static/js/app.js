@@ -87,6 +87,11 @@ document.addEventListener('alpine:init', () => {
         deleteTarget: null, // { kind, backupId?, jobIds?, label, requireType }
         deleteConfirm: '',
         deleting: false,
+        // Failure step: archives the provider(s) would not give up, as returned by a
+        // 409 from the delete endpoints. Non-empty means the modal is showing the
+        // "what is left behind / remove anyway" state instead of the confirm state.
+        deleteFailures: [],
+        deletedCount: 0,
 
         // Overwrite-on-conflict modal.
         showConflictModal: false,
@@ -463,10 +468,14 @@ document.addEventListener('alpine:init', () => {
         },
 
         // ---- Deletes ----
+        // The modal has two states. It opens on the confirm step; if the server
+        // answers 409 it switches to the failure step, listing every archive that
+        // could not be removed and (for a record) offering to drop the local record
+        // anyway. Nothing local has been deleted at that point — the record is only
+        // removed once the user takes the second step.
         openDeleteRecord(u, withFiles) {
             if (!u.backup) return;
-            this.error = '';
-            this.deleteConfirm = '';
+            this.resetDeleteState();
             this.deleteTarget = {
                 kind: withFiles ? 'record-files' : 'record',
                 backupId: u.backup.id,
@@ -478,10 +487,28 @@ document.addEventListener('alpine:init', () => {
         openDeleteProvider(u, provider) {
             const ids = this.completedJobs(u, provider).map(j => j.id);
             if (ids.length === 0) return;
-            this.error = '';
-            this.deleteConfirm = '';
+            this.resetDeleteState();
             this.deleteTarget = { kind: 'provider', jobIds: ids, label: `${provider} — ${u.email}`, requireType: true };
             this.showDeleteModal = true;
+        },
+        resetDeleteState() {
+            this.error = '';
+            this.deleteConfirm = '';
+            this.deleteFailures = [];
+            this.deletedCount = 0;
+        },
+        // Closing after a partial failure still needs a refresh: files may well have
+        // been deleted from their providers even though the record stayed.
+        closeDeleteModal() {
+            const touched = this.deleteFailures.length > 0 || this.deletedCount > 0;
+            this.showDeleteModal = false;
+            this.deleteTarget = null;
+            this.deleteFailures = [];
+            this.deletedCount = 0;
+            // `error` is shared with the upload and conflict modals; leaving a stale
+            // delete error behind would surface it in whichever opens next.
+            this.error = '';
+            if (touched) this.loadUsers();
         },
         deleteMessage() {
             const t = this.deleteTarget;
@@ -490,8 +517,35 @@ document.addEventListener('alpine:init', () => {
             if (t.kind === 'provider') return `This deletes all files for ${t.label} from that provider. Type DELETE to confirm.`;
             return `This removes the record “${t.label}” locally. Uploaded files are left on their providers.`;
         },
+        // Headline for the failure step, and the sentence spelling out what forcing
+        // would leave behind — the user has to be told before taking that step.
+        deleteFailureSummary() {
+            const n = this.deleteFailures.length;
+            const files = n === 1 ? 'file' : 'files';
+            const done = this.deletedCount > 0 ? ` ${this.deletedCount} other ${this.deletedCount === 1 ? 'file was' : 'files were'} deleted.` : '';
+            // Delete-All on one provider removes jobs, not the record, so it must not
+            // talk about a record that was never going to be removed.
+            const kept = this.deleteTarget && this.deleteTarget.kind === 'provider'
+                ? ` ${n === 1 ? 'It is' : 'They are'} still on the account.`
+                : ' The record has not been removed.';
+            return `${n} ${files} could not be deleted from ${n === 1 ? 'its provider' : 'their providers'}.${done}${kept}`;
+        },
+        forceDeleteMessage() {
+            const n = this.deleteFailures.length;
+            const accounts = [...new Set(this.deleteFailures.map(f => `${f.provider} — ${f.email}`))];
+            return `Remove the record anyway? ${n} ${n === 1 ? 'file stays' : 'files stay'} on ${accounts.join(', ')}. ` +
+                `Nothing is deleted from the provider — you would have to remove ${n === 1 ? 'it' : 'them'} there yourself.`;
+        },
+        // Whether the force step applies at all. Deliberately NOT gated on `deleting`:
+        // it drives x-show, and hiding the button (and its explanation) the moment it
+        // is clicked would leave the modal blank mid-request. The button is disabled
+        // instead.
+        canForceDelete() {
+            return !!this.deleteTarget && this.deleteTarget.kind === 'record-files' && this.deleteFailures.length > 0;
+        },
         canConfirmDelete() {
             if (!this.deleteTarget || this.deleting) return false;
+            if (this.deleteFailures.length > 0) return false;
             if (this.deleteTarget.requireType && this.deleteConfirm !== 'DELETE') return false;
             return true;
         },
@@ -502,24 +556,67 @@ document.addEventListener('alpine:init', () => {
             try {
                 const t = this.deleteTarget;
                 if (t.kind === 'provider') {
+                    // Same rule as the server's record delete: attempt every job rather
+                    // than stopping at the first one that fails, so one unreachable
+                    // account cannot block the copies that are reachable.
+                    const failures = [];
+                    let deleted = 0;
                     for (const id of t.jobIds) {
                         const r = await fetch(`/api/jobs/${id}`, {
                             method: 'DELETE',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ confirm: 'DELETE' }),
                         });
-                        if (!r.ok) { const e = await r.json().catch(() => ({})); this.error = e.error || 'Failed to delete'; return; }
+                        if (r.ok) { deleted++; continue; }
+                        const e = await r.json().catch(() => ({}));
+                        if (e.failures && e.failures.length) failures.push(...e.failures);
+                        else failures.push({ provider: t.label, email: '', archive: `job #${id}`, message: e.error || 'Failed to delete' });
                     }
+                    if (failures.length) { this.deletedCount = deleted; this.deleteFailures = failures; return; }
                 } else {
                     const r = await fetch(`/api/backups/${t.backupId}`, {
                         method: 'DELETE',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ confirm: this.deleteConfirm, delete_files: t.kind === 'record-files' }),
                     });
-                    if (!r.ok) { const e = await r.json().catch(() => ({})); this.error = e.error || 'Failed to delete'; return; }
+                    if (!r.ok) {
+                        const e = await r.json().catch(() => ({}));
+                        if (r.status === 409 && e.failures && e.failures.length) {
+                            this.deletedCount = e.deleted || 0;
+                            this.deleteFailures = e.failures;
+                            return;
+                        }
+                        this.error = e.error || 'Failed to delete';
+                        return;
+                    }
                 }
                 this.showDeleteModal = false;
                 this.deleteTarget = null;
+                this.deleteFailures = [];
+                this.deletedCount = 0;
+                await this.loadUsers();
+            } finally {
+                this.deleting = false;
+            }
+        },
+        // Second step: drop the local record while the listed files stay in the
+        // cloud. The server deletes nothing remote on this call, so the UI must not
+        // claim otherwise.
+        async forceDeleteRecord() {
+            if (!this.canForceDelete() || this.deleting) return;
+            this.deleting = true;
+            this.error = '';
+            try {
+                const r = await fetch(`/api/backups/${this.deleteTarget.backupId}`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: 'DELETE', delete_files: true, force: true }),
+                });
+                if (!r.ok) { const e = await r.json().catch(() => ({})); this.error = e.error || 'Failed to remove the record'; return; }
+                this.showDeleteModal = false;
+                this.deleteTarget = null;
+                this.deleteFailures = [];
+                this.deletedCount = 0;
                 await this.loadUsers();
             } finally {
                 this.deleting = false;

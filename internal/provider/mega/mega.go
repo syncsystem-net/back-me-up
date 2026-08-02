@@ -7,10 +7,12 @@ package mega
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 
 	gomega "github.com/t3rm1n4l/go-mega"
 
@@ -60,9 +62,27 @@ func (c *Client) Login(ctx context.Context, email, password string) error {
 		return err
 	}
 	if err := c.m.Login(email, password); err != nil {
+		if isBadCredentials(err) {
+			// MEGA answers a wrong email or password with its generic "object not
+			// found" (there is no dedicated auth code), so the wrapping has to be
+			// done here rather than left to the caller to guess at.
+			return fmt.Errorf("mega login (%s): %w: %v", email, provider.ErrAuthExpired, err)
+		}
 		return fmt.Errorf("mega login (%s): %w", email, err)
 	}
 	return nil
+}
+
+// isBadCredentials reports whether a go-mega login error is MEGA's way of
+// saying the credentials were rejected. MEGA returns ENOENT ("Object
+// (typically, node or user) not found") for an unregistered email or a wrong
+// password alike; go-mega surfaces it as a plain error value, so matching is by
+// message. Anything else (network, ETOOMANY, ...) stays a generic failure.
+func isBadCredentials(err error) bool {
+	if errors.Is(err, gomega.ENOENT) || errors.Is(err, gomega.EARGS) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
 func (c *Client) Upload(ctx context.Context, localPath, remoteName string, onProgress func(provider.Progress)) (string, error) {
@@ -131,7 +151,7 @@ func (c *Client) Upload(ctx context.Context, localPath, remoteName string, onPro
 func (c *Client) Download(ctx context.Context, remoteRef string, w io.Writer) error {
 	node := c.m.FS.HashLookup(remoteRef)
 	if node == nil {
-		return fmt.Errorf("mega node %q not found", remoteRef)
+		return fmt.Errorf("mega node %q: %w", remoteRef, provider.ErrNotFound)
 	}
 	d, err := c.m.NewDownload(node)
 	if err != nil {
@@ -215,7 +235,7 @@ func (c *Client) ReadRange(ctx context.Context, remoteRef string, p []byte, off 
 	}
 	node := c.m.FS.HashLookup(remoteRef)
 	if node == nil {
-		return 0, fmt.Errorf("mega node %q not found", remoteRef)
+		return 0, fmt.Errorf("mega node %q: %w", remoteRef, provider.ErrNotFound)
 	}
 	if off >= node.GetSize() {
 		return 0, io.EOF
@@ -330,7 +350,7 @@ func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 	}
 	node := c.m.FS.HashLookup(remoteRef)
 	if node == nil {
-		return fmt.Errorf("mega node %q not found", remoteRef)
+		return fmt.Errorf("mega node %q: %w", remoteRef, provider.ErrNotFound)
 	}
 	// destroy=true removes permanently rather than moving to trash.
 	if err := c.m.Delete(node, true); err != nil {
