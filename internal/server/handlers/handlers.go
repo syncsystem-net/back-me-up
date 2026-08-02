@@ -17,6 +17,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/archive"
 	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/database"
+	"github.com/syncsystem-net/back-me-up/internal/provider"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/scanner"
 )
@@ -40,6 +41,12 @@ type Handlers struct {
 	// (config scan.max_depth, default 3).
 	scanMaxDepth int
 	ui           UI
+
+	// connect resolves a logged-in provider for one account. It wraps
+	// cloud.Connect in production and is a field so tests can drive the delete
+	// paths — whose whole point is how they behave when a backend fails — against
+	// a stub backend, with no network and no real credentials.
+	connect func(ctx context.Context, providerName, email string) (provider.Provider, error)
 }
 
 func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth int, ui UI) *Handlers {
@@ -50,7 +57,7 @@ func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth
 		tmpl = template.New("")
 	}
 
-	return &Handlers{
+	h := &Handlers{
 		db:           db,
 		accounts:     accts,
 		tmpl:         tmpl,
@@ -58,6 +65,10 @@ func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth
 		scanMaxDepth: scanMaxDepth,
 		ui:           ui,
 	}
+	h.connect = func(ctx context.Context, providerName, email string) (provider.Provider, error) {
+		return cloud.Connect(ctx, h.accounts, providerName, email, h.chunkSize)
+	}
+	return h
 }
 
 func (h *Handlers) Home(w http.ResponseWriter, r *http.Request) {
@@ -543,7 +554,7 @@ func (h *Handlers) resolveConflicts(ctx context.Context, accountIDs []int64, rem
 			slog.Warn("conflict check: account not found", "account_id", id, "error", err)
 			continue
 		}
-		p, err := cloud.Connect(ctx, h.accounts, acct.Provider, acct.Email, h.chunkSize)
+		p, err := h.connect(ctx, acct.Provider, acct.Email)
 		if err != nil {
 			slog.Warn("conflict check: could not connect", "provider", acct.Provider, "email", acct.Email, "error", err)
 			continue
@@ -639,10 +650,10 @@ func (h *Handlers) DownloadJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p, err := cloud.Connect(r.Context(), h.accounts, job.Provider, job.Email, h.chunkSize)
+	p, err := h.connect(r.Context(), job.Provider, job.Email)
 	if err != nil {
 		slog.Error("download: connect failed", "job", id, "error", err)
-		jsonError(w, "could not connect to provider", http.StatusBadGateway)
+		jsonError(w, connectFailureMessage(job.Provider, job.Email, err), http.StatusBadGateway)
 		return
 	}
 
@@ -658,118 +669,6 @@ func (h *Handlers) DownloadJob(w http.ResponseWriter, r *http.Request) {
 		// a JSON error here; log it and let the client see a truncated download.
 		slog.Error("download stream failed", "job", id, "error", err)
 	}
-}
-
-// DeleteJob removes a job's file from its provider and deletes the job record.
-// It requires a JSON body {"confirm":"DELETE"} (also enforced in the UI). Only
-// that provider's copy is affected — the backup record, its directories, and any
-// sibling provider's job remain. Route: DELETE /api/jobs/{id}.
-func (h *Handlers) DeleteJob(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		jsonError(w, "invalid job id", http.StatusBadRequest)
-		return
-	}
-	var body struct {
-		Confirm string `json:"confirm"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if body.Confirm != "DELETE" {
-		jsonError(w, `confirmation must be exactly "DELETE"`, http.StatusBadRequest)
-		return
-	}
-
-	job, err := database.GetJob(h.db, id)
-	if err != nil {
-		jsonError(w, "job not found", http.StatusNotFound)
-		return
-	}
-
-	// Remove the remote file first. If it fails, keep the record so the user can
-	// retry rather than orphaning a file in the cloud. A job that never uploaded
-	// (no remote_path) skips straight to record deletion.
-	if job.RemotePath != "" {
-		p, err := cloud.Connect(r.Context(), h.accounts, job.Provider, job.Email, h.chunkSize)
-		if err != nil {
-			slog.Error("delete: connect failed", "job", id, "error", err)
-			jsonError(w, "could not connect to provider", http.StatusBadGateway)
-			return
-		}
-		if err := p.Delete(r.Context(), job.RemotePath); err != nil {
-			slog.Error("delete: remote delete failed", "job", id, "error", err)
-			jsonError(w, "failed to delete file from provider", http.StatusBadGateway)
-			return
-		}
-	}
-
-	if err := database.DeleteJob(h.db, id); err != nil {
-		slog.Error("delete: removing job record failed", "job", id, "error", err)
-		jsonError(w, "deleted from provider but failed to remove record", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// DeleteBackup removes a whole backup record. With {"delete_files":true} it also
-// deletes every uploaded zip from its provider(s) first (requiring
-// {"confirm":"DELETE"}); the record's zips, jobs, and logs cascade away. With
-// delete_files false only the local record is removed and remote files are left
-// in place. Route: DELETE /api/backups/{id}.
-func (h *Handlers) DeleteBackup(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
-		jsonError(w, "invalid backup id", http.StatusBadRequest)
-		return
-	}
-	var body struct {
-		Confirm     string `json:"confirm"`
-		DeleteFiles bool   `json:"delete_files"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if body.DeleteFiles {
-		if body.Confirm != "DELETE" {
-			jsonError(w, `confirmation must be exactly "DELETE"`, http.StatusBadRequest)
-			return
-		}
-		jobs, err := database.ListJobsByBackup(h.db, id)
-		if err != nil {
-			slog.Error("delete backup: listing jobs", "backup", id, "error", err)
-			jsonError(w, "failed to load backup jobs", http.StatusInternalServerError)
-			return
-		}
-		// Remove every uploaded remote file first. On any failure, keep the record
-		// so the user can retry rather than orphaning cloud files.
-		for _, j := range jobs {
-			if j.RemotePath == "" {
-				continue
-			}
-			p, err := cloud.Connect(r.Context(), h.accounts, j.Provider, j.Email, h.chunkSize)
-			if err != nil {
-				slog.Error("delete backup: connect failed", "job", j.ID, "error", err)
-				jsonError(w, "could not connect to provider", http.StatusBadGateway)
-				return
-			}
-			if err := p.Delete(r.Context(), j.RemotePath); err != nil {
-				slog.Error("delete backup: remote delete failed", "job", j.ID, "error", err)
-				jsonError(w, "failed to delete a file from its provider", http.StatusBadGateway)
-				return
-			}
-		}
-	}
-
-	if err := database.DeleteBackupRecord(h.db, id); err != nil {
-		slog.Error("delete backup: removing record failed", "backup", id, "error", err)
-		jsonError(w, "failed to remove backup record", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func BrowseHandler() http.HandlerFunc {
