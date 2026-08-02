@@ -335,18 +335,41 @@
         </div>
     </div>
 
-    <div x-show="showDeleteModal" class="modal-overlay" @click.self="showDeleteModal = false" x-cloak>
+    <div x-show="showDeleteModal" class="modal-overlay" @click.self="closeDeleteModal()" x-cloak>
         <div class="modal-card">
-            <div class="modal-head">Confirm delete</div>
+            <div class="modal-head" x-text="deleteFailures.length ? 'Some files could not be deleted' : 'Confirm delete'"></div>
             <div class="modal-body">
-                <p x-text="deleteMessage()"></p>
-                <div class="form-field" x-show="deleteTarget && deleteTarget.requireType">
-                    <input type="text" x-model="deleteConfirm" placeholder="DELETE">
-                </div>
+                <!-- Step 1: confirm. -->
+                <template x-if="!deleteFailures.length">
+                    <div>
+                        <p x-text="deleteMessage()"></p>
+                        <div class="form-field" x-show="deleteTarget && deleteTarget.requireType">
+                            <input type="text" x-model="deleteConfirm" placeholder="DELETE">
+                        </div>
+                    </div>
+                </template>
+
+                <!-- Step 2: what failed, and the option to drop the record anyway. -->
+                <template x-if="deleteFailures.length">
+                    <div>
+                        <p x-text="deleteFailureSummary()"></p>
+                        <ul class="delete-failures">
+                            <template x-for="(f, i) in deleteFailures" :key="i">
+                                <li>
+                                    <span class="delete-failure-head" x-text="f.archive + ' — ' + f.provider + (f.email ? ' (' + f.email + ')' : '')"></span>
+                                    <span class="delete-failure-why" x-text="f.message"></span>
+                                </li>
+                            </template>
+                        </ul>
+                        <p class="muted" x-show="canForceDelete()" x-text="forceDeleteMessage()"></p>
+                    </div>
+                </template>
+
                 <div class="form-error" x-show="error" x-text="error"></div>
                 <div class="modal-actions">
-                    <button class="btn btn-pink" @click="confirmDelete()" :disabled="!canConfirmDelete()" x-text="deleting ? 'Deleting…' : 'Delete'"></button>
-                    <button class="btn btn-grey" @click="showDeleteModal = false">Cancel</button>
+                    <button class="btn btn-pink" x-show="!deleteFailures.length" @click="confirmDelete()" :disabled="!canConfirmDelete()" x-text="deleting ? 'Deleting…' : 'Delete'"></button>
+                    <button class="btn btn-pink" x-show="canForceDelete()" @click="forceDeleteRecord()" :disabled="deleting" x-text="deleting ? 'Removing…' : 'Remove record anyway'"></button>
+                    <button class="btn btn-grey" @click="closeDeleteModal()" x-text="deleteFailures.length ? 'Close' : 'Cancel'"></button>
                 </div>
             </div>
         </div>
