@@ -129,7 +129,10 @@ func (c *Client) getUser(ctx context.Context) (*user, error) {
 		slog.Info("4shared GET /user response", "status", resp.StatusCode, "body", string(body))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET /user: 4shared returned %d: %s", resp.StatusCode, string(body))
+		// This is the call Login uses as its auth check, so it is where an
+		// expired token first shows up. statusError classifies it rather than
+		// leaving the caller to read "401.0301" out of the body.
+		return nil, statusError("GET /user", resp.StatusCode, body)
 	}
 	var u user
 	if err := json.Unmarshal(body, &u); err != nil {
@@ -525,9 +528,32 @@ func (c *Client) Delete(ctx context.Context, remoteRef string) error {
 	return nil
 }
 
+// apiError turns a non-success 4shared response into an error, wrapping the two
+// statuses whose meaning callers act on differently:
+//
+//   - 404 — the object is not there. For a delete that is the desired end
+//     state, so it becomes provider.ErrNotFound.
+//   - 401 — the OAuth access token was rejected (4shared's 401.0301: expired,
+//     revoked, or superseded by a re-authorization). OAuth 1.0 has no refresh,
+//     so retrying is pointless; it becomes provider.ErrAuthExpired and the
+//     caller tells the user to re-authorize.
+//
+// 403 (including the 403.0201 "already exists" rejection) stays a plain error.
 func apiError(op string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	return fmt.Errorf("%s: 4shared returned %d: %s", op, resp.StatusCode, string(body))
+	return statusError(op, resp.StatusCode, body)
+}
+
+// statusError is apiError for callers that have already consumed the body.
+func statusError(op string, status int, body []byte) error {
+	base := fmt.Errorf("%s: 4shared returned %d: %s", op, status, string(body))
+	switch status {
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: %v", provider.ErrNotFound, base)
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: %v", provider.ErrAuthExpired, base)
+	}
+	return base
 }
 
 // isAlreadyExists reports whether a 4shared error body is the "name already
