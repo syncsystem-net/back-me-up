@@ -112,6 +112,42 @@ func GetAccountsHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+// mainAccountResponse describes one provider's database-backup account for the
+// Accounts view. Main accounts are not rows in the accounts table (that table
+// drives the upload modal and the per-user table), so this reads the in-memory
+// store instead. Credentials never leave the server: only the provider, the
+// email, and whether the configuration is complete.
+type mainAccountResponse struct {
+	Provider string `json:"provider"`
+	Email    string `json:"email"`
+	// Usable is false when the account is configured but missing credentials it
+	// needs to log in; MissingKeys then names the .env keys to fill in.
+	Usable      bool     `json:"usable"`
+	MissingKeys []string `json:"missing_keys"`
+}
+
+// GetMainAccounts lists the configured metadata-database backup accounts, one
+// per provider at most. Route: GET /api/accounts/main.
+func (h *Handlers) GetMainAccounts(w http.ResponseWriter, r *http.Request) {
+	out := make([]mainAccountResponse, 0)
+	if h.accounts != nil {
+		for _, m := range h.accounts.Mains {
+			missing := m.MissingKeys()
+			if missing == nil {
+				missing = []string{}
+			}
+			out = append(out, mainAccountResponse{
+				Provider:    string(m.Provider),
+				Email:       m.Email,
+				Usable:      len(missing) == 0,
+				MissingKeys: missing,
+			})
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
 // userResponse is one table row: a user (email) with their configured accounts
 // (across providers), their single backup record (nil if they never uploaded),
 // its accumulated zips, and every job. Users with configured accounts but no

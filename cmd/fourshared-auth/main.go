@@ -3,6 +3,7 @@
 // paste into .env. Run it once per 4shared account:
 //
 //	go run ./cmd/fourshared-auth -account 1
+//	go run ./cmd/fourshared-auth -account main   # the database-backup account
 //
 // It reads the app consumer key/secret and callback domain from .env
 // (FOURSHARED_CONSUMER_KEY / FOURSHARED_CONSUMER_SECRET / FOURSHARED_CONSUMER_DOMAIN),
@@ -35,6 +36,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,11 +54,17 @@ const (
 func main() {
 	key := flag.String("key", "", "4shared consumer key (defaults to FOURSHARED_CONSUMER_KEY in .env)")
 	secret := flag.String("secret", "", "4shared consumer secret (defaults to FOURSHARED_CONSUMER_SECRET in .env)")
-	accountIndex := flag.Int("account", 1, "the FOURSHARED_ACCOUNT_<n> index these tokens are for (used in the printed .env keys)")
+	account := flag.String("account", "1", `the FOURSHARED_ACCOUNT_<n> slot these tokens are for: a number, or "main" for the database-backup account (used in the printed .env keys)`)
 	port := flag.Int("port", 8723, "local port the callback listener binds on this machine")
 	domainFlag := flag.String("domain", "", "callback domain matching the registered 4shared Application domain (defaults to FOURSHARED_CONSUMER_DOMAIN in .env)")
 	manual := flag.Bool("manual", false, "use the out-of-band PIN flow instead of a callback")
 	flag.Parse()
+
+	slot, err := accountSlot(*account)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	_ = godotenv.Load(".env")
 	// Prefer per-account credentials (FOURSHARED_ACCOUNT_<n>_CONSUMER_*), falling
@@ -64,25 +72,25 @@ func main() {
 	// normally authorized through its own registered application.
 	if *key == "" {
 		*key = firstNonEmpty(
-			os.Getenv(fmt.Sprintf("FOURSHARED_ACCOUNT_%d_CONSUMER_KEY", *accountIndex)),
+			os.Getenv(fmt.Sprintf("FOURSHARED_ACCOUNT_%s_CONSUMER_KEY", slot)),
 			os.Getenv("FOURSHARED_CONSUMER_KEY"),
 		)
 	}
 	if *secret == "" {
 		*secret = firstNonEmpty(
-			os.Getenv(fmt.Sprintf("FOURSHARED_ACCOUNT_%d_CONSUMER_SECRET", *accountIndex)),
+			os.Getenv(fmt.Sprintf("FOURSHARED_ACCOUNT_%s_CONSUMER_SECRET", slot)),
 			os.Getenv("FOURSHARED_CONSUMER_SECRET"),
 		)
 	}
 	if *key == "" || *secret == "" {
-		fmt.Fprintf(os.Stderr, "error: consumer key/secret required (set FOURSHARED_ACCOUNT_%d_CONSUMER_KEY/SECRET in .env or pass -key/-secret)\n", *accountIndex)
+		fmt.Fprintf(os.Stderr, "error: consumer key/secret required (set FOURSHARED_ACCOUNT_%s_CONSUMER_KEY/SECRET in .env or pass -key/-secret)\n", slot)
 		os.Exit(1)
 	}
 
 	domain := *domainFlag
 	if domain == "" {
 		domain = firstNonEmpty(
-			os.Getenv(fmt.Sprintf("FOURSHARED_ACCOUNT_%d_CONSUMER_DOMAIN", *accountIndex)),
+			os.Getenv(fmt.Sprintf("FOURSHARED_ACCOUNT_%s_CONSUMER_DOMAIN", slot)),
 			os.Getenv("FOURSHARED_CONSUMER_DOMAIN"),
 		)
 	}
@@ -94,10 +102,10 @@ func main() {
 	ctx := context.Background()
 
 	if *manual {
-		runManual(ctx, client, *key, *secret, *accountIndex)
+		runManual(ctx, client, *key, *secret, slot)
 		return
 	}
-	runCallback(ctx, client, *key, *secret, *accountIndex, domain, *port)
+	runCallback(ctx, client, *key, *secret, slot, domain, *port)
 }
 
 // callbackURL builds the OAuth callback URL the browser is redirected to. Its
@@ -113,7 +121,7 @@ func callbackURL(domain string, port int) string {
 // runCallback runs a local web server that captures the verifier from the
 // redirect. As a fallback it also reads a verifier pasted on stdin, in case the
 // browser redirect doesn't reach the local server.
-func runCallback(ctx context.Context, client *http.Client, key, secret string, accountIndex int, domain string, port int) {
+func runCallback(ctx context.Context, client *http.Client, key, secret, slot, domain string, port int) {
 	callback := callbackURL(domain, port)
 
 	// Bind the listener first so the port is ready before we authorize.
@@ -187,11 +195,11 @@ func runCallback(ctx context.Context, client *http.Client, key, secret string, a
 	if err != nil {
 		fail("exchanging request token for access token", err)
 	}
-	printResult(accountIndex, accToken, accSecret)
+	printResult(slot, accToken, accSecret)
 }
 
 // runManual uses the out-of-band PIN flow (last-resort fallback).
-func runManual(ctx context.Context, client *http.Client, key, secret string, accountIndex int) {
+func runManual(ctx context.Context, client *http.Client, key, secret, slot string) {
 	signer := &oauth1.Signer{ConsumerKey: key, ConsumerSecret: secret}
 	reqToken, reqSecret, err := postForm(ctx, client, signer, http.MethodPost, initiateURL, map[string]string{"oauth_callback": "oob"})
 	if err != nil {
@@ -212,13 +220,29 @@ func runManual(ctx context.Context, client *http.Client, key, secret string, acc
 	if err != nil {
 		fail("exchanging verifier for access token", err)
 	}
-	printResult(accountIndex, accToken, accSecret)
+	printResult(slot, accToken, accSecret)
 }
 
-func printResult(accountIndex int, token, secret string) {
+func printResult(slot, token, secret string) {
 	fmt.Printf("\nSuccess. Add these lines to your .env:\n\n")
-	fmt.Printf("FOURSHARED_ACCOUNT_%d_OAUTH_TOKEN=%s\n", accountIndex, token)
-	fmt.Printf("FOURSHARED_ACCOUNT_%d_OAUTH_TOKEN_SECRET=%s\n\n", accountIndex, secret)
+	fmt.Printf("FOURSHARED_ACCOUNT_%s_OAUTH_TOKEN=%s\n", slot, token)
+	fmt.Printf("FOURSHARED_ACCOUNT_%s_OAUTH_TOKEN_SECRET=%s\n\n", slot, secret)
+}
+
+// accountSlot validates the -account value and returns the .env key fragment it
+// names. A numbered account is its index; the database-backup account is the
+// literal MAIN, matching FOURSHARED_ACCOUNT_MAIN_*. The value is uppercased so
+// "-account main" and "-account MAIN" behave the same.
+func accountSlot(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if strings.EqualFold(v, "main") {
+		return "MAIN", nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return "", fmt.Errorf(`-account must be a positive number or "main", got %q`, v)
+	}
+	return strconv.Itoa(n), nil
 }
 
 // debug is enabled by FOURSHARED_DEBUG and logs the raw OAuth responses, which

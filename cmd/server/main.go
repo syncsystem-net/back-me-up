@@ -10,6 +10,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/config"
 	"github.com/syncsystem-net/back-me-up/internal/database"
+	"github.com/syncsystem-net/back-me-up/internal/provider/registry"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/ratelimit"
 	"github.com/syncsystem-net/back-me-up/internal/server"
@@ -40,7 +41,7 @@ func main() {
 	}
 	defer db.Close()
 
-	slog.Info("main account (db backup only, not shown in UI)", "provider", accts.Main.Provider, "email", accts.Main.Email)
+	logMainAccounts(accts)
 
 	if err := syncAccountsToDB(db, accts); err != nil {
 		slog.Warn("failed to sync accounts to database", "error", err)
@@ -130,6 +131,26 @@ func rateLimitSet(cfg *config.Config) *ratelimit.Set {
 		"mega":       mkLimiter(cfg.RateLimits.Mega),
 		"fourshared": mkLimiter(cfg.RateLimits.FourShared),
 	})
+}
+
+// logMainAccounts reports the configured database-backup destinations, one line
+// per provider, so a misread .env is visible at startup rather than at the end
+// of the first job. Configuring none is a supported choice and says so plainly;
+// accounts.Load has already warned about half-configured ones.
+func logMainAccounts(accts *accounts.AccountStore) {
+	if len(accts.Mains) == 0 {
+		slog.Info("no main account configured; the metadata database will not be copied to any provider")
+		return
+	}
+	for _, m := range accts.Mains {
+		if !registry.Supported(string(m.Provider)) {
+			slog.Warn("main account names an unsupported provider; it will receive no db backup",
+				"provider", m.Provider, "email", m.Email)
+			continue
+		}
+		slog.Info("main account (db backup only, not an upload target)",
+			"provider", m.Provider, "email", m.Email, "usable", m.Usable())
+	}
 }
 
 func syncAccountsToDB(db *sql.DB, accts *accounts.AccountStore) error {
