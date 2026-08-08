@@ -55,6 +55,14 @@ document.addEventListener('alpine:init', () => {
         // Table rows grouped by user (email). Each: {email, accounts, backup, zips, jobs}.
         users: [],
         accounts: [],
+        // Database-backup accounts, at most one per provider. Read from .env at
+        // startup, so this is fetched on load and on entering the Accounts tab
+        // rather than on every poll tick. mainAccountsLoaded separates "none are
+        // configured" from "we never got an answer" — claiming the former when a
+        // fetch failed would tell the user their index is not being backed up
+        // when it is.
+        mainAccounts: [],
+        mainAccountsLoaded: false,
         search: '',
         refreshingQuotas: false,
         error: '',
@@ -124,8 +132,14 @@ document.addEventListener('alpine:init', () => {
         searchError: '',
 
         async init() {
-            await Promise.all([this.loadUsers(), this.loadAccounts(), this.loadSettings()]);
-            this.scheduleRefresh();
+            // Same rule as the refresh loop: the poll must be armed even if a
+            // first fetch rejects (server still starting under Air), or the page
+            // never recovers for the rest of the session.
+            try {
+                await Promise.all([this.loadUsers(), this.loadAccounts(), this.loadMainAccounts(), this.loadSettings()]);
+            } finally {
+                this.scheduleRefresh();
+            }
         },
         // Two cadences, both from config.yml: a slow idle tick, and a faster one
         // while something is actually happening so progress bars stay smooth.
@@ -171,6 +185,20 @@ document.addEventListener('alpine:init', () => {
             const r = await fetch('/api/accounts');
             if (!r.ok) return;
             this.accounts = await r.json() || [];
+        },
+        async loadMainAccounts() {
+            const r = await fetch('/api/accounts/main');
+            if (!r.ok) return;
+            this.mainAccounts = await r.json() || [];
+            this.mainAccountsLoaded = true;
+        },
+        // Main accounts come from .env, so they only change across a restart —
+        // but "edit .env, restart, check the Accounts view" is exactly the loop
+        // this section exists to serve, and the page may have been open the whole
+        // time. Re-read on entering the tab rather than on every poll tick.
+        openAccountsPage() {
+            this.page = 'accounts';
+            this.loadMainAccounts();
         },
         hasActiveJobs() {
             return this.users.some(u => (u.jobs || []).some(j => j.status === 'pending' || j.status === 'in_progress'));

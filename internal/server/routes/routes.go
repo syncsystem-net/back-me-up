@@ -20,6 +20,7 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 
 	mux.HandleFunc("/api/health", h.Health)
 	mux.HandleFunc("/api/accounts", handlers.GetAccountsHandler(db))
+	mux.HandleFunc("GET /api/accounts/main", h.GetMainAccounts)
 	mux.HandleFunc("POST /api/accounts/quota-sync", handlers.QuotaSyncHandler(db, syncer))
 	mux.HandleFunc("GET /api/users", handlers.GetUsersHandler(db))
 	mux.HandleFunc("GET /api/search", handlers.SearchTreesHandler(db))

@@ -27,7 +27,7 @@
 
     <!-- Tabs -->
     <nav class="tabs" x-cloak>
-        <a href="#" class="tab" :class="{ active: page === 'accounts' }" @click.prevent="page = 'accounts'">accounts</a>
+        <a href="#" class="tab" :class="{ active: page === 'accounts' }" @click.prevent="openAccountsPage()">accounts</a>
         <a href="#" class="tab" :class="{ active: page === 'backups' }" @click.prevent="page = 'backups'">backups</a>
         <a href="#" class="tab" :class="{ active: page === 'jobs' }" @click.prevent="page = 'jobs'">jobs</a>
     </nav>
@@ -236,6 +236,35 @@
                 <div></div>
                 <div class="toolbar-right">
                     <button class="btn btn-purple" @click="refreshQuotas()" :disabled="refreshingQuotas" x-text="refreshingQuotas ? 'Refreshing…' : 'Refresh Quotas'"></button>
+                </div>
+            </div>
+
+            <!-- Main (database backup) accounts. Not upload targets, not in the
+                 accounts table, so they get their own section above the ones the
+                 user can actually pick. -->
+            <div class="acct-group">
+                <div class="acct-group-head acct-group-head--main">
+                    <span>Main accounts — metadata database backup</span>
+                </div>
+                <div class="acct-grid">
+                    <template x-for="m in mainAccounts" :key="m.provider">
+                        <div class="acct-card" :class="{ 'acct-card--warn': !m.usable }">
+                            <div class="acct-email" x-text="m.email"></div>
+                            <div class="acct-quota">
+                                <span x-text="m.provider === 'mega' ? 'MEGA' : '4shared'"></span>
+                                — receives a copy of the metadata database after every successful job. Not an upload target.
+                            </div>
+                            <div class="acct-warn" x-show="!m.usable">
+                                Incomplete configuration — set <span x-text="(m.missing_keys || []).join(', ')"></span> in .env.
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="mainAccountsLoaded && mainAccounts.length === 0">
+                        <p class="muted">No main account configured. Set <code>MEGA_ACCOUNT_MAIN_EMAIL</code> and/or <code>FOURSHARED_ACCOUNT_MAIN_EMAIL</code> in .env to keep a copy of the metadata database off this machine.</p>
+                    </template>
+                    <template x-if="!mainAccountsLoaded">
+                        <p class="muted">Could not read the main account configuration.</p>
+                    </template>
                 </div>
             </div>
 
