@@ -7,7 +7,7 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - The backups table is grouped by **user** (account email): the same email configured on both MEGA and 4shared shows as one row, and every configured account appears even before its first upload.
 - Point at a directory from a user's row (Upload / Edit), give the backup a title (defaults to the folder name), and it uploads to that user's accounts. A record belongs to one user and **accumulates zips** over time — each upload adds another archive, and every zip's directory tree is recorded and shown under "Files: expand".
 - A background worker pool uploads in chunks with live progress, automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit. The table refreshes every `ui.poll_seconds` (default 10) while idle and speeds up to `ui.active_poll_seconds` (default 2) while a job is running.
-- On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to your main account.
+- On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to every configured main account (one per provider).
 - Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
 - **Download** on an account card fetches every zip stored on that account (one file at a time — the browser asks once for permission to download multiple files); the `(download file)` link on a zip's own node in the tree fetches just that archive. Plus per-provider Delete-All and record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
 - **Deletes are resilient.** An archive that is already gone from the provider counts as deleted (that is the state the delete was after), and every copy is attempted rather than the whole operation stopping at the first problem. If some copies genuinely can't be removed — an expired 4shared authorization, say — the record is kept and the modal names each archive, its account, and why, then offers to remove the record anyway once you've seen what will be left in the cloud. Retrying is safe too: the copies already deleted simply report "not found", which counts as success.
@@ -130,15 +130,14 @@ The `.env` file has two distinct account types:
 
 | Variable prefix | Purpose | Shown in UI |
 |---|---|---|
-| `MAIN_ACCOUNT_*` | Receives a copy of the SQLite DB after every successful job | No |
+| `MEGA_ACCOUNT_MAIN_*`, `FOURSHARED_ACCOUNT_MAIN_*` | Receives a copy of the SQLite DB after every successful job | In the Accounts view only, never as an upload target |
 | `MEGA_ACCOUNT_1_*`, `MEGA_ACCOUNT_2_*`, … | Accounts available for user-selected backups | Yes |
 | `FOURSHARED_ACCOUNT_1_*`, … | Same for 4shared | Yes |
 
-Example — one MEGA backup account plus one 4shared:
+Example — one MEGA backup account plus one 4shared, with a MEGA main account:
 ```env
-MAIN_ACCOUNT_PROVIDER=mega
-MAIN_ACCOUNT_EMAIL=db-backup@example.com
-MAIN_ACCOUNT_PASSWORD=secret
+MEGA_ACCOUNT_MAIN_EMAIL=db-backup@example.com
+MEGA_ACCOUNT_MAIN_PASSWORD='secret'
 
 MEGA_ACCOUNT_1_EMAIL=uploads@example.com
 MEGA_ACCOUNT_1_PASSWORD=secret
@@ -149,7 +148,22 @@ FOURSHARED_ACCOUNT_1_PASSWORD=secret
 FOURSHARED_ACCOUNT_1_QUOTA_GB=15
 ```
 
-The `MAIN_ACCOUNT` is intentionally excluded from the backup modal — it is reserved for database backup only.
+Main accounts are intentionally excluded from the backup modal — they are reserved for database backup only. They appear in the Accounts view under **Main accounts** so you can confirm the app read your configuration the way you meant it.
+
+### Main accounts are per provider
+
+There is at most **one main account per provider**, configured with the same `MAIN` slot a numbered account fills with its index:
+
+- MEGA: `MEGA_ACCOUNT_MAIN_EMAIL` / `_PASSWORD`
+- 4shared: `FOURSHARED_ACCOUNT_MAIN_EMAIL` plus the same OAuth set a numbered 4shared account needs (`_CONSUMER_KEY`, `_CONSUMER_SECRET`, `_CONSUMER_DOMAIN`, `_OAUTH_TOKEN`, `_OAUTH_TOKEN_SECRET`). Authorize it with `go run ./cmd/fourshared-auth -account main`.
+
+After every successful job the metadata database is uploaded to **every** configured main account. Each destination is attempted independently, so an expired token on one provider does not cost the other its copy; failures are logged per destination, naming the provider and account.
+
+Configuring **no** main account is supported and warns about nothing — it simply means no copy of your index is kept off this machine, so losing this machine loses the record of what was backed up where (the archives themselves remain in the cloud, and Auto-Sync can rebuild a record of them).
+
+A main account that is configured but **incomplete** (a MEGA one with no password, a 4shared one with no token) is a different matter: it is reported as a warning at startup naming the exact `.env` keys to fill in, and flagged in the Accounts view.
+
+> **Upgrading:** `MAIN_ACCOUNT_PROVIDER` / `MAIN_ACCOUNT_EMAIL` / `MAIN_ACCOUNT_PASSWORD` are no longer read. Leaving them in `.env` produces a startup warning naming the replacements; their values are **not** adopted, so rename them or your database backups will stop.
 
 ## Provider credentials
 
@@ -207,6 +221,8 @@ FOURSHARED_ACCOUNT_1_OAUTH_TOKEN_SECRET=...
 
 Add those two lines to `.env`. Repeat Steps 1–3 with `-account 2`, `-account 3`, … (and matching `FOURSHARED_ACCOUNT_<n>_*` keys) for additional 4shared accounts.
 
+To authorize the 4shared **main** (database-backup) account, run the same steps with `-account main`; the helper reads `FOURSHARED_ACCOUNT_MAIN_CONSUMER_KEY` / `_SECRET` / `_DOMAIN` and prints `FOURSHARED_ACCOUNT_MAIN_OAUTH_TOKEN` / `_SECRET`.
+
 > **Note:** 4shared implements **OAuth 1.0**, not 1.0a — the authorize callback returns only `oauth_token` and **no `oauth_verifier`**, and the helper completes the moment the callback arrives.
 
 **Flags / fallbacks:** `-port <n>` uses a different local port (the callback then uses that port too); `-manual` is a last-resort flow if you cannot use a callback at all. If several accounts share a single application, you can instead set `FOURSHARED_CONSUMER_KEY` / `FOURSHARED_CONSUMER_SECRET` / `FOURSHARED_CONSUMER_DOMAIN` once as a fallback for accounts that omit their own.
@@ -222,7 +238,7 @@ Creating a backup writes one `pending` job per selected account. A background wo
 1. Claims each pending job atomically and marks it `in_progress`.
 2. Uploads the zip in chunks (`upload.chunk_size_mb`), persisting progress after each chunk — the Backups table shows a live progress bar, polled every `ui.active_poll_seconds` (default 2s) while the job runs.
 3. Retries on failure with exponential backoff (`retry_policy`).
-4. On success: verifies the first chunk's checksum, refreshes the account quota, deletes the temp zip (once every sibling job for that backup is done), and uploads a copy of the metadata DB to the main account.
+4. On success: verifies the first chunk's checksum, refreshes the account quota, deletes the temp zip (once every sibling job for that backup is done), and uploads a copy of the metadata DB to every configured main account, attempting each independently.
 5. On failure (after retries): marks the job `failed`, records the error, and keeps the temp zip for a future retry.
 
 Click **logs** in a provider column to see that job's log history (including failure reasons) in a modal.
@@ -250,7 +266,7 @@ After each update, do the following:
 - **Port already in use**: Change `server.port` in `config.yml`.
 - **`go run` says module not found**: Run `go mod download` first to fetch all dependencies.
 - **Accounts not showing in modal / UI looks stale after a server update**: The browser may be serving a cached version of the JavaScript. Press **Ctrl+Shift+R** (Windows/Linux) or **Cmd+Shift+R** (macOS) to force a full reload. This is a one-time step after each update — subsequent reloads are automatic because the server now sends `Cache-Control: no-store` for all static assets.
-- **MEGA accounts not showing in modal**: Verify your `.env` has `MEGA_ACCOUNT_1_EMAIL` (a numbered backup account), not just `MAIN_ACCOUNT_EMAIL`. The main account is not displayed in the UI. See the account structure table above.
+- **MEGA accounts not showing in modal**: Verify your `.env` has `MEGA_ACCOUNT_1_EMAIL` (a numbered backup account), not just `MEGA_ACCOUNT_MAIN_EMAIL`. A main account is shown in the Accounts view but is never offered as an upload target. See the account structure table above.
 - **MEGA upload fails with "Object (typically, node or user) not found" at login**: MEGA reports invalid credentials this way. The usual cause is a password containing `$` (or other special characters) that was silently corrupted by `.env` variable expansion — see the next item. Otherwise confirm you can log in with that exact email and password at <https://mega.nz>, that there are no stray spaces in `.env`, and that the account does not require two-factor authentication (2FA is not currently supported).
 - **A password/secret with `$`, `#`, backticks or spaces isn't accepted**: Unquoted and double-quoted `.env` values undergo variable expansion, so `PASSWORD=paSs1$2178` becomes `paSs1`. Wrap such values in **single** quotes to keep them literal: `MEGA_ACCOUNT_1_PASSWORD='paSs1$2178'`. (OAuth tokens are hex and don't need quoting.)
 - **4shared upload fails with `401 ... "token ... expired, rejected or does not exist"` (code `401.0301`)**: The account's OAuth access token is no longer valid server-side. **There is no token-expiry setting in this app** — the application sets no lifetime on tokens; an OAuth 1.0 access token's validity is controlled entirely by 4shared's servers, so it cannot be extended or configured from here. A token can become invalid because 4shared expired it, because the app was re-authorized (which invalidates the previous token), or because it was revoked. 4shared does not publish the exact lifetime. The fix is always to re-mint the token: re-run `go run ./cmd/fourshared-auth -account <n>` and paste the freshly printed `FOURSHARED_ACCOUNT_<n>_OAUTH_TOKEN`/`_SECRET` into `.env`, then restart the server. Run `go run ./cmd/fourshared-test -account <n>` (add `FOURSHARED_DEBUG=1` for verbose signing logs) to verify a token in isolation.

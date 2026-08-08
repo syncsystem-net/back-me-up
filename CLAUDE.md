@@ -113,10 +113,19 @@ Note: single-quote any value containing `$`, `#`, backticks, or spaces (godotenv
 expands unquoted/double-quoted values — see Technical Notes). The full 4shared
 credential walkthrough lives in README.md → "Provider credentials".
 
-# Main account for database backup
-MAIN_ACCOUNT_PROVIDER=mega
-MAIN_ACCOUNT_EMAIL=main@example.com
-MAIN_ACCOUNT_PASSWORD='secret'
+# Main accounts for database backup — one per provider, both optional.
+# Never upload targets; a provider with no _MAIN_EMAIL is skipped silently.
+MEGA_ACCOUNT_MAIN_EMAIL=mega-main@example.com
+MEGA_ACCOUNT_MAIN_PASSWORD='secret'
+
+# The 4shared main account needs the same OAuth set as a numbered one:
+#   go run ./cmd/fourshared-auth -account main
+FOURSHARED_ACCOUNT_MAIN_EMAIL=4s-main@example.com
+FOURSHARED_ACCOUNT_MAIN_CONSUMER_KEY=...
+FOURSHARED_ACCOUNT_MAIN_CONSUMER_SECRET=...
+FOURSHARED_ACCOUNT_MAIN_CONSUMER_DOMAIN=backmeup.example.com
+FOURSHARED_ACCOUNT_MAIN_OAUTH_TOKEN=...
+FOURSHARED_ACCOUNT_MAIN_OAUTH_TOKEN_SECRET=...
 
 # MEGA accounts (numbered) — password login, no app registration
 MEGA_ACCOUNT_1_EMAIL=mega1@example.com
@@ -232,7 +241,9 @@ Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-re
 
 **Phase 2 — Resilient deletes: DONE** (PR #23, branch `pr/11-resilient-deletes`). Ticket `dev-tools/prompts/output/tickets/11-resilient-deletes.md`. Shipped: `provider.ErrNotFound` + `provider.ErrAuthExpired` sentinels (MEGA nil `HashLookup` and rejected login; 4shared 404 and 401), delete treats not-found as success, `DeleteBackup` attempts every job and reports per-archive failures as **409 + structured body**, an explicit "remove the record anyway" force step, and a `connect` seam on `Handlers` so the delete paths are testable against a stub backend. See the "Resilient deletes" technical note below.
 
-**Phase 3** — per-provider main account. **Phase 4** — credentials into the DB, encrypted, plus 4shared re-authorize. **Phase 5** — per-provider/tier size caps and archive splitting.
+**Phase 3 — Per-provider main account: DONE** (branch `pr/12-per-provider-main-account`). Ticket `dev-tools/prompts/output/tickets/12-per-provider-main-account.md`. Shipped: `MEGA_ACCOUNT_MAIN_*` / `FOURSHARED_ACCOUNT_MAIN_*` (the 4shared main carrying its own OAuth quintet), `MAIN_ACCOUNT_*` removed with a startup warning naming the replacements, `AccountStore.Mains` + `MainFor`, `MainAccount.MissingKeys`/`Usable`, the metadata DB fanned out to every main account with each destination attempted independently, `GET /api/accounts/main` and a **Main accounts** section in the Accounts view, and `cmd/fourshared-auth -account main`. See the "Per-provider main account" technical note below.
+
+**Phase 4** — credentials into the DB, encrypted, plus 4shared re-authorize. **Phase 5** — per-provider/tier size caps and archive splitting.
 
 ---
 
@@ -383,13 +394,13 @@ macOS: use `osascript -e 'POSIX path of (choose folder ...)'` — it returns the
 
 ### Account structure: MAIN vs numbered
 
-`MAIN_ACCOUNT_*` is the database-backup account — it is **not** synced to the `accounts` DB table and **not** shown in the UI modal. It is reserved for uploading the SQLite DB after each successful job.
+`<PROVIDER>_ACCOUNT_MAIN_*` is that provider's database-backup account — **at most one per provider**, **not** synced to the `accounts` DB table and **not** offered in the upload modal. It is reserved for uploading the SQLite DB after each successful job, and shows in the Accounts view under its own "Main accounts" heading.
 
-Only numbered accounts (`MEGA_ACCOUNT_1_*`, `FOURSHARED_ACCOUNT_1_*`, etc.) appear in the New Backup modal as selectable upload targets. If a user configures only `MAIN_ACCOUNT_EMAIL` for MEGA and expects it to appear in the modal, it won't — they need a separate `MEGA_ACCOUNT_1_EMAIL` entry.
+Only numbered accounts (`MEGA_ACCOUNT_1_*`, `FOURSHARED_ACCOUNT_1_*`, etc.) appear in the New Backup modal as selectable upload targets. If a user configures only `MEGA_ACCOUNT_MAIN_EMAIL` and expects it to appear in the modal, it won't — they need a separate `MEGA_ACCOUNT_1_EMAIL` entry.
 
 Log lines to verify on startup:
 ```
-msg="main account (db backup only, not shown in UI)" provider=mega email=...
+msg="main account (db backup only, not an upload target)" provider=mega email=... usable=true
 msg="syncing account" provider=mega email=...
 msg="syncing account" provider=fourshared email=...
 msg="accounts synced" count=2
@@ -473,6 +484,26 @@ Adding a provider = implement `Provider` in a new subpackage + add one `case` in
 
 ---
 
+### Per-provider main account (pre-launch phase 3)
+
+**An optional setting must never be able to take the required ones down with it.** `accounts.Load` used to *error* when `MAIN_ACCOUNT_PROVIDER` was unset, and `main.go` treats any `Load` error as "running without accounts" — so forgetting the db-backup account silently dropped **every** upload account. Absence of an optional thing returns absence, not an error.
+
+**Absence is silent; half-configured is loud.** A provider with no `*_ACCOUNT_MAIN_EMAIL` produces no log line at all — it is a supported choice, and warning about it trains the user to ignore warnings. A main account that *is* declared but lacks credentials it needs (`MainAccount.MissingKeys` → full `.env` key names, not suffixes, so the message is pasteable) is warned about once at load and flagged in the Accounts view.
+
+**Removed keys warn rather than being quietly adopted.** Leftover `MAIN_ACCOUNT_*` values are ignored *and* reported with their replacements. Silently promoting a value from a key we claim to have removed is worse than a clear break; silently ignoring it stops the user's db backups with no visible cause.
+
+**The main account carries its own credentials.** `MainAccount` holds the OAuth quintet, so the 4shared main account works standalone. It replaced `worker.mainOAuth`'s hack of matching the main email against the *numbered* 4shared accounts to borrow their token — which meant a main account that wasn't also an upload target silently had no token at all.
+
+**The fan-out never stops at the first failure** — the same rule as resilient deletes. One snapshot of the DB is copied once and uploaded to every main account; a rejected login on one provider must not cost the other its copy of the index. `usableMains` filters unsupported/incomplete entries *before* any network call, so the per-job logs only ever contain real failures.
+
+**"No main account configured" is logged once per process** (`Worker.noMainOnce`), not once per successful job. It is a standing state, not an event.
+
+**Main accounts stay out of the `accounts` table, deliberately.** That table feeds the upload modal *and* `GetUsersHandler`, which groups the backups table by account email — a row there would both offer the db-backup account as an upload target and invent a user row for it. `GET /api/accounts/main` therefore reads the in-memory `AccountStore` and returns provider, email and configuration state only; the credentials never reach the browser (`json:"-"` on every secret, plus a test asserting the response body contains none of them). The cost is that main accounts have no quota display and no `last_quota_sync` — nothing polls them. Revisit in phase 4.
+
+**`cloud.Connect` was deliberately *not* widened to reach main accounts.** It resolves credentials from `store.Accounts`, and every handler that takes a provider/email pair goes through it; teaching it about main accounts would make the db-backup account addressable as an upload target. `Worker.registryMainProvider` builds those through the registry directly instead.
+
+---
+
 ### .env credentials and special characters
 
 **`godotenv` expands `$` in unquoted AND double-quoted values.** A password like `paSs1$2178` silently becomes `paSs1` (everything from `$` is treated as a variable reference). This is a top cause of "wrong credentials" failures (e.g. MEGA's "Object not found").
@@ -490,7 +521,7 @@ OAuth tokens/consumer keys are hex and don't need quoting.
 - `internal/worker` owns the pool. Sizing: pool goroutines = `concurrency.max_workers`; a global semaphore caps simultaneous uploads at `concurrency.max_concurrent_uploads`; a per-account semaphore enforces `concurrency.max_concurrent_per_account`.
 - Jobs are claimed atomically with `UPDATE jobs SET status='in_progress' ... WHERE id=(SELECT ... WHERE status='pending' ... LIMIT 1) RETURNING id` so no two workers take the same job.
 - **Resume is whole-file, not chunk-level.** Provider upload sessions can't be reconstructed across a process restart, so `RequeueStaleJobs` resets `in_progress`→`pending` at startup and the job re-uploads from 0 (progress is reset per attempt). Chunk-level resume only happens within a single in-process attempt.
-- On success: verify the first chunk's checksum, refresh that account's quota, mark complete, then delete the temp zip **only when every sibling job sharing that zip is complete** (a failed sibling keeps it for retry), and back up the metadata DB to the main account.
+- On success: verify the first chunk's checksum, refresh that account's quota, mark complete, then delete the temp zip **only when every sibling job sharing that zip is complete** (a failed sibling keeps it for retry), and back up the metadata DB to **every configured main account**, each attempted independently.
 - The UI shows a **"verifying"** label when bytes are 100% uploaded but the job is still `in_progress` (post-upload checksum/finalize), so the bar doesn't look stuck.
 
 ---
