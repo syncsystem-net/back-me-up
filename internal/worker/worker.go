@@ -2,8 +2,9 @@
 // claims pending jobs from the database, uploads each job's zip to its provider
 // in chunks (reporting progress as it goes), retries with exponential backoff,
 // verifies the result, refreshes the account's quota, and backs up the metadata
-// database to the main account. The pool is provider-agnostic: it talks to the
-// provider registry, never to a concrete backend.
+// database to every configured main account (one per provider). The pool is
+// provider-agnostic: it talks to the provider registry, never to a concrete
+// backend.
 package worker
 
 import (
@@ -19,6 +20,8 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
+	"github.com/syncsystem-net/back-me-up/internal/provider/registry"
+	"github.com/syncsystem-net/back-me-up/internal/ratelimit"
 )
 
 // Config is the worker's slice of application configuration, pre-converted into
@@ -51,12 +54,23 @@ type Worker struct {
 
 	uploadSem chan struct{} // global ceiling on concurrent uploads
 
+	// newMainProvider builds (but does not log in) the provider for one main
+	// account. It is a field for the same reason handlers.connect and
+	// autosync.Manager.connect are: the metadata-DB fan-out is defined by what it
+	// does when one destination fails, and that is unreachable without injecting
+	// a backend. Production wiring is registryMainProvider.
+	newMainProvider func(m accounts.MainAccount) (provider.Provider, error)
+
+	// noMainOnce keeps "no main account configured" to a single log line for the
+	// life of the process instead of one per successful job.
+	noMainOnce sync.Once
+
 	mu      sync.Mutex
 	acctSem map[int64]chan struct{} // per-account concurrency limiter
 }
 
-// New builds a Worker. dbPath is the SQLite file, copied and uploaded to the
-// main account after each successful job.
+// New builds a Worker. dbPath is the SQLite file, copied once and uploaded to
+// every configured main account after each successful job.
 func New(db *sql.DB, accts *accounts.AccountStore, cfg Config, dbPath string) *Worker {
 	if cfg.MaxConcurrentUploads < 1 {
 		cfg.MaxConcurrentUploads = 1
@@ -75,7 +89,7 @@ func New(db *sql.DB, accts *accounts.AccountStore, cfg Config, dbPath string) *W
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 2 * time.Second
 	}
-	return &Worker{
+	w := &Worker{
 		db:        db,
 		accounts:  accts,
 		cfg:       cfg,
@@ -83,6 +97,20 @@ func New(db *sql.DB, accts *accounts.AccountStore, cfg Config, dbPath string) *W
 		uploadSem: make(chan struct{}, cfg.MaxConcurrentUploads),
 		acctSem:   make(map[int64]chan struct{}),
 	}
+	w.newMainProvider = w.registryMainProvider
+	return w
+}
+
+// registryMainProvider is the production newMainProvider: it builds a main
+// account's backend through the registry, so the worker still never imports a
+// concrete provider. It does not go through cloud.Connect, which resolves
+// credentials from the numbered accounts only — widening that would make the
+// db-backup account addressable as an upload target.
+func (w *Worker) registryMainProvider(m accounts.MainAccount) (provider.Provider, error) {
+	return registry.New(string(m.Provider), mainOAuth(m), provider.Config{
+		ChunkSizeBytes: w.cfg.ChunkSizeBytes,
+		RateLimiter:    ratelimit.For(string(m.Provider)),
+	})
 }
 
 // Start launches the pool and returns immediately. Workers run until ctx is
