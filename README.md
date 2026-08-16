@@ -19,6 +19,8 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - Quotas refresh automatically on a background interval (`quota.sync_interval_minutes`) and on demand via the "Refresh quotas now" button, in addition to refreshing after each successful upload.
 - Per-provider rate limiting (`rate_limits.<provider>`) paces API requests and upload bandwidth so a large backup stays within each provider's limits.
 - Periodic re-verification (`verification.periodic_check_days`) re-downloads the first chunk of a random sample of already-uploaded files on a schedule and compares it to the checksum recorded at upload time; mismatches surface in the per-job logs modal.
+- **Credentials are encrypted at rest** (AES-256-GCM, key derived from a `.env` passphrase plus a per-install salt) and live in the database rather than being re-read from `.env` on every boot — which matters because the metadata database is uploaded to your main accounts after every job. Lose the passphrase and every stored credential is lost; see "Credential storage and the passphrase".
+- **Re-authorize 4shared in one click.** An account whose token the provider rejected is flagged in the Accounts view with a button that runs the OAuth flow server-side and stores the new token — no `.env` edit, no restart.
 - Providers are pluggable: MEGA (email/password) and 4shared (OAuth 1.0) today, with a registry so new backends are a focused addition.
 
 ## Prerequisites
@@ -35,14 +37,16 @@ Backup tool that zips local directories and uploads them to cloud storage provid
    cp .env.example .env
    ```
 
-2. Edit `config.yml` to adjust settings (chunk size, retry policy, rate limits, etc.).
+2. Set `BACKMEUP_CREDENTIAL_PASSPHRASE` in `.env` to a long random string, and **store it somewhere you will still have if this machine dies**. It encrypts every stored password and token; see [Credential storage and the passphrase](#credential-storage-and-the-passphrase) — losing it loses every stored credential.
 
-3. Download dependencies:
+3. Edit `config.yml` to adjust settings (chunk size, retry policy, rate limits, etc.).
+
+4. Download dependencies:
    ```
    go mod download
    ```
 
-4. Run the server:
+5. Run the server:
    ```
    go run ./cmd/server
    ```
@@ -51,7 +55,7 @@ Backup tool that zips local directories and uploads them to cloud storage provid
    air
    ```
 
-5. Open `http://localhost:8080` in your browser.
+6. Open `http://localhost:8080` in your browser.
 
 ## Project Structure
 
@@ -61,7 +65,10 @@ cmd/fourshared-auth/   - One-time OAuth helper to authorize a 4shared account
 cmd/fourshared-test/   - Diagnostic: tests one 4shared account's credentials in isolation
 internal/
   config/              - YAML configuration loader
-  accounts/            - .env account parser (passwords + OAuth app/tokens)
+  accounts/            - .env parsing + the running credential set (concurrency-safe)
+  keyring/             - scrypt key derivation and AES-256-GCM sealing of credentials
+  credentials/         - Reconciles .env into the encrypted store; decides which copy wins
+  reauth/              - Server-side OAuth re-authorization flow (the Re-authorize button)
   database/            - SQLite setup, schema, and per-entity queries
   scanner/             - Recursive directory scanner (depth-capped, accent-insensitive excludes)
   archive/             - Zip creation
@@ -69,7 +76,7 @@ internal/
   provider/            - Cloud provider interface + Progress/OAuth types
     mega/              - MEGA implementation (chunked, encrypted)
     fourshared/        - 4shared implementation (OAuth 1.0 REST)
-    oauth1/            - Reusable OAuth 1.0a request signing
+    oauth1/            - Reusable OAuth 1.0a request signing + the 3-legged authorization flow
     registry/          - Maps provider name -> implementation
   server/              - HTTP server, routes, handlers
 web/
@@ -99,6 +106,8 @@ Application behavior is tuned in `config.yml`; every value has a sensible defaul
 | `scan.max_depth` | `3` | Directory levels below the source root recorded in a zip's tree. `3` records the root plus three levels; an omitted, `0`, or negative value falls back to 3 |
 | `ui.poll_seconds` | `10` | How often the browser re-fetches the table while nothing is uploading |
 | `ui.active_poll_seconds` | `2` | Refresh cadence used **only** while a job is pending or in progress, so progress bars stay smooth without polling hard when idle. Clamped to at most `poll_seconds` |
+| `reauth.callback_port` | `8723` | Port the temporary local listener binds during in-app re-authorization; must match the callback URL the provider's registered app accepts |
+| `reauth.timeout_minutes` | `5` | How long re-authorization waits for you to approve in the browser before giving up and releasing the port |
 
 Credentials are **not** in `config.yml` — they live in `.env` (see below).
 
@@ -123,6 +132,53 @@ If you already have `.zip` archives in a cloud account — uploaded before you u
 Nothing is written until you confirm. Auto-Sync never deletes anything, cloud or local.
 
 Notes and limits: only each account's **cloud root** is crawled (no nested folders), and only `.zip` files are adopted. A discovered archive's tree is read straight from the ZIP's central directory using ranged reads, so only the tail of the file is transferred — **except on 4shared**, whose ranged-read and file-size support are undocumented: if it can't range-read, the archive is downloaded once to read its directory (capped at ~2 GB — a larger archive is still adopted, just without a tree). Adopted archives aren't periodically re-verified (there's no upload-time checksum for them).
+
+## Credential storage and the passphrase
+
+Every cloud password and OAuth token is stored in the database, encrypted with **AES-256-GCM**. The key is derived with scrypt from `BACKMEUP_CREDENTIAL_PASSPHRASE` in `.env` plus a random per-install salt generated on first run and kept in the database. Each account's credentials are sealed as one document under a fresh nonce, bound to that account so a row copied over another fails to open rather than authenticating as the wrong account.
+
+This exists for one concrete reason: **the metadata database is uploaded to your main accounts after every successful job.** Unencrypted, your cloud passwords would routinely travel to the cloud in the clear.
+
+> ### ⚠️ Losing the passphrase loses every stored credential
+>
+> The passphrase is never written to the database it protects — if it were, it would travel with the backup and protect nothing. There is no recovery path and no reset.
+>
+> Losing it does **not** lose your backups: the archives stay in the cloud and your provider accounts are unaffected. But BackMeUp will refuse to use its stored credentials, and the only way forward is to clear them and set every password and re-authorize every 4shared account from scratch.
+>
+> Keep it somewhere that survives this machine. Changing it later is not supported yet.
+
+### What happens if the passphrase is missing or wrong
+
+The app **still starts**. Your records, trees and searches stay browsable, and a red banner at the top of the page names the key to fix. What it will not do is act: uploads, downloads, provider deletes, Auto-Sync, quota polling and the metadata DB backup all refuse with the same reason, queued jobs stay `pending`, and **nothing is re-encrypted** — so a wrong passphrase can never destroy credentials the right one would still open. Fix `.env` and restart.
+
+The startup log says so plainly:
+
+```
+level=ERROR msg="credentials are locked; the app is running read-only" reason="No credential passphrase is set. Add BACKMEUP_CREDENTIAL_PASSPHRASE to .env ..."
+```
+
+### `.env` is the way in; the database is the source of truth
+
+On first run with this build, every account in `.env` is imported into the database and encrypted (one `imported account from .env into the encrypted store` log line each). After that:
+
+| In `.env` | Effect on the stored account |
+|---|---|
+| A new `_EMAIL` entry | Creates the account |
+| A changed password / consumer key / secret / domain | Updates it |
+| A blank or deleted value | Ignored — absence never erases a stored credential |
+| A numbered account removed entirely | **Kept.** Removing an upload target has to be deliberate |
+| A `MAIN` account block removed | **Deleted** — `.env` is a main account's only removal path, and quietly continuing to copy your database to a destination you removed would be worse |
+| A `FOURSHARED_..._OAUTH_TOKEN` the app wrote itself via **Re-authorize** | **Not overwritten** by the older value still in `.env` |
+
+That last row is what makes the Re-authorize button worth having: without it, every restart would put the expired token back.
+
+### Re-authorizing 4shared from the app
+
+OAuth 1.0 has no refresh token, so a rejected token (`401.0301`) can only be replaced by authorizing again. When a provider rejects an account's token, BackMeUp records it: the account's card in the **Accounts** view gets a `needs re-authorization` badge and a **Re-authorize** button, and the flag survives a restart.
+
+Pressing it runs the OAuth dance server-side using that account's own consumer key/secret and `CONSUMER_DOMAIN`, tries to open your browser, and **always shows the authorize URL as a link** in case it doesn't. Approve access as that 4shared account; the new token is encrypted, written to the database, and used immediately — no `.env` edit, no restart.
+
+Requirements, all the same ones `cmd/fourshared-auth` has: the account needs `CONSUMER_KEY`, `CONSUMER_SECRET` and `CONSUMER_DOMAIN`, and the domain must be registered with the 4shared application and resolve to `127.0.0.1` (4shared rejects `localhost`). The listener binds `reauth.callback_port` (default `8723`, matching the CLI helper) and gives up after `reauth.timeout_minutes`. `cmd/fourshared-auth` still works for bootstrapping an account that has no stored row yet.
 
 ## .env Account Structure
 
@@ -162,6 +218,8 @@ After every successful job the metadata database is uploaded to **every** config
 Configuring **no** main account is supported and warns about nothing — it simply means no copy of your index is kept off this machine, so losing this machine loses the record of what was backed up where (the archives themselves remain in the cloud, and Auto-Sync can rebuild a record of them).
 
 A main account that is configured but **incomplete** (a MEGA one with no password, a 4shared one with no token) is a different matter: it is reported as a warning at startup naming the exact `.env` keys to fill in, and flagged in the Accounts view.
+
+Main accounts show their used/total quota and last-synced time in the Accounts view like any other account: the quota poller makes a second pass over them, writing to the `main_accounts` table (they are deliberately not rows in `accounts`, which drives the upload modal and the per-user table).
 
 > **Upgrading:** `MAIN_ACCOUNT_PROVIDER` / `MAIN_ACCOUNT_EMAIL` / `MAIN_ACCOUNT_PASSWORD` are no longer read. Leaving them in `.env` produces a startup warning naming the replacements; their values are **not** adopted, so rename them or your database backups will stop.
 
@@ -269,7 +327,7 @@ After each update, do the following:
 - **MEGA accounts not showing in modal**: Verify your `.env` has `MEGA_ACCOUNT_1_EMAIL` (a numbered backup account), not just `MEGA_ACCOUNT_MAIN_EMAIL`. A main account is shown in the Accounts view but is never offered as an upload target. See the account structure table above.
 - **MEGA upload fails with "Object (typically, node or user) not found" at login**: MEGA reports invalid credentials this way. The usual cause is a password containing `$` (or other special characters) that was silently corrupted by `.env` variable expansion — see the next item. Otherwise confirm you can log in with that exact email and password at <https://mega.nz>, that there are no stray spaces in `.env`, and that the account does not require two-factor authentication (2FA is not currently supported).
 - **A password/secret with `$`, `#`, backticks or spaces isn't accepted**: Unquoted and double-quoted `.env` values undergo variable expansion, so `PASSWORD=paSs1$2178` becomes `paSs1`. Wrap such values in **single** quotes to keep them literal: `MEGA_ACCOUNT_1_PASSWORD='paSs1$2178'`. (OAuth tokens are hex and don't need quoting.)
-- **4shared upload fails with `401 ... "token ... expired, rejected or does not exist"` (code `401.0301`)**: The account's OAuth access token is no longer valid server-side. **There is no token-expiry setting in this app** — the application sets no lifetime on tokens; an OAuth 1.0 access token's validity is controlled entirely by 4shared's servers, so it cannot be extended or configured from here. A token can become invalid because 4shared expired it, because the app was re-authorized (which invalidates the previous token), or because it was revoked. 4shared does not publish the exact lifetime. The fix is always to re-mint the token: re-run `go run ./cmd/fourshared-auth -account <n>` and paste the freshly printed `FOURSHARED_ACCOUNT_<n>_OAUTH_TOKEN`/`_SECRET` into `.env`, then restart the server. Run `go run ./cmd/fourshared-test -account <n>` (add `FOURSHARED_DEBUG=1` for verbose signing logs) to verify a token in isolation.
+- **4shared upload fails with `401 ... "token ... expired, rejected or does not exist"` (code `401.0301`)**: The account's OAuth access token is no longer valid server-side. **There is no token-expiry setting in this app** — the application sets no lifetime on tokens; an OAuth 1.0 access token's validity is controlled entirely by 4shared's servers, so it cannot be extended or configured from here. A token can become invalid because 4shared expired it, because the app was re-authorized (which invalidates the previous token), or because it was revoked. 4shared does not publish the exact lifetime. The fix is always to re-mint the token, and since PR #13 you can do it without leaving the app: the account's card in the **Accounts** view shows a `needs re-authorization` badge and a **Re-authorize** button that runs the flow and stores the new token immediately (see "Re-authorizing 4shared from the app"). The command-line route still works — `go run ./cmd/fourshared-auth -account <n>`, paste the printed `FOURSHARED_ACCOUNT_<n>_OAUTH_TOKEN`/`_SECRET` into `.env`, restart — and is what you need for an account that has no stored row yet. Run `go run ./cmd/fourshared-test -account <n>` (add `FOURSHARED_DEBUG=1` for verbose signing logs) to verify a token in isolation.
 - **"Delete Record And Files" reports files it could not delete**: The record is deliberately kept when some copies survive, so you don't silently orphan archives in the cloud. The modal lists each one with its provider, account, archive name and reason. Fix the cause (usually re-authorizing 4shared, see the item above) and press Delete again — copies that were already removed on the first attempt report "not found", which counts as success, so a retry converges. If you'd rather not fix it now, **Remove record anyway** drops the local record only; the listed files stay on their accounts and you'll have to delete them from the provider's own web UI.
 - **A record won't delete because its file no longer exists on the provider**: Fixed. A remote file that is already gone is treated as deleted rather than as an error, so records that Auto-Sync flagged as having a missing remote copy can now be removed normally.
 - **A directory I expected is missing from a zip's file tree**: Three possible causes, in order of likelihood. (1) It matches an **exclude term** — check the Settings modal; matching ignores case and accents, so `conteudo` also hides "Conteúdo". (2) It sits deeper than `scan.max_depth` (default 3 levels below the source root). (3) The tree was recorded **before** the term or depth changed — trees are captured at upload time and never rewritten, so re-upload the record to refresh it. Note that in every case the directory is still **inside the uploaded zip**; only the recorded tree is filtered.
