@@ -187,12 +187,21 @@ func (m *Manager) Cancel() {
 func (m *Manager) preview(ctx context.Context) {
 	defer m.finish()
 
-	if m.store == nil || len(m.store.Accounts) == 0 {
+	// Locked credentials would fail every account with the same reason, so say it
+	// once as the run's outcome instead of as a per-account error.
+	// Failed, not preview_ready: a preview the user can press Apply on implies a
+	// crawl that found nothing, when in fact no crawl happened.
+	if reason := m.store.LockReason(); reason != "" {
+		m.settle(PhaseFailed, "Credentials are locked: "+reason, "")
+		return
+	}
+	configured := m.store.All()
+	if len(configured) == 0 {
 		m.settle(PhasePreviewReady, "", "No accounts are configured.")
 		return
 	}
 
-	for _, a := range m.store.Accounts {
+	for _, a := range configured {
 		if ctx.Err() != nil {
 			m.settle(PhaseCancelled, "", "Cancelled.")
 			return

@@ -1,14 +1,31 @@
+// Package accounts models the cloud accounts this application uploads to, and
+// holds the credential set the rest of the app resolves against.
+//
+// Since PR #13 the .env file is no longer the running source of truth: LoadEnv
+// parses it, the credentials package reconciles it into the database, and the
+// AccountStore is populated from there. .env remains how an account is added or
+// a password changed, but a credential the application itself obtains (a
+// re-authorized 4shared token) lives only in the database and must survive a
+// restart — which it cannot do if .env is replayed over it on every boot.
 package accounts
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/joho/godotenv"
 )
+
+// ErrLocked means the stored credentials could not be opened — the passphrase is
+// missing or wrong. Every path that needs a credential wraps it, so the API can
+// answer with one consistent status and the UI can explain the real cause rather
+// than reporting each account as unconfigured.
+var ErrLocked = errors.New("credentials are locked")
 
 type ProviderType string
 
@@ -26,6 +43,15 @@ var providerEnv = []struct {
 }{
 	{ProviderMega, "MEGA_ACCOUNT"},
 	{ProviderFourShared, "FOURSHARED_ACCOUNT"},
+}
+
+// Providers returns the providers configurable from .env, in a stable order.
+func Providers() []ProviderType {
+	out := make([]ProviderType, 0, len(providerEnv))
+	for _, pe := range providerEnv {
+		out = append(out, pe.Provider)
+	}
+	return out
 }
 
 // legacyMainKeys are the pre-phase-3 single-main-account keys. They are no
@@ -50,6 +76,17 @@ type Account struct {
 	ConsumerSecret   string
 	OAuthToken       string
 	OAuthTokenSecret string
+
+	// ConsumerDomain is the callback domain registered with the provider's
+	// application. Stored because the in-app re-authorization flow needs it to
+	// build a callback URL the provider will accept; 4shared rejects localhost.
+	ConsumerDomain string
+
+	// NeedsReauth is set when the provider rejected this account's token as
+	// expired. It is stored in the database, so it survives a restart and can be
+	// shown in the Accounts view rather than only in a failed job's logs.
+	NeedsReauth  bool
+	ReauthReason string
 }
 
 // MainAccount is a provider's database-backup destination: it receives a copy of
@@ -62,10 +99,10 @@ type Account struct {
 // stand on its own — before this it had to borrow them from a numbered account
 // that happened to share its email address.
 //
-// Main accounts are deliberately NOT synced to the accounts database table:
-// that table feeds the upload-target modal and the per-user backups table, so a
-// row there would offer the db-backup account as an upload target and invent a
-// user row for it.
+// Main accounts are deliberately NOT rows in the accounts database table: that
+// table feeds the upload-target modal and the per-user backups table, so a row
+// there would offer the db-backup account as an upload target and invent a user
+// row for it. They have their own table instead.
 type MainAccount struct {
 	Provider ProviderType `json:"provider"`
 	Email    string       `json:"email"`
@@ -75,6 +112,10 @@ type MainAccount struct {
 	ConsumerSecret   string `json:"-"`
 	OAuthToken       string `json:"-"`
 	OAuthTokenSecret string `json:"-"`
+	ConsumerDomain   string `json:"-"`
+
+	NeedsReauth  bool   `json:"needs_reauth"`
+	ReauthReason string `json:"reauth_reason,omitempty"`
 }
 
 // MissingKeys returns the full .env key names this main account needs but does
@@ -134,27 +175,24 @@ func (m MainAccount) Usable() bool { return len(m.MissingKeys()) == 0 }
 type OAuthApp struct {
 	ConsumerKey    string
 	ConsumerSecret string
+	Domain         string
 }
 
-type AccountStore struct {
-	// Mains holds the configured database-backup accounts, at most one per
-	// provider, in providerEnv order. Providers with no main account configured
-	// are simply absent.
-	Mains    []MainAccount
-	Accounts []Account
-
-	// FourShared is an optional fallback 4shared consumer key/secret applied to
-	// any 4shared account that doesn't set its own FOURSHARED_ACCOUNT_<n>_CONSUMER_*.
-	// Lets a single shared app cover all accounts when per-account apps aren't used.
+// EnvConfig is what .env declares. It is an input to reconciliation, not the
+// running credential set: the database is authoritative once the first import
+// has happened.
+type EnvConfig struct {
+	Mains      []MainAccount
+	Accounts   []Account
 	FourShared OAuthApp
 }
 
-// MainFor returns the main account configured for a provider, if any.
-func (s *AccountStore) MainFor(provider ProviderType) (MainAccount, bool) {
-	if s == nil {
+// MainFor returns the main account .env declares for a provider, if any.
+func (c *EnvConfig) MainFor(provider ProviderType) (MainAccount, bool) {
+	if c == nil {
 		return MainAccount{}, false
 	}
-	for _, m := range s.Mains {
+	for _, m := range c.Mains {
 		if m.Provider == provider {
 			return m, true
 		}
@@ -162,69 +200,221 @@ func (s *AccountStore) MainFor(provider ProviderType) (MainAccount, bool) {
 	return MainAccount{}, false
 }
 
-func Load(envPath string) (*AccountStore, error) {
+// AccountStore is the running credential set, shared by the worker, the HTTP
+// handlers, the quota poller and Auto-Sync.
+//
+// It is read from several goroutines and rewritten at runtime — the
+// re-authorization flow replaces an account's token without a restart — so its
+// contents are guarded rather than exposed as fields. Readers get copies; there
+// is no way to hold a reference into the live slice and observe a torn update.
+type AccountStore struct {
+	mu         sync.RWMutex
+	mains      []MainAccount
+	accounts   []Account
+	fourShared OAuthApp
+
+	// lockReason is non-empty when credentials could not be unsealed (no
+	// passphrase, or the wrong one). The store is then empty and every credential
+	// path refuses with this reason rather than reporting "account not
+	// configured", which would send the user looking in the wrong place.
+	lockReason string
+}
+
+// NewStore returns a store holding the given credential set.
+func NewStore(mains []MainAccount, accts []Account, app OAuthApp) *AccountStore {
+	s := &AccountStore{}
+	s.Replace(mains, accts, app)
+	return s
+}
+
+// Replace swaps in a new credential set atomically.
+func (s *AccountStore) Replace(mains []MainAccount, accts []Account, app OAuthApp) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mains = append([]MainAccount(nil), mains...)
+	s.accounts = append([]Account(nil), accts...)
+	s.fourShared = app
+	s.lockReason = ""
+}
+
+// Lock marks the store unusable and empties it. Called when the credential
+// passphrase is missing or wrong: the credentials on disk are intact but cannot
+// be opened, and nothing may act on them until that is fixed.
+func (s *AccountStore) Lock(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mains = nil
+	s.accounts = nil
+	s.lockReason = reason
+}
+
+// LockReason returns why credentials are unavailable, or "" when the store is
+// usable.
+func (s *AccountStore) LockReason() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lockReason
+}
+
+// IsLocked reports whether credentials are unavailable.
+func (s *AccountStore) IsLocked() bool { return s.LockReason() != "" }
+
+// All returns every numbered (upload-target) account.
+func (s *AccountStore) All() []Account {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]Account(nil), s.accounts...)
+}
+
+// Mains returns the configured database-backup accounts, at most one per
+// provider, in providerEnv order.
+func (s *AccountStore) Mains() []MainAccount {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]MainAccount(nil), s.mains...)
+}
+
+// MainFor returns the main account configured for a provider, if any.
+func (s *AccountStore) MainFor(provider ProviderType) (MainAccount, bool) {
+	if s == nil {
+		return MainAccount{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.mains {
+		if m.Provider == provider {
+			return m, true
+		}
+	}
+	return MainAccount{}, false
+}
+
+// Find returns the numbered account for a (provider, email) pair.
+func (s *AccountStore) Find(provider, email string) (Account, bool) {
+	if s == nil {
+		return Account{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.accounts {
+		if string(a.Provider) == provider && a.Email == email {
+			return a, true
+		}
+	}
+	return Account{}, false
+}
+
+// GetByProvider returns every numbered account belonging to one provider.
+func (s *AccountStore) GetByProvider(provider ProviderType) []Account {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []Account
+	for _, a := range s.accounts {
+		if a.Provider == provider {
+			result = append(result, a)
+		}
+	}
+	return result
+}
+
+// FourSharedApp returns the optional shared 4shared consumer credentials.
+func (s *AccountStore) FourSharedApp() OAuthApp {
+	if s == nil {
+		return OAuthApp{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.fourShared
+}
+
+// LoadEnv reads .env and returns what it declares. It does not decide anything:
+// the credentials package reconciles this against the database, which is where
+// the running credential set comes from.
+//
+// Loading also populates the process environment (godotenv), so callers can read
+// other .env entries — notably the credential passphrase — afterwards.
+func LoadEnv(envPath string) (*EnvConfig, error) {
 	if err := godotenv.Load(envPath); err != nil {
 		return nil, fmt.Errorf("loading .env file: %w", err)
 	}
 
-	store := &AccountStore{}
+	cfg := &EnvConfig{}
 
 	warnLegacyMainKeys()
 
 	// Optional shared fallback for 4shared accounts that don't set their own.
-	store.FourShared = OAuthApp{
+	cfg.FourShared = OAuthApp{
 		ConsumerKey:    os.Getenv("FOURSHARED_CONSUMER_KEY"),
 		ConsumerSecret: os.Getenv("FOURSHARED_CONSUMER_SECRET"),
+		Domain:         os.Getenv("FOURSHARED_CONSUMER_DOMAIN"),
 	}
 
 	for _, pe := range providerEnv {
 		if main, ok := loadMainAccount(pe.Provider, pe.Prefix); ok {
-			store.Mains = append(store.Mains, main)
+			cfg.Mains = append(cfg.Mains, main)
 		}
-		store.Accounts = append(store.Accounts, loadProviderAccounts(pe.Provider, pe.Prefix)...)
+		cfg.Accounts = append(cfg.Accounts, loadProviderAccounts(pe.Provider, pe.Prefix)...)
 	}
 
 	// Apply the shared 4shared consumer fallback where an account omitted its own.
 	// Main accounts get the same treatment as numbered ones: a single registered
 	// app can cover every 4shared account, main included.
-	for i := range store.Accounts {
-		a := &store.Accounts[i]
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
 		if a.Provider == ProviderFourShared {
-			a.ConsumerKey, a.ConsumerSecret = withFallback(a.ConsumerKey, a.ConsumerSecret, store.FourShared)
+			a.ConsumerKey, a.ConsumerSecret, a.ConsumerDomain =
+				withFallback(a.ConsumerKey, a.ConsumerSecret, a.ConsumerDomain, cfg.FourShared)
 		}
 	}
-	for i := range store.Mains {
-		m := &store.Mains[i]
+	for i := range cfg.Mains {
+		m := &cfg.Mains[i]
 		if m.Provider == ProviderFourShared {
-			m.ConsumerKey, m.ConsumerSecret = withFallback(m.ConsumerKey, m.ConsumerSecret, store.FourShared)
+			m.ConsumerKey, m.ConsumerSecret, m.ConsumerDomain =
+				withFallback(m.ConsumerKey, m.ConsumerSecret, m.ConsumerDomain, cfg.FourShared)
 		}
 	}
 
-	// A main account that is configured but incomplete is a misconfiguration the
-	// user wants to hear about; one that is absent is a supported choice and stays
-	// silent. Checked after the consumer fallback so a shared app doesn't get
-	// reported as missing.
-	for _, m := range store.Mains {
+	slog.Info("read accounts from .env", "total", len(cfg.Accounts), "main_accounts", len(cfg.Mains))
+	return cfg, nil
+}
+
+// WarnIncompleteMains reports main accounts that are configured but missing
+// credentials they need. A main account that is absent entirely is a supported
+// choice and stays silent; only a half-configured one is worth a warning.
+func WarnIncompleteMains(mains []MainAccount) {
+	for _, m := range mains {
 		if missing := m.MissingKeys(); len(missing) > 0 {
 			slog.Warn("main account is incompletely configured; it cannot receive the metadata database backup",
 				"provider", m.Provider, "email", m.Email,
 				"missing", strings.Join(missing, ", "))
 		}
 	}
-
-	slog.Info("accounts loaded", "total", len(store.Accounts), "main_accounts", len(store.Mains))
-	return store, nil
 }
 
 // withFallback fills empty per-account consumer credentials from the shared app.
-func withFallback(key, secret string, app OAuthApp) (string, string) {
+func withFallback(key, secret, domain string, app OAuthApp) (string, string, string) {
 	if key == "" {
 		key = app.ConsumerKey
 	}
 	if secret == "" {
 		secret = app.ConsumerSecret
 	}
-	return key, secret
+	if domain == "" {
+		domain = app.Domain
+	}
+	return key, secret, domain
 }
 
 // warnLegacyMainKeys reports any leftover MAIN_ACCOUNT_* keys and names their
@@ -249,6 +439,26 @@ func warnLegacyMainKeys() {
 // its index: MEGA_ACCOUNT_MAIN_EMAIL alongside MEGA_ACCOUNT_1_EMAIL.
 const mainSuffix = "MAIN"
 
+// EnvSlot is the .env key fragment identifying an account: its index, or MAIN
+// for a database-backup account. Used when telling the user which keys to edit.
+func EnvSlot(index int) string {
+	if index <= 0 {
+		return mainSuffix
+	}
+	return strconv.Itoa(index)
+}
+
+// KeyPrefix returns the .env prefix for one account slot, e.g.
+// "FOURSHARED_ACCOUNT_2". Messages quote real keys so they can be pasted.
+func KeyPrefix(provider ProviderType, index int) string {
+	for _, pe := range providerEnv {
+		if pe.Provider == provider {
+			return pe.Prefix + "_" + EnvSlot(index)
+		}
+	}
+	return strings.ToUpper(string(provider)) + "_ACCOUNT_" + EnvSlot(index)
+}
+
 // loadMainAccount reads <prefix>_MAIN_* . An unset email means this provider has
 // no main account, which is a supported configuration, not an error.
 func loadMainAccount(provider ProviderType, prefix string) (MainAccount, bool) {
@@ -264,6 +474,7 @@ func loadMainAccount(provider ProviderType, prefix string) (MainAccount, bool) {
 		Password:         os.Getenv(key("_PASSWORD")),
 		ConsumerKey:      os.Getenv(key("_CONSUMER_KEY")),
 		ConsumerSecret:   os.Getenv(key("_CONSUMER_SECRET")),
+		ConsumerDomain:   os.Getenv(key("_CONSUMER_DOMAIN")),
 		OAuthToken:       os.Getenv(key("_OAUTH_TOKEN")),
 		OAuthTokenSecret: os.Getenv(key("_OAUTH_TOKEN_SECRET")),
 	}, true
@@ -297,19 +508,10 @@ func loadProviderAccounts(provider ProviderType, prefix string) []Account {
 			Index:            i,
 			ConsumerKey:      os.Getenv(fmt.Sprintf("%s_%d_CONSUMER_KEY", prefix, i)),
 			ConsumerSecret:   os.Getenv(fmt.Sprintf("%s_%d_CONSUMER_SECRET", prefix, i)),
+			ConsumerDomain:   os.Getenv(fmt.Sprintf("%s_%d_CONSUMER_DOMAIN", prefix, i)),
 			OAuthToken:       os.Getenv(fmt.Sprintf("%s_%d_OAUTH_TOKEN", prefix, i)),
 			OAuthTokenSecret: os.Getenv(fmt.Sprintf("%s_%d_OAUTH_TOKEN_SECRET", prefix, i)),
 		})
 	}
 	return accounts
-}
-
-func (s *AccountStore) GetByProvider(provider ProviderType) []Account {
-	var result []Account
-	for _, a := range s.Accounts {
-		if a.Provider == provider {
-			result = append(result, a)
-		}
-	}
-	return result
 }

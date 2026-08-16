@@ -32,7 +32,10 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	store, err := accounts.Load(".env")
+	// This tool diagnoses what .env declares, deliberately bypassing the encrypted
+	// store: when a token is rejected the question is usually whether the value in
+	// .env is the one being used, and reading the database would hide that.
+	store, err := accounts.LoadEnv(".env")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "loading .env: %v\n", err)
 		os.Exit(1)
@@ -44,7 +47,14 @@ func main() {
 	// end of a job and only logs — is the sole other place it would show up.
 	var email, consumerKey, consumerSecret, token, tokenSecret string
 	if strings.EqualFold(strings.TrimSpace(*account), "main") {
-		m, ok := store.MainFor(accounts.ProviderFourShared)
+		var m accounts.MainAccount
+		ok := false
+		for _, candidate := range store.Mains {
+			if candidate.Provider == accounts.ProviderFourShared {
+				m, ok = candidate, true
+				break
+			}
+		}
 		if !ok {
 			fmt.Fprintln(os.Stderr, "no FOURSHARED_ACCOUNT_MAIN_EMAIL found in .env")
 			os.Exit(1)

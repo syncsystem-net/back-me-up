@@ -133,6 +133,11 @@ func (h *Handlers) deleteRemoteFiles(ctx context.Context, jobs []*database.Job) 
 // counts as deleted, so the job record still goes away. Route: DELETE
 // /api/jobs/{id}.
 func (h *Handlers) DeleteJob(w http.ResponseWriter, r *http.Request) {
+	// Deleting from a provider needs a credential; with the store locked every
+	// archive would be reported as unreachable for the wrong reason.
+	if h.refuseWhenLocked(w) {
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		jsonError(w, "invalid job id", http.StatusBadRequest)
@@ -183,6 +188,9 @@ func (h *Handlers) DeleteJob(w http.ResponseWriter, r *http.Request) {
 // removes the local record only, touching no provider. Route: DELETE
 // /api/backups/{id}.
 func (h *Handlers) DeleteBackup(w http.ResponseWriter, r *http.Request) {
+	if h.refuseWhenLocked(w) {
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		jsonError(w, "invalid backup id", http.StatusBadRequest)

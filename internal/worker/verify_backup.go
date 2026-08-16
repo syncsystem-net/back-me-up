@@ -82,12 +82,13 @@ func (w *Worker) backupDatabase(ctx context.Context) {
 		// would contradict the startup log and send them looking in the wrong
 		// place.
 		w.noMainOnce.Do(func() {
-			if w.accounts == nil || len(w.accounts.Mains) == 0 {
+			configured := len(w.accounts.Mains())
+			if configured == 0 {
 				slog.Info("no main account configured; the metadata database is not being copied off this machine")
 				return
 			}
 			slog.Warn("no usable main account; the metadata database is not being copied off this machine",
-				"configured", len(w.accounts.Mains))
+				"configured", configured)
 		})
 		return
 	}
@@ -149,31 +150,13 @@ func (w *Worker) uploadDBToMains(ctx context.Context, mains []accounts.MainAccou
 // silently — it runs after every completed job, and a standing misconfiguration
 // must not produce a line per upload.
 func (w *Worker) usableMains() []accounts.MainAccount {
-	if w.accounts == nil {
-		return nil
-	}
 	var usable []accounts.MainAccount
-	for _, m := range w.accounts.Mains {
+	for _, m := range w.accounts.Mains() {
 		if m.Usable() && registry.Supported(string(m.Provider)) {
 			usable = append(usable, m)
 		}
 	}
 	return usable
-}
-
-// mainOAuth supplies OAuth creds when the main account is an OAuth provider.
-// A main account carries its own consumer credentials and access token, so
-// nothing here has to look them up on a numbered account.
-func mainOAuth(m accounts.MainAccount) provider.OAuthCreds {
-	if m.Provider != accounts.ProviderFourShared {
-		return provider.OAuthCreds{}
-	}
-	return provider.OAuthCreds{
-		ConsumerKey:    m.ConsumerKey,
-		ConsumerSecret: m.ConsumerSecret,
-		Token:          m.OAuthToken,
-		TokenSecret:    m.OAuthTokenSecret,
-	}
 }
 
 // cappedHasher hashes the bytes written to it until limit is reached, then
