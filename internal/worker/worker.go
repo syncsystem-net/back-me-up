@@ -20,8 +20,6 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
-	"github.com/syncsystem-net/back-me-up/internal/provider/registry"
-	"github.com/syncsystem-net/back-me-up/internal/ratelimit"
 )
 
 // Config is the worker's slice of application configuration, pre-converted into
@@ -65,6 +63,11 @@ type Worker struct {
 	// life of the process instead of one per successful job.
 	noMainOnce sync.Once
 
+	// lockedOnce likewise: locked credentials are a standing state, and every
+	// worker goroutine polls, so without this the log fills at the poll interval
+	// times max_workers.
+	lockedOnce sync.Once
+
 	mu      sync.Mutex
 	acctSem map[int64]chan struct{} // per-account concurrency limiter
 }
@@ -107,10 +110,7 @@ func New(db *sql.DB, accts *accounts.AccountStore, cfg Config, dbPath string) *W
 // credentials from the numbered accounts only — widening that would make the
 // db-backup account addressable as an upload target.
 func (w *Worker) registryMainProvider(m accounts.MainAccount) (provider.Provider, error) {
-	return registry.New(string(m.Provider), mainOAuth(m), provider.Config{
-		ChunkSizeBytes: w.cfg.ChunkSizeBytes,
-		RateLimiter:    ratelimit.For(string(m.Provider)),
-	})
+	return cloud.NewMain(m, w.cfg.ChunkSizeBytes)
 }
 
 // Start launches the pool and returns immediately. Workers run until ctx is
@@ -136,6 +136,19 @@ func (w *Worker) loop(ctx context.Context, id int) {
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+		// Claiming a job while credentials are locked would move it to in_progress
+		// only to fail it: the upload cannot authenticate. Leave it pending so it
+		// runs once the passphrase is fixed, exactly like a job queued before a
+		// restart.
+		if w.accounts.IsLocked() {
+			w.lockedOnce.Do(func() {
+				slog.Warn("not claiming jobs: credentials are locked", "reason", w.accounts.LockReason())
+			})
+			if !sleep(ctx, w.cfg.PollInterval) {
+				return
+			}
+			continue
 		}
 		job, err := database.ClaimNextPendingJob(w.db)
 		if err != nil {

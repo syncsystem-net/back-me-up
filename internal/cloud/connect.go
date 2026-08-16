@@ -21,9 +21,16 @@ import (
 // provider is bound to that single account and ready for Upload/Download/
 // Delete/FindByName/GetQuota.
 func Connect(ctx context.Context, store *accounts.AccountStore, providerName, email string, chunkSizeBytes int64) (provider.Provider, error) {
-	acct, ok := findAccount(store, providerName, email)
+	// A locked store is empty, so without this check every credential operation
+	// would report "no credentials for this account" and send the user looking in
+	// the wrong place. The credentials are on disk and intact; they just cannot
+	// be opened.
+	if reason := store.LockReason(); reason != "" {
+		return nil, fmt.Errorf("%w: %s", accounts.ErrLocked, reason)
+	}
+	acct, ok := store.Find(providerName, email)
 	if !ok {
-		return nil, fmt.Errorf("no credentials in .env for %s account %s", providerName, email)
+		return nil, fmt.Errorf("no stored credentials for %s account %s", providerName, email)
 	}
 	p, err := registry.New(providerName, oauthFor(acct), provider.Config{
 		ChunkSizeBytes: chunkSizeBytes,
@@ -32,22 +39,48 @@ func Connect(ctx context.Context, store *accounts.AccountStore, providerName, em
 	if err != nil {
 		return nil, err
 	}
+	// Wrapped before Login so a rejected token is noticed there too — that is the
+	// most common place an expired one shows up.
+	p = watch(p, providerName, email, false)
 	if err := p.Login(ctx, acct.Email, acct.Password); err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 
-func findAccount(store *accounts.AccountStore, providerName, email string) (accounts.Account, bool) {
-	if store == nil {
-		return accounts.Account{}, false
+// NewMain builds — but does not log in — the backend for a database-backup
+// account.
+//
+// It is deliberately a separate entry point rather than a widening of Connect.
+// Connect resolves credentials from the numbered accounts only, and every
+// handler that takes a provider/email pair goes through it; teaching it about
+// main accounts would make the db-backup account addressable as an upload
+// target. Callers here already hold the MainAccount and have to have gone
+// looking for it.
+func NewMain(m accounts.MainAccount, chunkSizeBytes int64) (provider.Provider, error) {
+	p, err := registry.New(string(m.Provider), MainOAuth(m), provider.Config{
+		ChunkSizeBytes: chunkSizeBytes,
+		RateLimiter:    ratelimit.For(string(m.Provider)),
+	})
+	if err != nil {
+		return nil, err
 	}
-	for _, a := range store.Accounts {
-		if string(a.Provider) == providerName && a.Email == email {
-			return a, true
-		}
+	return watch(p, string(m.Provider), m.Email, true), nil
+}
+
+// MainOAuth supplies OAuth creds when the main account is an OAuth provider. A
+// main account carries its own consumer credentials and access token, so nothing
+// here has to look them up on a numbered account.
+func MainOAuth(m accounts.MainAccount) provider.OAuthCreds {
+	if m.Provider != accounts.ProviderFourShared {
+		return provider.OAuthCreds{}
 	}
-	return accounts.Account{}, false
+	return provider.OAuthCreds{
+		ConsumerKey:    m.ConsumerKey,
+		ConsumerSecret: m.ConsumerSecret,
+		Token:          m.OAuthToken,
+		TokenSecret:    m.OAuthTokenSecret,
+	}
 }
 
 func oauthFor(a accounts.Account) provider.OAuthCreds {

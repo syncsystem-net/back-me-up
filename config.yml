@@ -50,3 +50,16 @@ scan:
   # tree. 3 records the root plus three levels beneath it. Directory names to
   # leave out of the tree are managed in the app's Settings modal, not here.
   max_depth: 3
+
+reauth:
+  # The in-app "Re-authorize" button runs the provider's OAuth flow and needs a
+  # local listener for the callback. callback_port must match the port in the
+  # callback URL the provider's registered application accepts — 4shared rejects
+  # localhost as an application domain, so the domain in .env
+  # (FOURSHARED_ACCOUNT_<n>_CONSUMER_DOMAIN) must resolve to 127.0.0.1. This
+  # matches cmd/fourshared-auth's default, so an app registered for that tool
+  # works here unchanged.
+  callback_port: 8723
+  # How long to wait for you to approve access in the browser before giving up
+  # and releasing the port.
+  timeout_minutes: 5

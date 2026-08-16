@@ -63,6 +63,16 @@ document.addEventListener('alpine:init', () => {
         // when it is.
         mainAccounts: [],
         mainAccountsLoaded: false,
+        // Whether the server could open the stored credentials. Locked means the
+        // passphrase is missing or wrong: the app runs, records stay browsable,
+        // and every cloud action refuses. It can only change across a restart, so
+        // it is fetched on load rather than polled.
+        credentials: { locked: false, reason: '', env_key: '' },
+        // In-flight re-authorization, mirrored from the server. The flow spans a
+        // browser round trip, so the modal polls rather than awaiting one request.
+        reauthRun: { phase: 'idle' },
+        showReauthModal: false,
+        reauthError: '',
         search: '',
         refreshingQuotas: false,
         error: '',
@@ -136,7 +146,8 @@ document.addEventListener('alpine:init', () => {
             // first fetch rejects (server still starting under Air), or the page
             // never recovers for the rest of the session.
             try {
-                await Promise.all([this.loadUsers(), this.loadAccounts(), this.loadMainAccounts(), this.loadSettings()]);
+                await Promise.all([this.loadUsers(), this.loadAccounts(), this.loadMainAccounts(),
+                    this.loadSettings(), this.loadCredentials()]);
             } finally {
                 this.scheduleRefresh();
             }
@@ -175,6 +186,9 @@ document.addEventListener('alpine:init', () => {
             // Only poll the crawl while its modal is open — it is a deliberate,
             // user-triggered operation, not background state the table needs.
             if (this.showAutoSyncModal && this.autoSyncStarted) await this.loadAutoSync();
+            // Same rule as the crawl: only poll the re-authorization while its
+            // modal is open, since it is a deliberate one-off action.
+            if (this.showReauthModal) await this.loadReauth();
         },
         async loadUsers() {
             const r = await fetch('/api/users');
@@ -199,6 +213,71 @@ document.addEventListener('alpine:init', () => {
         openAccountsPage() {
             this.page = 'accounts';
             this.loadMainAccounts();
+            this.loadAccounts();
+            this.loadCredentials();
+        },
+        async loadCredentials() {
+            const r = await fetch('/api/credentials');
+            if (!r.ok) return;
+            this.credentials = await r.json() || { locked: false };
+        },
+
+        // ---- Re-authorization (4shared OAuth) ----
+        // OAuth 1.0 has no refresh token, so an expired one can only be replaced
+        // by authorizing again. The server runs the flow and writes the new token
+        // straight to the encrypted store; this drives and watches it.
+        needsReauth(a) { return !!(a && a.needs_reauth); },
+        canReauth(a) { return !!(a && a.provider === 'fourshared'); },
+        async startReauth(provider, email, isMain) {
+            this.reauthError = '';
+            this.reauthRun = { phase: 'starting', provider, email, is_main: !!isMain };
+            this.showReauthModal = true;
+            try {
+                const r = await fetch('/api/reauth/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider, email, is_main: !!isMain }),
+                });
+                const body = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                    this.reauthError = body.error || 'Could not start re-authorization.';
+                    this.reauthRun = { phase: 'error', provider, email };
+                    return;
+                }
+                this.reauthRun = body;
+            } catch (e) {
+                this.reauthError = String(e);
+                this.reauthRun = { phase: 'error', provider, email };
+            } finally {
+                // The run creates work the poll should watch, so re-arm now rather
+                // than waiting out an already-armed idle timer.
+                this.scheduleRefresh();
+            }
+        },
+        async loadReauth() {
+            const r = await fetch('/api/reauth');
+            if (!r.ok) return;
+            const before = this.reauthRun && this.reauthRun.phase;
+            this.reauthRun = await r.json() || { phase: 'idle' };
+            // A finished run changes stored credentials, so the account cards must
+            // be re-read to drop the "needs re-authorization" flag.
+            if (before !== 'done' && this.reauthRun.phase === 'done') {
+                await Promise.all([this.loadAccounts(), this.loadMainAccounts()]);
+            }
+        },
+        async cancelReauth() {
+            await fetch('/api/reauth/cancel', { method: 'POST' }).catch(() => {});
+            await this.loadReauth();
+        },
+        closeReauthModal() {
+            // Closing while the flow is still waiting would leave the callback
+            // listener bound with nothing watching it, so closing cancels.
+            if (this.reauthInFlight()) this.cancelReauth();
+            this.showReauthModal = false;
+        },
+        reauthInFlight() {
+            const p = this.reauthRun && this.reauthRun.phase;
+            return p === 'starting' || p === 'awaiting' || p === 'exchanging';
         },
         hasActiveJobs() {
             return this.users.some(u => (u.jobs || []).some(j => j.status === 'pending' || j.status === 'in_progress'));
@@ -210,7 +289,10 @@ document.addEventListener('alpine:init', () => {
             const p = this.autoSyncRun && this.autoSyncRun.phase;
             return this.showAutoSyncModal && (p === 'previewing' || p === 'applying');
         },
-        needsFastPoll() { return this.hasActiveJobs() || this.autoSyncRunning(); },
+        // A waiting re-authorization produces no job either, and the user is
+        // staring at the modal for the moment it completes — so it opts into the
+        // fast cadence the same way the crawl does.
+        needsFastPoll() { return this.hasActiveJobs() || this.autoSyncRunning() || this.reauthInFlight(); },
 
         // ---- Header totals ----
         activeAccountsCount() { return this.accounts.length; },

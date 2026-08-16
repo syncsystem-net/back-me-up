@@ -32,7 +32,7 @@ func resetAccountEnv(t *testing.T) {
 }
 
 // loadEnv writes body to a temp .env and loads it.
-func loadEnv(t *testing.T, body string) *AccountStore {
+func loadEnv(t *testing.T, body string) *EnvConfig {
 	t.Helper()
 	store, _ := loadEnvWithLog(t, body)
 	return store
@@ -42,7 +42,7 @@ func loadEnv(t *testing.T, body string) *AccountStore {
 // Load to the warnings it promises: several acceptance criteria are *about* the
 // message (it must name the missing keys, it must name the replacement keys),
 // which reading the store cannot check.
-func loadEnvWithLog(t *testing.T, body string) (*AccountStore, string) {
+func loadEnvWithLog(t *testing.T, body string) (*EnvConfig, string) {
 	t.Helper()
 	resetAccountEnv(t)
 	path := filepath.Join(t.TempDir(), ".env")
@@ -55,11 +55,11 @@ func loadEnvWithLog(t *testing.T, body string) (*AccountStore, string) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 
-	store, err := Load(path)
+	cfg, err := LoadEnv(path)
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatalf("LoadEnv: %v", err)
 	}
-	return store, buf.String()
+	return cfg, buf.String()
 }
 
 func TestLoadMainAccountPerProvider(t *testing.T) {
@@ -254,16 +254,45 @@ FOURSHARED_ACCOUNT_MAIN_OAUTH_TOKEN_SECRET=osecret
 
 // The warning must name the keys to fill in — an operator should not have to
 // consult the README to act on it.
+//
+// The check runs over the merged credential set rather than over .env, because
+// since PR #13 a stored credential .env no longer repeats is still a credential
+// the account has — warning about it would be a false alarm.
 func TestIncompleteMainAccountWarningNamesTheMissingKeys(t *testing.T) {
-	_, logged := loadEnvWithLog(t, `
+	cfg := loadEnv(t, `
 MEGA_ACCOUNT_MAIN_EMAIL=mega-main@example.com
 `)
+	logged := captureLog(t, func() { WarnIncompleteMains(cfg.Mains) })
+
 	if !strings.Contains(logged, "MEGA_ACCOUNT_MAIN_PASSWORD") {
 		t.Errorf("warning did not name the missing key:\n%s", logged)
 	}
 	if !strings.Contains(logged, "level=WARN") {
 		t.Errorf("an incomplete main account should warn, got:\n%s", logged)
 	}
+}
+
+// A complete main account must produce no warning: the log only means something
+// if it stays quiet when nothing is wrong.
+func TestCompleteMainAccountDoesNotWarn(t *testing.T) {
+	cfg := loadEnv(t, `
+MEGA_ACCOUNT_MAIN_EMAIL=mega-main@example.com
+MEGA_ACCOUNT_MAIN_PASSWORD=megapass
+`)
+	if logged := captureLog(t, func() { WarnIncompleteMains(cfg.Mains) }); strings.Contains(logged, "level=WARN") {
+		t.Errorf("a complete main account must not warn, got:\n%s", logged)
+	}
+}
+
+// captureLog returns everything fn logs.
+func captureLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	fn()
+	return buf.String()
 }
 
 // The opposite case: a provider with no main account is a supported choice and
@@ -304,7 +333,13 @@ MEGA_ACCOUNT_MAIN_PASSWORD=megapass
 	if len(store.Accounts) != 0 {
 		t.Fatalf("main account leaked into the numbered accounts: %+v", store.Accounts)
 	}
-	if len(store.GetByProvider(ProviderMega)) != 0 {
+	// And it must not leak through the running store either, which is what
+	// actually feeds the upload modal.
+	running := NewStore(store.Mains, store.Accounts, store.FourShared)
+	if len(running.GetByProvider(ProviderMega)) != 0 {
 		t.Error("GetByProvider returned the main account")
+	}
+	if len(running.All()) != 0 {
+		t.Error("All() returned the main account")
 	}
 }

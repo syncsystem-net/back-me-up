@@ -2,15 +2,23 @@ package handlers
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
+	"github.com/syncsystem-net/back-me-up/internal/database"
 )
 
 func mainAccountsBody(t *testing.T, store *accounts.AccountStore) (string, []mainAccountResponse) {
 	t.Helper()
-	h := &Handlers{accounts: store}
+	db, err := database.Open(filepath.Join(t.TempDir(), "main.db"))
+	if err != nil {
+		t.Fatalf("opening database: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	h := &Handlers{db: db, accounts: store}
 	w := do(t, h.GetMainAccounts, "GET", "/api/accounts/main", "")
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
@@ -23,11 +31,11 @@ func mainAccountsBody(t *testing.T, store *accounts.AccountStore) (string, []mai
 }
 
 func TestGetMainAccountsListsEachProvider(t *testing.T) {
-	store := &accounts.AccountStore{Mains: []accounts.MainAccount{
+	store := accounts.NewStore([]accounts.MainAccount{
 		{Provider: accounts.ProviderMega, Email: "mega-main@example.com", Password: "megapass"},
 		{Provider: accounts.ProviderFourShared, Email: "4s-main@example.com",
 			ConsumerKey: "ck", ConsumerSecret: "cs", OAuthToken: "tok", OAuthTokenSecret: "toksec"},
-	}}
+	}, nil, accounts.OAuthApp{})
 
 	raw, got := mainAccountsBody(t, store)
 	if len(got) != 2 {
@@ -50,9 +58,9 @@ func TestGetMainAccountsListsEachProvider(t *testing.T) {
 }
 
 func TestGetMainAccountsReportsIncompleteConfiguration(t *testing.T) {
-	store := &accounts.AccountStore{Mains: []accounts.MainAccount{
+	store := accounts.NewStore([]accounts.MainAccount{
 		{Provider: accounts.ProviderMega, Email: "mega-main@example.com"}, // no password
-	}}
+	}, nil, accounts.OAuthApp{})
 
 	_, got := mainAccountsBody(t, store)
 	if len(got) != 1 {
@@ -69,7 +77,7 @@ func TestGetMainAccountsReportsIncompleteConfiguration(t *testing.T) {
 // With nothing configured the endpoint answers with an empty array, not null:
 // the page renders it directly and `null.length` would break the empty state.
 func TestGetMainAccountsWithNoneConfigured(t *testing.T) {
-	raw, got := mainAccountsBody(t, &accounts.AccountStore{})
+	raw, got := mainAccountsBody(t, accounts.NewStore(nil, nil, accounts.OAuthApp{}))
 	if len(got) != 0 {
 		t.Fatalf("got %+v", got)
 	}

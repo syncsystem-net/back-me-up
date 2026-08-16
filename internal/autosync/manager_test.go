@@ -63,12 +63,12 @@ func newManagerForTest(t *testing.T, backends map[string]*stubBackend, accts []a
 	t.Cleanup(func() { db.Close() })
 
 	for _, a := range accts {
-		if _, err := database.UpsertAccount(db, string(a.Provider), a.Email, 20); err != nil {
+		if _, err := database.UpsertAccountRow(db, database.AccountRow{Provider: string(a.Provider), Email: a.Email, QuotaGB: 20}); err != nil {
 			t.Fatalf("UpsertAccount: %v", err)
 		}
 	}
 
-	m := New(db, &accounts.AccountStore{Accounts: accts}, 1<<20, 3)
+	m := New(db, accounts.NewStore(nil, accts, accounts.OAuthApp{}), 1<<20, 3)
 	m.connect = func(_ context.Context, _ *accounts.AccountStore, providerName, email string, _ int64) (provider.Provider, error) {
 		b, ok := backends[providerName+"|"+email]
 		if !ok {

@@ -6,10 +6,11 @@ import (
 
 	"github.com/syncsystem-net/back-me-up/internal/autosync"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
+	"github.com/syncsystem-net/back-me-up/internal/reauth"
 	"github.com/syncsystem-net/back-me-up/internal/server/handlers"
 )
 
-func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quota.Syncer, sync *autosync.Manager) {
+func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quota.Syncer, sync *autosync.Manager, reauthMgr *reauth.Manager) {
 	staticFS := http.StripPrefix("/static/", http.FileServer(http.Dir("web/static")))
 	mux.Handle("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -21,7 +22,11 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 	mux.HandleFunc("/api/health", h.Health)
 	mux.HandleFunc("/api/accounts", handlers.GetAccountsHandler(db))
 	mux.HandleFunc("GET /api/accounts/main", h.GetMainAccounts)
-	mux.HandleFunc("POST /api/accounts/quota-sync", handlers.QuotaSyncHandler(db, syncer))
+	mux.HandleFunc("GET /api/credentials", h.GetCredentialsStatus)
+	mux.HandleFunc("GET /api/reauth", handlers.ReauthStatusHandler(reauthMgr))
+	mux.HandleFunc("POST /api/reauth/start", handlers.ReauthStartHandler(reauthMgr))
+	mux.HandleFunc("POST /api/reauth/cancel", handlers.ReauthCancelHandler(reauthMgr))
+	mux.HandleFunc("POST /api/accounts/quota-sync", h.QuotaSync(syncer))
 	mux.HandleFunc("GET /api/users", handlers.GetUsersHandler(db))
 	mux.HandleFunc("GET /api/search", handlers.SearchTreesHandler(db))
 	mux.HandleFunc("GET /api/settings", handlers.GetSettingsHandler(db))

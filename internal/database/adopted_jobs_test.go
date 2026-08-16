@@ -11,7 +11,7 @@ import (
 func TestInsertAdoptedJobIsDownloadable(t *testing.T) {
 	db := newTestDB(t)
 
-	acctID, err := UpsertAccount(db, "mega", "user@example.com", 20)
+	acctID, err := UpsertAccountRow(db, AccountRow{Provider: "mega", Email: "user@example.com", QuotaGB: 20})
 	if err != nil {
 		t.Fatalf("UpsertAccount: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestInsertAdoptedJobIsDownloadable(t *testing.T) {
 func TestAdoptedJobIsSkippedByReverification(t *testing.T) {
 	db := newTestDB(t)
 
-	acctID, err := UpsertAccount(db, "mega", "user@example.com", 20)
+	acctID, err := UpsertAccountRow(db, AccountRow{Provider: "mega", Email: "user@example.com", QuotaGB: 20})
 	if err != nil {
 		t.Fatalf("UpsertAccount: %v", err)
 	}

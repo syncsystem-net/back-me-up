@@ -450,6 +450,46 @@ tbody.record + tbody.record { border-top: 1px solid var(--page); }
 .acct-group-head--main { background: var(--slate); cursor: default; }
 .acct-card--warn { box-shadow: 0 0 0 0.125rem var(--pink), 0 0.25rem 0.25rem rgba(0, 0, 0, 0.1); }
 .acct-warn { color: var(--pink); font-size: 0.875rem; margin-top: 0.375rem; font-weight: 700; }
+
+/* An account whose token the provider rejected. The badge sits inline with the
+   address so the card reads as one statement, and the action to fix it is on
+   the card rather than somewhere else. */
+.acct-badge {
+    display: inline-block;
+    margin-left: 0.375rem;
+    padding: 0.0625rem 0.375rem;
+    border-radius: var(--radius);
+    background: var(--pink);
+    color: #fff;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    vertical-align: middle;
+}
+.acct-btn { margin-top: 0.5rem; }
+
+/* Credentials locked. Full-bleed, above the tabs, and impossible to mistake for
+   a status line: with the passphrase missing or wrong the app looks like it
+   simply has no accounts, which would send the user looking in the wrong place. */
+.locked-banner {
+    background: var(--pink);
+    color: #fff;
+    padding: 0.75rem 1.25rem;
+    font-size: 0.875rem;
+    line-height: 1.45;
+}
+.locked-banner-title { font-weight: 700; font-size: 1rem; margin-bottom: 0.25rem; }
+.locked-banner-body { margin-top: 0.25rem; }
+.locked-banner code {
+    background: rgba(255, 255, 255, 0.22);
+    border-radius: var(--radius);
+    padding: 0.0625rem 0.25rem;
+}
+
+/* The authorize URL is always shown, even when the browser opened by itself:
+   a failed auto-open must never leave the flow with no way forward. */
+.reauth-link { color: var(--purple); word-break: break-all; font-size: 0.8125rem; }
 .acct-grid .muted code {
     background: var(--card);
     border-radius: var(--radius);

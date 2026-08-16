@@ -108,6 +108,23 @@ func migrate(db *sql.DB) error {
 	if err := dropLegacyDirectories(db); err != nil {
 		return fmt.Errorf("dropping backup_directories: %w", err)
 	}
+	// PR #13: accounts stop being re-read from .env on every boot and become the
+	// authoritative record, so each row carries its own sealed credentials plus
+	// the state that used to have nowhere to live — whether the account needs
+	// re-authorization, and whether its OAuth token was written by the app (in
+	// which case a stale .env value must not overwrite it). CREATE TABLE adds
+	// these for fresh databases; existing databases need an ALTER.
+	for _, col := range []struct{ name, typ string }{
+		{"secrets_enc", "BLOB"},
+		{"needs_reauth", "INTEGER NOT NULL DEFAULT 0"},
+		{"reauth_reason", "TEXT"},
+		{"token_source", "TEXT"},
+		{"env_index", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := addColumnIfMissing(db, "accounts", col.name, col.typ); err != nil {
+			return fmt.Errorf("accounts.%s migration: %w", col.name, err)
+		}
+	}
 	return nil
 }
 
@@ -278,8 +295,34 @@ CREATE TABLE IF NOT EXISTS accounts (
     quota_total_gb REAL DEFAULT 0,
     quota_used_gb REAL DEFAULT 0,
     last_quota_sync DATETIME,
+    secrets_enc BLOB,
+    needs_reauth INTEGER NOT NULL DEFAULT 0,
+    reauth_reason TEXT,
+    token_source TEXT,
+    env_index INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, email)
+);
+
+-- Main accounts (the per-provider database-backup destinations) are deliberately
+-- NOT rows in accounts. That table feeds the upload-target modal and
+-- GetUsersHandler, which groups the backups table by account email, so a row
+-- there would both offer the db-backup account as an upload target and invent a
+-- user row for it. A separate table also avoids a real collision: accounts is
+-- UNIQUE(provider, email) and the same account may legitimately serve as both a
+-- main and an upload target, which one row could not represent.
+CREATE TABLE IF NOT EXISTS main_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL,
+    secrets_enc BLOB,
+    quota_total_gb REAL DEFAULT 0,
+    quota_used_gb REAL DEFAULT 0,
+    last_quota_sync DATETIME,
+    needs_reauth INTEGER NOT NULL DEFAULT 0,
+    reauth_reason TEXT,
+    token_source TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS jobs (

@@ -29,10 +29,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -45,11 +43,21 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/provider/oauth1"
 )
 
-const (
-	initiateURL  = "https://api.4shared.com/v1_2/oauth/initiate"
-	authorizeURL = "https://api.4shared.com/v1_2/oauth/authorize"
-	tokenURL     = "https://api.4shared.com/v1_2/oauth/token"
-)
+// endpoints, the flow itself and the signing live in internal/provider/oauth1,
+// shared with the in-app Re-authorize button: a token obtained here has to work
+// exactly like one obtained there, which two implementations could not promise.
+var endpoints = oauth1.FourSharedEndpoints
+
+// newFlow builds the shared three-legged flow for this account's registered app.
+func newFlow(client *http.Client, key, secret string) oauth1.Flow {
+	return oauth1.Flow{
+		Endpoints:      endpoints,
+		ConsumerKey:    key,
+		ConsumerSecret: secret,
+		Client:         client,
+		Debug:          debug,
+	}
+}
 
 func main() {
 	key := flag.String("key", "", "4shared consumer key (defaults to FOURSHARED_CONSUMER_KEY in .env)")
@@ -108,21 +116,11 @@ func main() {
 	runCallback(ctx, client, *key, *secret, slot, domain, *port)
 }
 
-// callbackURL builds the OAuth callback URL the browser is redirected to. Its
-// host must match the registered 4shared Application domain; its address must
-// resolve to this machine so the local listener receives it.
-func callbackURL(domain string, port int) string {
-	if port == 80 {
-		return fmt.Sprintf("http://%s/callback", domain)
-	}
-	return fmt.Sprintf("http://%s:%d/callback", domain, port)
-}
-
 // runCallback runs a local web server that captures the verifier from the
 // redirect. As a fallback it also reads a verifier pasted on stdin, in case the
 // browser redirect doesn't reach the local server.
 func runCallback(ctx context.Context, client *http.Client, key, secret, slot, domain string, port int) {
-	callback := callbackURL(domain, port)
+	callback := oauth1.CallbackURL(domain, port)
 
 	// Bind the listener first so the port is ready before we authorize.
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -131,8 +129,8 @@ func runCallback(ctx context.Context, client *http.Client, key, secret, slot, do
 	}
 
 	// Step 1: temporary credentials.
-	signer := &oauth1.Signer{ConsumerKey: key, ConsumerSecret: secret}
-	reqToken, reqSecret, err := postForm(ctx, client, signer, http.MethodPost, initiateURL, map[string]string{"oauth_callback": callback})
+	flow := newFlow(client, key, secret)
+	reqToken, reqSecret, authURL, err := flow.Initiate(ctx, callback)
 	if err != nil {
 		fail("requesting temporary credentials", err)
 	}
@@ -156,7 +154,6 @@ func runCallback(ctx context.Context, client *http.Client, key, secret, slot, do
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	authURL := fmt.Sprintf("%s?oauth_token=%s", authorizeURL, url.QueryEscape(reqToken))
 	fmt.Printf("\nCallback configured as: %s\n", callback)
 	fmt.Printf("\nOpening your browser to authorize. If it doesn't open, paste this URL:\n\n   %s\n\n", authURL)
 	openBrowser(authURL)
@@ -183,15 +180,10 @@ func runCallback(ctx context.Context, client *http.Client, key, secret, slot, do
 	}
 
 	// Step 3: exchange the authorized request token for the access token. Under
-	// OAuth 1.0 there is no verifier; include it only if one was provided
-	// (OAuth 1.0a), otherwise the access-token request is signed with the
-	// request token alone.
-	extra := map[string]string{}
-	if verifier != "" {
-		extra["oauth_verifier"] = verifier
-	}
-	signer = &oauth1.Signer{ConsumerKey: key, ConsumerSecret: secret, Token: reqToken, TokenSecret: reqSecret}
-	accToken, accSecret, err := postForm(ctx, client, signer, http.MethodPost, tokenURL, extra)
+	// OAuth 1.0 there is no verifier; the flow includes it only if one was
+	// provided (OAuth 1.0a), otherwise the request is signed with the request
+	// token alone.
+	accToken, accSecret, err := flow.Exchange(ctx, reqToken, reqSecret, verifier)
 	if err != nil {
 		fail("exchanging request token for access token", err)
 	}
@@ -200,14 +192,14 @@ func runCallback(ctx context.Context, client *http.Client, key, secret, slot, do
 
 // runManual uses the out-of-band PIN flow (last-resort fallback).
 func runManual(ctx context.Context, client *http.Client, key, secret, slot string) {
-	signer := &oauth1.Signer{ConsumerKey: key, ConsumerSecret: secret}
-	reqToken, reqSecret, err := postForm(ctx, client, signer, http.MethodPost, initiateURL, map[string]string{"oauth_callback": "oob"})
+	flow := newFlow(client, key, secret)
+	reqToken, reqSecret, authURL, err := flow.Initiate(ctx, "oob")
 	if err != nil {
 		fail("requesting temporary credentials", err)
 	}
 
 	fmt.Println("\n1. Open this URL, log in to the 4shared account you want to authorize, and approve access:")
-	fmt.Printf("\n   %s?oauth_token=%s\n", authorizeURL, url.QueryEscape(reqToken))
+	fmt.Printf("\n   %s\n", authURL)
 	fmt.Print("\n2. Copy the verification code (PIN) shown, paste it here and press Enter:\n\n   PIN: ")
 	pin, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 	pin = strings.TrimSpace(pin)
@@ -215,8 +207,7 @@ func runManual(ctx context.Context, client *http.Client, key, secret, slot strin
 		fail("reading PIN", fmt.Errorf("no PIN entered"))
 	}
 
-	signer = &oauth1.Signer{ConsumerKey: key, ConsumerSecret: secret, Token: reqToken, TokenSecret: reqSecret}
-	accToken, accSecret, err := postForm(ctx, client, signer, http.MethodPost, tokenURL, map[string]string{"oauth_verifier": pin})
+	accToken, accSecret, err := flow.Exchange(ctx, reqToken, reqSecret, pin)
 	if err != nil {
 		fail("exchanging verifier for access token", err)
 	}
@@ -248,39 +239,6 @@ func accountSlot(v string) (string, error) {
 // debug is enabled by FOURSHARED_DEBUG and logs the raw OAuth responses, which
 // is essential for diagnosing token problems (e.g. what /token actually returns).
 var debug = os.Getenv("FOURSHARED_DEBUG") != ""
-
-// postForm signs and sends an OAuth request and parses the form-encoded
-// oauth_token / oauth_token_secret response common to all three OAuth steps.
-func postForm(ctx context.Context, c *http.Client, signer *oauth1.Signer, method, rawURL string, extra map[string]string) (token, secret string, err error) {
-	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
-	if err != nil {
-		return "", "", err
-	}
-	signer.Debug = debug
-	signer.Sign(req, extra)
-	resp, err := c.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if debug {
-		fmt.Printf("[debug] POST %s -> %d\n[debug] raw response: %s\n\n", rawURL, resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("4shared returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	vals, err := url.ParseQuery(string(body))
-	if err != nil {
-		return "", "", fmt.Errorf("parsing response %q: %w", string(body), err)
-	}
-	token = vals.Get("oauth_token")
-	secret = vals.Get("oauth_token_secret")
-	if token == "" || secret == "" {
-		return "", "", fmt.Errorf("response missing oauth_token/secret: %s", strings.TrimSpace(string(body)))
-	}
-	return token, secret, nil
-}
 
 // openBrowser best-effort opens a URL in the default browser.
 func openBrowser(u string) {

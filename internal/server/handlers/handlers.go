@@ -16,7 +16,9 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/archive"
 	"github.com/syncsystem-net/back-me-up/internal/cloud"
+	"github.com/syncsystem-net/back-me-up/internal/credentials"
 	"github.com/syncsystem-net/back-me-up/internal/database"
+	"github.com/syncsystem-net/back-me-up/internal/keyring"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/scanner"
@@ -33,7 +35,10 @@ type UI struct {
 }
 
 type Handlers struct {
-	db        *sql.DB
+	db *sql.DB
+	// accounts is the running credential set. It is the same pointer for the life
+	// of the process and is refreshed in place by the credentials manager, so a
+	// re-authorized token takes effect here without a restart.
 	accounts  *accounts.AccountStore
 	tmpl      *template.Template
 	chunkSize int64
@@ -49,7 +54,7 @@ type Handlers struct {
 	connect func(ctx context.Context, providerName, email string) (provider.Provider, error)
 }
 
-func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth int, ui UI) *Handlers {
+func New(db *sql.DB, creds *credentials.Manager, chunkSize int64, scanMaxDepth int, ui UI) *Handlers {
 	tmplPath := filepath.Join("web", "templates", "*.html")
 	tmpl, err := template.ParseGlob(tmplPath)
 	if err != nil {
@@ -59,7 +64,7 @@ func New(db *sql.DB, accts *accounts.AccountStore, chunkSize int64, scanMaxDepth
 
 	h := &Handlers{
 		db:           db,
-		accounts:     accts,
+		accounts:     creds.Store(),
 		tmpl:         tmpl,
 		chunkSize:    chunkSize,
 		scanMaxDepth: scanMaxDepth,
@@ -124,28 +129,73 @@ type mainAccountResponse struct {
 	// needs to log in; MissingKeys then names the .env keys to fill in.
 	Usable      bool     `json:"usable"`
 	MissingKeys []string `json:"missing_keys"`
+
+	// Cached capacity, polled into main_accounts by the quota syncer. Zero until
+	// the first successful poll.
+	QuotaTotalGB float64 `json:"quota_total_gb"`
+	QuotaUsedGB  float64 `json:"quota_used_gb"`
+	LastSync     *string `json:"last_quota_sync"`
+
+	// NeedsReauth is set when the provider rejected this account's OAuth token.
+	NeedsReauth  bool   `json:"needs_reauth"`
+	ReauthReason string `json:"reauth_reason,omitempty"`
 }
 
 // GetMainAccounts lists the configured metadata-database backup accounts, one
 // per provider at most. Route: GET /api/accounts/main.
+//
+// Credentials never reach the browser: this returns identity, configuration
+// state, cached quota and whether re-authorization is needed — nothing else.
 func (h *Handlers) GetMainAccounts(w http.ResponseWriter, r *http.Request) {
+	quotas, err := database.ListMainAccountQuotas(h.db)
+	if err != nil {
+		// A quota lookup failure must not hide the accounts themselves; report the
+		// list without capacity rather than failing the request.
+		slog.Warn("listing main account quotas", "error", err)
+		quotas = map[string]database.MainAccountQuota{}
+	}
+
 	out := make([]mainAccountResponse, 0)
-	if h.accounts != nil {
-		for _, m := range h.accounts.Mains {
-			missing := m.MissingKeys()
-			if missing == nil {
-				missing = []string{}
-			}
-			out = append(out, mainAccountResponse{
-				Provider:    string(m.Provider),
-				Email:       m.Email,
-				Usable:      len(missing) == 0,
-				MissingKeys: missing,
-			})
+	for _, m := range h.accounts.Mains() {
+		missing := m.MissingKeys()
+		if missing == nil {
+			missing = []string{}
 		}
+		resp := mainAccountResponse{
+			Provider:     string(m.Provider),
+			Email:        m.Email,
+			Usable:       len(missing) == 0,
+			MissingKeys:  missing,
+			NeedsReauth:  m.NeedsReauth,
+			ReauthReason: m.ReauthReason,
+		}
+		if q, ok := quotas[string(m.Provider)]; ok {
+			resp.QuotaTotalGB, resp.QuotaUsedGB, resp.LastSync = q.QuotaTotalGB, q.QuotaUsedGB, q.LastSync
+		}
+		out = append(out, resp)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+// credentialsStatusResponse tells the page whether credentials are usable. The
+// UI shows Reason verbatim in a banner, so it must name the .env key and the
+// remedy rather than describing the internal failure.
+type credentialsStatusResponse struct {
+	Locked bool   `json:"locked"`
+	Reason string `json:"reason,omitempty"`
+	EnvKey string `json:"env_key"`
+}
+
+// GetCredentialsStatus reports whether stored credentials could be opened.
+// Route: GET /api/credentials.
+func (h *Handlers) GetCredentialsStatus(w http.ResponseWriter, r *http.Request) {
+	resp := credentialsStatusResponse{EnvKey: keyring.EnvKey}
+	if reason := h.accounts.LockReason(); reason != "" {
+		resp.Locked, resp.Reason = true, reason
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // userResponse is one table row: a user (email) with their configured accounts
@@ -387,12 +437,18 @@ func PatchBackupHandler(db *sql.DB) http.HandlerFunc {
 // QuotaSyncHandler triggers an immediate quota refresh for every numbered
 // account and returns the updated account list. Route: POST
 // /api/accounts/quota-sync.
-func QuotaSyncHandler(db *sql.DB, syncer *quota.Syncer) http.HandlerFunc {
+func (h *Handlers) QuotaSync(syncer *quota.Syncer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Polling a quota needs a credential like everything else, and the syncer
+		// would otherwise skip every account server-side and hand back an unchanged
+		// list with a 200 — a button that reports success and does nothing.
+		if h.refuseWhenLocked(w) {
+			return
+		}
 		if syncer != nil {
 			syncer.SyncAll(r.Context())
 		}
-		accts, err := database.ListDBAccounts(db)
+		accts, err := database.ListDBAccounts(h.db)
 		if err != nil {
 			slog.Error("listing accounts after quota sync", "error", err)
 			jsonError(w, "failed to list accounts", http.StatusInternalServerError)
@@ -424,6 +480,13 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		// object keys are strings) to "overwrite" or "skip". Sent on resubmit
 		// after the user resolves the conflicts reported by a prior 409.
 		ConflictResolutions map[string]string `json:"conflict_resolutions"`
+	}
+
+	// Checked before anything else: with credentials locked the store is empty,
+	// so every account id would come back "unknown" and send the user looking for
+	// a configuration problem they do not have.
+	if h.refuseWhenLocked(w) {
+		return
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -671,6 +734,9 @@ func GetJobLogsHandler(db *sql.DB) http.HandlerFunc {
 // DownloadJob streams the remote zip for a completed job back to the browser.
 // Route: GET /api/jobs/{id}/download.
 func (h *Handlers) DownloadJob(w http.ResponseWriter, r *http.Request) {
+	if h.refuseWhenLocked(w) {
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		jsonError(w, "invalid job id", http.StatusBadRequest)
@@ -716,6 +782,19 @@ func BrowseHandler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"path": path})
 	}
+}
+
+// refuseWhenLocked answers 503 with the lock reason and reports true when the
+// caller should stop. Every operation that needs a credential consults it, so
+// the API gives one consistent answer instead of each path inventing its own
+// version of "that did not work".
+func (h *Handlers) refuseWhenLocked(w http.ResponseWriter) bool {
+	reason := h.accounts.LockReason()
+	if reason == "" {
+		return false
+	}
+	jsonError(w, "credentials are locked: "+reason, http.StatusServiceUnavailable)
+	return true
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {

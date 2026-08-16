@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
+	"github.com/syncsystem-net/back-me-up/internal/cloud"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 )
 
@@ -52,7 +53,7 @@ func mainsFixture(t *testing.T, mains []accounts.MainAccount) (*Worker, map[stri
 	for _, m := range mains {
 		stubs[string(m.Provider)] = &stubMainProvider{name: string(m.Provider)}
 	}
-	w := &Worker{accounts: &accounts.AccountStore{Mains: mains}}
+	w := &Worker{accounts: accounts.NewStore(mains, nil, accounts.OAuthApp{})}
 	w.newMainProvider = func(m accounts.MainAccount) (provider.Provider, error) {
 		s, ok := stubs[string(m.Provider)]
 		if !ok {
@@ -138,7 +139,7 @@ func TestUploadDBToMainsAllDestinationsFail(t *testing.T) {
 // half-configured entry cannot produce a confusing login failure after each job.
 func TestUsableMainsSkipsIncompleteAccounts(t *testing.T) {
 	incomplete := accounts.MainAccount{Provider: accounts.ProviderMega, Email: "mega-main@example.com"} // no password
-	w := &Worker{accounts: &accounts.AccountStore{Mains: []accounts.MainAccount{incomplete, fourSharedMain()}}}
+	w := &Worker{accounts: accounts.NewStore([]accounts.MainAccount{incomplete, fourSharedMain()}, nil, accounts.OAuthApp{})}
 
 	usable := w.usableMains()
 	if len(usable) != 1 || usable[0].Provider != accounts.ProviderFourShared {
@@ -147,7 +148,7 @@ func TestUsableMainsSkipsIncompleteAccounts(t *testing.T) {
 }
 
 func TestUsableMainsWithNoAccountsConfigured(t *testing.T) {
-	w := &Worker{accounts: &accounts.AccountStore{}}
+	w := &Worker{accounts: accounts.NewStore(nil, nil, accounts.OAuthApp{})}
 	if got := w.usableMains(); len(got) != 0 {
 		t.Fatalf("usableMains = %+v, want none", got)
 	}
@@ -157,7 +158,7 @@ func TestUsableMainsWithNoAccountsConfigured(t *testing.T) {
 // down with it.
 func TestUsableMainsSkipsUnsupportedProvider(t *testing.T) {
 	unknown := accounts.MainAccount{Provider: "dropbox", Email: "x@example.com", Password: "pw"}
-	w := &Worker{accounts: &accounts.AccountStore{Mains: []accounts.MainAccount{unknown, megaMain()}}}
+	w := &Worker{accounts: accounts.NewStore([]accounts.MainAccount{unknown, megaMain()}, nil, accounts.OAuthApp{})}
 
 	usable := w.usableMains()
 	if len(usable) != 1 || usable[0].Provider != accounts.ProviderMega {
@@ -169,11 +170,11 @@ func TestUsableMainsSkipsUnsupportedProvider(t *testing.T) {
 // account itself — the whole point of giving it its own credential set, rather
 // than borrowing from a numbered account that happens to share an email.
 func TestMainOAuthUsesTheMainAccountsOwnCredentials(t *testing.T) {
-	creds := mainOAuth(fourSharedMain())
+	creds := cloud.MainOAuth(fourSharedMain())
 	if creds.ConsumerKey != "ck" || creds.ConsumerSecret != "cs" || creds.Token != "t" || creds.TokenSecret != "ts" {
-		t.Errorf("mainOAuth = %+v", creds)
+		t.Errorf("MainOAuth = %+v", creds)
 	}
-	if got := mainOAuth(megaMain()); got != (provider.OAuthCreds{}) {
+	if got := cloud.MainOAuth(megaMain()); got != (provider.OAuthCreds{}) {
 		t.Errorf("a password provider should get no OAuth creds, got %+v", got)
 	}
 }

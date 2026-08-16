@@ -25,6 +25,21 @@
         </div>
     </header>
 
+    <!-- Credentials locked. The stored passwords and tokens are intact but cannot
+         be opened, so the app runs read-only: records stay browsable and every
+         cloud action refuses. The banner is unmissable on purpose — the app
+         otherwise looks like it simply has no accounts. -->
+    <div class="locked-banner" x-show="credentials.locked" x-cloak>
+        <div class="locked-banner-title">Credentials are locked — no uploads, downloads, deletes or syncing</div>
+        <div class="locked-banner-body" x-text="credentials.reason"></div>
+        <div class="locked-banner-body">
+            Set <code x-text="credentials.env_key"></code> in <code>.env</code> and restart.
+            Single-quote it if it contains <code>$</code>, <code>#</code> or spaces.
+            <strong>There is no recovery if the passphrase is lost</strong> — stored credentials
+            cannot be decrypted without it, and would have to be re-entered in <code>.env</code>.
+        </div>
+    </div>
+
     <!-- Tabs -->
     <nav class="tabs" x-cloak>
         <a href="#" class="tab" :class="{ active: page === 'accounts' }" @click.prevent="openAccountsPage()">accounts</a>
@@ -248,15 +263,33 @@
                 </div>
                 <div class="acct-grid">
                     <template x-for="m in mainAccounts" :key="m.provider">
-                        <div class="acct-card" :class="{ 'acct-card--warn': !m.usable }">
-                            <div class="acct-email" x-text="m.email"></div>
+                        <div class="acct-card" :class="{ 'acct-card--warn': !m.usable || needsReauth(m) }">
+                            <div class="acct-email">
+                                <span x-text="m.email"></span>
+                                <span class="acct-badge" x-show="needsReauth(m)">needs re-authorization</span>
+                            </div>
                             <div class="acct-quota">
                                 <span x-text="m.provider === 'mega' ? 'MEGA' : '4shared'"></span>
                                 — receives a copy of the metadata database after every successful job. Not an upload target.
                             </div>
+                            <!-- Quota for main accounts arrives from the same poller as the
+                                 upload targets, writing to main_accounts. Zero until the
+                                 first successful poll, so it says so rather than showing
+                                 a confident 0.00. -->
+                            <div class="acct-quota" x-show="m.last_quota_sync">
+                                <span x-text="(m.quota_used_gb || 0).toFixed(2)"></span> /
+                                <span x-text="(m.quota_total_gb || 0).toFixed(2)"></span> GB used
+                            </div>
+                            <div class="acct-synced" x-show="m.last_quota_sync">Last synced: <span x-text="m.last_quota_sync"></span></div>
+                            <div class="acct-synced" x-show="!m.last_quota_sync">Quota not polled yet.</div>
                             <div class="acct-warn" x-show="!m.usable">
                                 Incomplete configuration — set <span x-text="(m.missing_keys || []).join(', ')"></span> in .env.
                             </div>
+                            <div class="acct-warn" x-show="needsReauth(m)" x-text="m.reauth_reason || 'The provider rejected this account's access token.'"></div>
+                            <button class="btn btn-purple acct-btn"
+                                    x-show="needsReauth(m) && canReauth(m)"
+                                    :disabled="credentials.locked"
+                                    @click="startReauth(m.provider, m.email, true)">Re-authorize</button>
                         </div>
                     </template>
                     <template x-if="mainAccountsLoaded && mainAccounts.length === 0">
@@ -276,10 +309,18 @@
                     </div>
                     <div class="acct-grid" x-show="isProviderOpen(prov)">
                         <template x-for="a in (prov === 'mega' ? megaAccounts() : foursharedAccounts())" :key="a.id">
-                            <div class="acct-card">
-                                <div class="acct-email" x-text="a.email"></div>
+                            <div class="acct-card" :class="{ 'acct-card--warn': needsReauth(a) }">
+                                <div class="acct-email">
+                                    <span x-text="a.email"></span>
+                                    <span class="acct-badge" x-show="needsReauth(a)">needs re-authorization</span>
+                                </div>
                                 <div class="acct-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
                                 <div class="acct-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
+                                <div class="acct-warn" x-show="needsReauth(a)" x-text="a.reauth_reason || 'The provider rejected this account's access token.'"></div>
+                                <button class="btn btn-purple acct-btn"
+                                        x-show="needsReauth(a) && canReauth(a)"
+                                        :disabled="credentials.locked"
+                                        @click="startReauth(a.provider, a.email, false)">Re-authorize</button>
                             </div>
                         </template>
                         <template x-if="(prov === 'mega' ? megaAccounts() : foursharedAccounts()).length === 0">
@@ -457,6 +498,45 @@
                 <div class="modal-actions">
                     <button class="btn btn-purple" @click="saveSettings()" :disabled="settingsSaving" x-text="settingsSaving ? 'Saving…' : 'Save'"></button>
                     <button class="btn btn-grey" @click="cancelSettings()">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Re-authorize. OAuth 1.0 has no refresh token, so an expired one is
+         replaced by authorizing again. The server runs the flow and writes the
+         new token straight to the encrypted store — no .env edit, no restart. -->
+    <div x-show="showReauthModal" class="modal-overlay" @click.self="closeReauthModal()" x-cloak>
+        <div class="modal-card">
+            <div class="modal-head">Re-authorize 4shared</div>
+            <div class="modal-body">
+                <p class="muted">
+                    <span x-text="reauthRun.email || ''"></span>
+                    <span x-show="reauthRun.is_main"> (metadata database backup account)</span>
+                </p>
+
+                <div class="form-error" x-show="reauthError" x-text="reauthError"></div>
+                <div class="form-error" x-show="!reauthError && reauthRun.phase === 'error'" x-text="reauthRun.error"></div>
+
+                <template x-if="reauthInFlight() || reauthRun.phase === 'done'">
+                    <div>
+                        <p x-text="reauthRun.message"></p>
+                        <!-- The link is always shown, never only the auto-open: a failed
+                             browser launch must not be a dead end. -->
+                        <p x-show="reauthRun.authorize_url && reauthInFlight()">
+                            <a class="reauth-link" :href="reauthRun.authorize_url" target="_blank" rel="noopener"
+                               x-text="reauthRun.authorize_url"></a>
+                        </p>
+                        <p class="muted" x-show="reauthRun.phase === 'awaiting'">
+                            Approve access as the 4shared account above. The tab that opens can be
+                            closed once it says the account is authorized.
+                        </p>
+                    </div>
+                </template>
+
+                <div class="modal-actions">
+                    <button class="btn btn-grey" x-show="reauthInFlight()" @click="cancelReauth()">Cancel</button>
+                    <button class="btn btn-purple" x-show="!reauthInFlight()" @click="showReauthModal = false">Close</button>
                 </div>
             </div>
         </div>
