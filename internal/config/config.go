@@ -18,6 +18,19 @@ type Config struct {
 	Verification VerificationConfig `yaml:"verification"`
 	Scan         ScanConfig         `yaml:"scan"`
 	UI           UIConfig           `yaml:"ui"`
+	Reauth       ReauthConfig       `yaml:"reauth"`
+}
+
+// ReauthConfig controls the in-app OAuth re-authorization flow. CallbackPort is
+// the port the temporary local listener binds while the provider redirects the
+// browser back; it must match the port in the callback URL the provider's
+// registered application accepts. It mirrors cmd/fourshared-auth's -port default
+// so an app registered for the command-line tool works in the app unchanged.
+type ReauthConfig struct {
+	CallbackPort int `yaml:"callback_port"`
+	// TimeoutMinutes is how long the flow waits for the user to approve before
+	// giving up and releasing the port.
+	TimeoutMinutes int `yaml:"timeout_minutes"`
 }
 
 type ServerConfig struct {
@@ -166,5 +179,11 @@ func setDefaults(cfg *Config) {
 	// happening), so clamp it rather than honouring it.
 	if cfg.UI.ActivePollSeconds > cfg.UI.PollSeconds {
 		cfg.UI.ActivePollSeconds = cfg.UI.PollSeconds
+	}
+	if cfg.Reauth.CallbackPort <= 0 {
+		cfg.Reauth.CallbackPort = 8723
+	}
+	if cfg.Reauth.TimeoutMinutes <= 0 {
+		cfg.Reauth.TimeoutMinutes = 5
 	}
 }
