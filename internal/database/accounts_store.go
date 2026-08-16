@@ -14,28 +14,24 @@ type DBAccount struct {
 	QuotaUsedGB   float64    `json:"quota_used_gb"`
 	LastQuotaSync *time.Time `json:"last_quota_sync"`
 	CreatedAt     time.Time  `json:"created_at"`
-}
 
-func UpsertAccount(db *sql.DB, provider, email string, quotaTotalGB float64) (int64, error) {
-	_, err := db.Exec(
-		`INSERT INTO accounts (provider, email, quota_total_gb) VALUES (?, ?, ?)
-		 ON CONFLICT(provider, email) DO UPDATE SET quota_total_gb=excluded.quota_total_gb`,
-		provider, email, quotaTotalGB,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("upserting account: %w", err)
-	}
-
-	var id int64
-	if err := db.QueryRow(`SELECT id FROM accounts WHERE provider = ? AND email = ?`, provider, email).Scan(&id); err != nil {
-		return 0, fmt.Errorf("getting account id: %w", err)
-	}
-	return id, nil
+	// NeedsReauth is set when the provider rejected this account's OAuth token as
+	// expired. It rides on the account rather than living in memory so an expired
+	// token found during a job is still reported after a restart — and so the
+	// Accounts view can offer a Re-authorize button instead of the user learning
+	// about it from a failed upload.
+	NeedsReauth  bool   `json:"needs_reauth"`
+	ReauthReason string `json:"reauth_reason,omitempty"`
+	// EnvIndex is the account's .env slot, so a message can name real keys
+	// (FOURSHARED_ACCOUNT_2_*) rather than describing them.
+	EnvIndex int `json:"env_index"`
 }
 
 func ListDBAccounts(db *sql.DB) ([]*DBAccount, error) {
 	rows, err := db.Query(
-		`SELECT id, provider, email, quota_total_gb, quota_used_gb, last_quota_sync, created_at FROM accounts ORDER BY provider, email`,
+		`SELECT id, provider, email, quota_total_gb, quota_used_gb, last_quota_sync, created_at,
+		        needs_reauth, COALESCE(reauth_reason, ''), env_index
+		 FROM accounts ORDER BY provider, email`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("querying accounts: %w", err)
@@ -46,7 +42,8 @@ func ListDBAccounts(db *sql.DB) ([]*DBAccount, error) {
 	for rows.Next() {
 		a := &DBAccount{}
 		var lastSync sql.NullTime
-		if err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.QuotaTotalGB, &a.QuotaUsedGB, &lastSync, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.QuotaTotalGB, &a.QuotaUsedGB, &lastSync, &a.CreatedAt,
+			&a.NeedsReauth, &a.ReauthReason, &a.EnvIndex); err != nil {
 			return nil, fmt.Errorf("scanning account row: %w", err)
 		}
 		if lastSync.Valid {
