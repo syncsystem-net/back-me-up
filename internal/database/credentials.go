@@ -33,7 +33,21 @@ type AccountRow struct {
 	NeedsReauth  bool
 	ReauthReason string
 	TokenSource  string
+	// Tier and TierSource carry the account's plan and who last set it. A
+	// TierSource of TierSourceApp means the user chose it in the UI and .env must
+	// not overwrite it on the next boot.
+	Tier       string
+	TierSource string
 }
+
+// TierSourceEnv marks a tier adopted from .env; TierSourceApp one the user set
+// in the Accounts view. The distinction exists for exactly one reason: .env is
+// replayed into the database on every boot, so without it a tier changed in the
+// UI would silently revert at the next restart.
+const (
+	TierSourceEnv = "env"
+	TierSourceApp = "app"
+)
 
 // MainAccountRow is a provider's database-backup destination as stored. It lives
 // in its own table; see the schema comment for why it is not a flagged row in
@@ -51,7 +65,8 @@ type MainAccountRow struct {
 // ListAccountRows returns every stored numbered account, credentials included.
 func ListAccountRows(db *sql.DB) ([]AccountRow, error) {
 	rows, err := db.Query(`SELECT id, provider, email, quota_total_gb, env_index,
-		secrets_enc, needs_reauth, COALESCE(reauth_reason, ''), COALESCE(token_source, '')
+		secrets_enc, needs_reauth, COALESCE(reauth_reason, ''), COALESCE(token_source, ''),
+		COALESCE(tier, 'free'), COALESCE(tier_source, '')
 		FROM accounts ORDER BY provider, env_index, email`)
 	if err != nil {
 		return nil, fmt.Errorf("querying account credentials: %w", err)
@@ -62,7 +77,8 @@ func ListAccountRows(db *sql.DB) ([]AccountRow, error) {
 	for rows.Next() {
 		var a AccountRow
 		if err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.QuotaGB, &a.EnvIndex,
-			&a.SecretsEnc, &a.NeedsReauth, &a.ReauthReason, &a.TokenSource); err != nil {
+			&a.SecretsEnc, &a.NeedsReauth, &a.ReauthReason, &a.TokenSource,
+			&a.Tier, &a.TierSource); err != nil {
 			return nil, fmt.Errorf("scanning account credential row: %w", err)
 		}
 		out = append(out, a)
@@ -78,14 +94,16 @@ func ListAccountRows(db *sql.DB) ([]AccountRow, error) {
 // omitting the optional _QUOTA_GB key must not reset that to zero on every boot.
 func UpsertAccountRow(db *sql.DB, a AccountRow) (int64, error) {
 	_, err := db.Exec(
-		`INSERT INTO accounts (provider, email, quota_total_gb, env_index, secrets_enc, token_source)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO accounts (provider, email, quota_total_gb, env_index, secrets_enc, token_source, tier, tier_source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(provider, email) DO UPDATE SET
 		   quota_total_gb = CASE WHEN excluded.quota_total_gb > 0 THEN excluded.quota_total_gb ELSE accounts.quota_total_gb END,
 		   env_index      = excluded.env_index,
 		   secrets_enc    = excluded.secrets_enc,
-		   token_source   = excluded.token_source`,
-		a.Provider, a.Email, a.QuotaGB, a.EnvIndex, a.SecretsEnc, a.TokenSource,
+		   token_source   = excluded.token_source,
+		   tier           = CASE WHEN accounts.tier_source = 'app' THEN accounts.tier ELSE excluded.tier END,
+		   tier_source    = CASE WHEN accounts.tier_source = 'app' THEN 'app' ELSE excluded.tier_source END`,
+		a.Provider, a.Email, a.QuotaGB, a.EnvIndex, a.SecretsEnc, a.TokenSource, a.Tier, a.TierSource,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("upserting account %s/%s: %w", a.Provider, a.Email, err)

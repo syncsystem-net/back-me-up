@@ -87,6 +87,17 @@ type Account struct {
 	// shown in the Accounts view rather than only in a failed job's logs.
 	NeedsReauth  bool
 	ReauthReason string
+
+	// Tier is the account's plan with its provider ("free" or "paid"), selecting
+	// which per-file size cap and transfer budget apply. .env seeds it via
+	// <PREFIX>_<n>_TIER; the Accounts view can change it without a restart.
+	//
+	// TierSource records who last set it. "app" means the user chose it in the
+	// UI, and the .env reconciliation must then leave it alone — the same rule
+	// that protects an app-written OAuth token, and for the same reason: a value
+	// the app owns cannot survive a boot that replays .env over it.
+	Tier       string
+	TierSource string
 }
 
 // MainAccount is a provider's database-backup destination: it receives a copy of
@@ -435,6 +446,26 @@ func warnLegacyMainKeys() {
 		"use", "MEGA_ACCOUNT_MAIN_EMAIL/_PASSWORD and/or FOURSHARED_ACCOUNT_MAIN_EMAIL/_CONSUMER_KEY/_CONSUMER_SECRET/_OAUTH_TOKEN/_OAUTH_TOKEN_SECRET")
 }
 
+// TierFree and TierPaid are the account plans .env may declare. They mirror the
+// limits package's tiers; the string lives here too so accounts does not depend
+// on the limits table just to parse one .env value.
+const (
+	TierFree = "free"
+	TierPaid = "paid"
+)
+
+// normalizeTier maps a .env value onto a known tier. An unset or unrecognised
+// value becomes free, which is the conservative answer: a free tier carries the
+// strict caps, so mislabelling a paid account only splits archives it did not
+// have to, while guessing "paid" would let an oversized file through to a
+// provider that rejects it.
+func normalizeTier(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), TierPaid) {
+		return TierPaid
+	}
+	return TierFree
+}
+
 // mainSuffix is the slot a main account occupies where a numbered account has
 // its index: MEGA_ACCOUNT_MAIN_EMAIL alongside MEGA_ACCOUNT_1_EMAIL.
 const mainSuffix = "MAIN"
@@ -506,6 +537,7 @@ func loadProviderAccounts(provider ProviderType, prefix string) []Account {
 			Password:         password,
 			QuotaGB:          quota,
 			Index:            i,
+			Tier:             normalizeTier(os.Getenv(fmt.Sprintf("%s_%d_TIER", prefix, i))),
 			ConsumerKey:      os.Getenv(fmt.Sprintf("%s_%d_CONSUMER_KEY", prefix, i)),
 			ConsumerSecret:   os.Getenv(fmt.Sprintf("%s_%d_CONSUMER_SECRET", prefix, i)),
 			ConsumerDomain:   os.Getenv(fmt.Sprintf("%s_%d_CONSUMER_DOMAIN", prefix, i)),

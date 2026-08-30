@@ -125,8 +125,45 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("accounts.%s migration: %w", col.name, err)
 		}
 	}
+	// PR #14: an account's plan with its provider decides which size cap and
+	// transfer budget apply to it. tier_source mirrors token_source — a tier the
+	// user set in the app must survive a boot that replays a stale .env value.
+	for _, col := range []struct{ name, typ string }{
+		{"tier", "TEXT NOT NULL DEFAULT 'free'"},
+		{"tier_source", "TEXT"},
+	} {
+		if err := addColumnIfMissing(db, "accounts", col.name, col.typ); err != nil {
+			return fmt.Errorf("accounts.%s migration: %w", col.name, err)
+		}
+	}
+	// PR #14: why a pending job is not being claimed. A job held for the transfer
+	// budget is indistinguishable from a stuck one without this, and the reason
+	// has to outlive a restart to be worth showing.
+	if err := addColumnIfMissing(db, "jobs", "hold_reason", "TEXT"); err != nil {
+		return fmt.Errorf("jobs.hold_reason migration: %w", err)
+	}
+	// PR #14: the transfer ledger. A rolling window ("5 GB per 6 hours") cannot be
+	// answered by a counter column — it needs the individual transfers and their
+	// timestamps, so old ones fall out of the window as time passes.
+	if _, err := db.Exec(transferSchema); err != nil {
+		return fmt.Errorf("transfer_usage migration: %w", err)
+	}
 	return nil
 }
+
+// transferSchema is applied after the additive column migrations rather than
+// inside the schema const, purely for locality with the ledger's own code. Its
+// index is over its own columns, so it carries no ALTER-ordering hazard.
+const transferSchema = `
+CREATE TABLE IF NOT EXISTS transfer_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_usage_account_at ON transfer_usage(account_id, at);
+`
 
 // dropLegacyDirectories removes the dead backup_directories table. Its rows are
 // deleted first: nothing references them, but the table references backups, and
@@ -300,6 +337,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     reauth_reason TEXT,
     token_source TEXT,
     env_index INTEGER NOT NULL DEFAULT 0,
+    tier TEXT NOT NULL DEFAULT 'free',
+    tier_source TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, email)
 );
@@ -339,6 +378,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     chunks_total INTEGER DEFAULT 0,
     chunks_uploaded INTEGER DEFAULT 0,
     error_message TEXT,
+    hold_reason TEXT,
     verify_checksum TEXT,
     last_verified_at DATETIME,
     started_at DATETIME,

@@ -166,7 +166,10 @@ func (m *Manager) importAccounts(declared []accounts.Account) error {
 		merged, tokenSource := merge(current, envSecrets(a), row.TokenSource)
 		warnIgnoredEnvToken(provider, email, current, envSecrets(a), row.TokenSource)
 
-		if exists && merged == current && row.EnvIndex == a.Index && row.TokenSource == tokenSource && !quotaChanged(row, a) {
+		tier, tierSource := mergeTier(row, a, exists)
+
+		if exists && merged == current && row.EnvIndex == a.Index && row.TokenSource == tokenSource &&
+			!quotaChanged(row, a) && row.Tier == tier && row.TierSource == tierSource {
 			continue // nothing .env can tell us that we do not already have
 		}
 		sealed, err := m.kr.SealJSON(keyring.AccountAAD(kindAccount, provider, email), merged)
@@ -180,6 +183,8 @@ func (m *Manager) importAccounts(declared []accounts.Account) error {
 			EnvIndex:    a.Index,
 			SecretsEnc:  sealed,
 			TokenSource: tokenSource,
+			Tier:        tier,
+			TierSource:  tierSource,
 		}); err != nil {
 			return err
 		}
@@ -204,6 +209,25 @@ func (m *Manager) importAccounts(declared []accounts.Account) error {
 // quota poller writes the provider's real figure into the same column.
 func quotaChanged(row database.AccountRow, a accounts.Account) bool {
 	return a.QuotaGB > 0 && a.QuotaGB != row.QuotaGB
+}
+
+// mergeTier decides an account's tier the same way merge decides its OAuth
+// token: .env seeds it, and a value the user set in the app wins over whatever
+// .env still says.
+//
+// Without this rule the Accounts view's tier dropdown would appear to work and
+// then revert at the next restart, because .env is replayed into the database on
+// every boot. The stored tier is also what a *new* account inherits when .env
+// says nothing — the column defaults to free, so an unset key is not a change.
+func mergeTier(row database.AccountRow, a accounts.Account, exists bool) (tier, source string) {
+	if exists && row.TierSource == database.TierSourceApp {
+		return row.Tier, database.TierSourceApp
+	}
+	declared := a.Tier
+	if declared == "" {
+		declared = accounts.TierFree
+	}
+	return declared, database.TierSourceEnv
 }
 
 func (m *Manager) importMains(declared []accounts.MainAccount) error {
@@ -294,6 +318,8 @@ func (m *Manager) load(app accounts.OAuthApp) error {
 			OAuthTokenSecret: s.OAuthTokenSecret,
 			NeedsReauth:      r.NeedsReauth,
 			ReauthReason:     r.ReauthReason,
+			Tier:             r.Tier,
+			TierSource:       r.TierSource,
 		})
 	}
 
