@@ -187,6 +187,10 @@
                                             <template x-if="providerStatus(u, prov) === 'in_progress'">
                                                 <div class="progress"><div class="progress-fill" :style="`width:${providerProgress(u, prov)}%`"></div></div>
                                             </template>
+
+                                            <!-- Why an upload is waiting rather than running. Without this a
+                                                 job held for the transfer budget looks identical to a stuck one. -->
+                                            <div class="job-hold" x-show="providerHold(u, prov)" x-text="providerHold(u, prov)"></div>
                                         </div>
                                     </template>
                                     <template x-if="!(u.accounts && u.accounts.length)">
@@ -316,6 +320,23 @@
                                 </div>
                                 <div class="acct-quota"><span x-text="(a.quota_used_gb || 0).toFixed(2)"></span> / <span x-text="(a.quota_total_gb || 0).toFixed(2)"></span> GB used</div>
                                 <div class="acct-synced">Last synced: <span x-text="lastSynced(a)"></span></div>
+
+                                <!-- The plan selects which size cap and transfer budget apply.
+                                     Set here it survives a restart; .env only seeds it. -->
+                                <div class="acct-tier">
+                                    <label>Plan</label>
+                                    <select :value="a.tier" @change="setAccountTier(a, $event.target.value)">
+                                        <option value="free">Free</option>
+                                        <option value="paid">Paid</option>
+                                    </select>
+                                </div>
+                                <div class="acct-limits" x-text="accountLimitLabel(a)"></div>
+                                <div class="acct-transfer" x-show="a.transfer_budget_bytes > 0">
+                                    <div class="acct-transfer-bar">
+                                        <div class="acct-transfer-fill" :style="`width: ${transferPercent(a)}%`"></div>
+                                    </div>
+                                </div>
+
                                 <div class="acct-warn" x-show="needsReauth(a)" x-text="a.reauth_reason || 'The provider rejected this account's access token.'"></div>
                                 <button class="btn btn-purple acct-btn"
                                         x-show="needsReauth(a) && canReauth(a)"
@@ -346,10 +367,55 @@
                 <div class="form-field">
                     <label>Select directory to compress and back up</label>
                     <div class="path-row">
-                        <input type="text" x-model="uploadForm.source_path" placeholder="C:\path\to\directory or /path/to/directory">
+                        <input type="text" x-model="uploadForm.source_path" @input="preflight = null; preflightError = ''" placeholder="C:\path\to\directory or /path/to/directory">
                         <button type="button" class="btn btn-purple" @click="browsePath()" :disabled="browseLoading" x-text="browseLoading ? 'Opening…' : 'Browse'"></button>
                     </div>
                 </div>
+
+                <!-- Pre-flight: what this upload would produce, checked on directory
+                     metadata alone so an impossible backup is refused in seconds
+                     rather than after gigabytes of pointless compression. -->
+                <div class="form-field" x-show="!isTitleOnly()">
+                    <div class="path-row">
+                        <button type="button" class="btn btn-grey" @click="runPreflight()"
+                                :disabled="preflightLoading || !(uploadForm.source_path || '').trim() || !uploadForm.account_ids.length"
+                                x-text="preflightLoading ? 'Checking…' : 'Check what this will upload'"></button>
+                    </div>
+                    <p class="muted" x-show="preflightError" x-text="preflightError"></p>
+
+                    <div class="plan-preview" x-show="preflight" x-cloak>
+                        <p class="muted" x-show="preflight && preflight.total_source_bytes"
+                           x-text="'Source is ' + formatLimit(preflight.total_source_bytes) + '.'"></p>
+
+                        <template x-for="(g, gi) in (preflight ? preflight.groups : [])" :key="gi">
+                            <div class="plan-group">
+                                <div class="plan-group-head" x-text="planGroupSummary(g)"></div>
+                                <div class="plan-parts-note" x-show="g.byte_parts">
+                                    Numbered parts, not standalone archives — download all of them and rejoin
+                                    before extracting (open the .001 in 7-Zip, or <code>copy /b</code> on Windows).
+                                </div>
+                                <ul class="plan-volumes">
+                                    <template x-for="(v, vi) in g.volumes" :key="vi">
+                                        <li><span x-text="v.name"></span>
+                                            <span class="muted" x-text="'≈ ' + formatLimit(v.estimated_bytes)"></span></li>
+                                    </template>
+                                </ul>
+                            </div>
+                        </template>
+
+                        <template x-for="(b, bi) in (preflight ? preflight.blockers : [])" :key="bi">
+                            <p class="plan-blocker" x-text="b.message"></p>
+                        </template>
+                        <template x-for="(wn, wi) in (preflight ? preflight.warnings : [])" :key="wi">
+                            <p class="plan-warning" x-text="wn.message"></p>
+                        </template>
+
+                        <p class="muted" x-show="preflight && preflight.ok">
+                            Estimates are uncompressed sizes; the archives will be this size or smaller.
+                        </p>
+                    </div>
+                </div>
+
                 <div class="form-error" x-show="error" x-text="error"></div>
                 <div class="modal-actions">
                     <button class="btn btn-purple" @click="submitUpload()" :disabled="uploading" x-text="uploading ? 'Working…' : (isTitleOnly() ? 'Save Title' : 'Upload / Save')"></button>
@@ -494,9 +560,48 @@
                         <button type="button" class="btn btn-purple" @click="addTerm()">Add</button>
                     </div>
                 </div>
+
+                <div class="form-field">
+                    <label>Provider limits</label>
+                    <p class="muted settings-hint">
+                        What each provider accepts, per account plan. An archive larger than the
+                        size limit is split into several standalone zips — each one opens on its
+                        own, and extracting them all into the same folder rebuilds the original.
+                        Uploads that would exceed the transfer budget wait for the window to roll
+                        over instead of being sent and rejected.
+                        <strong>Enter 0 for no limit.</strong>
+                        Changes apply to the next backup; archives already uploaded are left alone.
+                    </p>
+                    <table class="limits-table">
+                        <thead>
+                            <tr>
+                                <th>Provider</th>
+                                <th>Plan</th>
+                                <th>Split archives at (GB)</th>
+                                <th>Transfer budget (GB)</th>
+                                <th>Per (hours)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="row in limitsForm" :key="row.provider + '|' + row.tier">
+                                <tr>
+                                    <td x-text="row.provider"></td>
+                                    <td x-text="row.tier"></td>
+                                    <td><input type="number" min="0" step="any" x-model.number="row.max_file_gb"></td>
+                                    <td><input type="number" min="0" step="any" x-model.number="row.transfer_gb"></td>
+                                    <td><input type="number" min="1" step="1" x-model.number="row.window_hours"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    <div class="path-row term-add">
+                        <button type="button" class="btn btn-grey" @click="resetLimitsToDefaults()">Reset to defaults</button>
+                    </div>
+                </div>
+
                 <div class="form-error" x-show="settingsError" x-text="settingsError"></div>
                 <div class="modal-actions">
-                    <button class="btn btn-purple" @click="saveSettings()" :disabled="settingsSaving" x-text="settingsSaving ? 'Saving…' : 'Save'"></button>
+                    <button class="btn btn-purple" @click="saveSettings()" :disabled="settingsSaving || !settingsLoaded" x-text="settingsSaving ? 'Saving…' : 'Save'"></button>
                     <button class="btn btn-grey" @click="cancelSettings()">Cancel</button>
                 </div>
             </div>

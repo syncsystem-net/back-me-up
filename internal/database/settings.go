@@ -4,7 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
+
+	"github.com/syncsystem-net/back-me-up/internal/limits"
 )
 
 // SettingExcludeTerms is the settings key holding the directory-name terms that
@@ -13,6 +16,15 @@ import (
 // Settings are a key/value table rather than one column per setting so the
 // Settings modal can grow without a migration each time.
 const SettingExcludeTerms = "exclude_terms"
+
+// SettingProviderLimits is the settings key holding the per-provider, per-tier
+// size caps and transfer budgets. The value is the JSON shape limits.Set
+// serializes to.
+//
+// It is one key rather than several because the limits are read together on
+// every upload; splitting them across keys would mean a partial write could
+// leave a threshold and its budget describing different intentions.
+const SettingProviderLimits = "provider_limits"
 
 // GetSetting returns the raw stored value for key, or ("", nil) when unset.
 func GetSetting(db *sql.DB, key string) (string, error) {
@@ -66,6 +78,29 @@ func SetExcludeTerms(db *sql.DB, terms []string) error {
 		return fmt.Errorf("encoding exclude terms: %w", err)
 	}
 	return SetSetting(db, SettingExcludeTerms, string(b))
+}
+
+// GetProviderLimits returns the configured provider limits, with anything the
+// stored row does not supply falling back to the shipped defaults. A read
+// failure degrades the same way — to the defaults, never to "unlimited". That
+// direction matters: unlimited would let an oversized archive reach a provider
+// that rejects it, which is the failure this whole phase exists to prevent.
+func GetProviderLimits(db *sql.DB) limits.Set {
+	raw, err := GetSetting(db, SettingProviderLimits)
+	if err != nil {
+		slog.Warn("could not read provider limits; using defaults", "error", err)
+		return limits.Defaults()
+	}
+	return limits.Parse(raw)
+}
+
+// SetProviderLimits replaces the stored limits with a fully-populated table.
+func SetProviderLimits(db *sql.DB, set limits.Set) error {
+	raw, err := set.Marshal()
+	if err != nil {
+		return fmt.Errorf("encoding provider limits: %w", err)
+	}
+	return SetSetting(db, SettingProviderLimits, raw)
 }
 
 // normalizeTerms trims each term and drops blanks and case-insensitive

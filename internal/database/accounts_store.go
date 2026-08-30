@@ -25,12 +25,27 @@ type DBAccount struct {
 	// EnvIndex is the account's .env slot, so a message can name real keys
 	// (FOURSHARED_ACCOUNT_2_*) rather than describing them.
 	EnvIndex int `json:"env_index"`
+
+	// Tier is the account's plan with its provider ("free" or "paid"). It selects
+	// which size cap and transfer budget apply, so it is what makes one 4shared
+	// account split its archives at 1.9 GB while another does not.
+	Tier string `json:"tier"`
+
+	// TransferUsedBytes and TransferBudgetBytes describe the account's current
+	// rolling window. They are computed per request from the transfer ledger and
+	// the configured limits, not stored on the row.
+	TransferUsedBytes   int64 `json:"transfer_used_bytes"`
+	TransferBudgetBytes int64 `json:"transfer_budget_bytes"`
+	TransferWindowHours int   `json:"transfer_window_hours"`
+	// MaxFileBytes is the split threshold in force for this account. 0 means the
+	// provider accepts any size.
+	MaxFileBytes int64 `json:"max_file_bytes"`
 }
 
 func ListDBAccounts(db *sql.DB) ([]*DBAccount, error) {
 	rows, err := db.Query(
 		`SELECT id, provider, email, quota_total_gb, quota_used_gb, last_quota_sync, created_at,
-		        needs_reauth, COALESCE(reauth_reason, ''), env_index
+		        needs_reauth, COALESCE(reauth_reason, ''), env_index, COALESCE(tier, 'free')
 		 FROM accounts ORDER BY provider, email`,
 	)
 	if err != nil {
@@ -43,7 +58,7 @@ func ListDBAccounts(db *sql.DB) ([]*DBAccount, error) {
 		a := &DBAccount{}
 		var lastSync sql.NullTime
 		if err := rows.Scan(&a.ID, &a.Provider, &a.Email, &a.QuotaTotalGB, &a.QuotaUsedGB, &lastSync, &a.CreatedAt,
-			&a.NeedsReauth, &a.ReauthReason, &a.EnvIndex); err != nil {
+			&a.NeedsReauth, &a.ReauthReason, &a.EnvIndex, &a.Tier); err != nil {
 			return nil, fmt.Errorf("scanning account row: %w", err)
 		}
 		if lastSync.Valid {
@@ -52,6 +67,18 @@ func ListDBAccounts(db *sql.DB) ([]*DBAccount, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// UpdateAccountTier records a tier the user chose in the app and marks it as
+// app-set, so the .env reconciliation on the next boot leaves it alone. This is
+// the same rule that protects an app-written OAuth token from a stale .env value
+// — without it, changing a tier in the UI would silently revert on restart.
+func UpdateAccountTier(db *sql.DB, id int64, tier string) error {
+	_, err := db.Exec(`UPDATE accounts SET tier = ?, tier_source = 'app' WHERE id = ?`, tier, id)
+	if err != nil {
+		return fmt.Errorf("updating account tier: %w", err)
+	}
+	return nil
 }
 
 // UpdateAccountQuota stores the latest total/used capacity (in bytes, converted
@@ -71,12 +98,14 @@ func UpdateAccountQuota(db *sql.DB, id, totalBytes, usedBytes int64) error {
 
 func GetDBAccountByID(db *sql.DB, id int64) (*DBAccount, error) {
 	row := db.QueryRow(
-		`SELECT id, provider, email, quota_total_gb, quota_used_gb, last_quota_sync, created_at FROM accounts WHERE id = ?`,
+		`SELECT id, provider, email, quota_total_gb, quota_used_gb, last_quota_sync, created_at,
+		        COALESCE(tier, 'free')
+		 FROM accounts WHERE id = ?`,
 		id,
 	)
 	a := &DBAccount{}
 	var lastSync sql.NullTime
-	if err := row.Scan(&a.ID, &a.Provider, &a.Email, &a.QuotaTotalGB, &a.QuotaUsedGB, &lastSync, &a.CreatedAt); err != nil {
+	if err := row.Scan(&a.ID, &a.Provider, &a.Email, &a.QuotaTotalGB, &a.QuotaUsedGB, &lastSync, &a.CreatedAt, &a.Tier); err != nil {
 		return nil, fmt.Errorf("scanning account: %w", err)
 	}
 	if lastSync.Valid {

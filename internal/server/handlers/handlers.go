@@ -19,6 +19,7 @@ import (
 	"github.com/syncsystem-net/back-me-up/internal/credentials"
 	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/keyring"
+	"github.com/syncsystem-net/back-me-up/internal/limits"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 	"github.com/syncsystem-net/back-me-up/internal/quota"
 	"github.com/syncsystem-net/back-me-up/internal/scanner"
@@ -45,7 +46,11 @@ type Handlers struct {
 	// scanMaxDepth caps the recursive directory walk that records a zip's tree
 	// (config scan.max_depth, default 3).
 	scanMaxDepth int
-	ui           UI
+	// splitMethod is how an oversized backup is divided (config
+	// archive.split_method). The zero value normalizes to auto, so a Handlers
+	// built without it behaves as configured rather than refusing to split.
+	splitMethod archive.SplitMethod
+	ui          UI
 
 	// connect resolves a logged-in provider for one account. It wraps
 	// cloud.Connect in production and is a field so tests can drive the delete
@@ -54,7 +59,7 @@ type Handlers struct {
 	connect func(ctx context.Context, providerName, email string) (provider.Provider, error)
 }
 
-func New(db *sql.DB, creds *credentials.Manager, chunkSize int64, scanMaxDepth int, ui UI) *Handlers {
+func New(db *sql.DB, creds *credentials.Manager, chunkSize int64, scanMaxDepth int, splitMethod string, ui UI) *Handlers {
 	tmplPath := filepath.Join("web", "templates", "*.html")
 	tmpl, err := template.ParseGlob(tmplPath)
 	if err != nil {
@@ -68,6 +73,7 @@ func New(db *sql.DB, creds *credentials.Manager, chunkSize int64, scanMaxDepth i
 		tmpl:         tmpl,
 		chunkSize:    chunkSize,
 		scanMaxDepth: scanMaxDepth,
+		splitMethod:  archive.NormalizeMethod(splitMethod),
 		ui:           ui,
 	}
 	h.connect = func(ctx context.Context, providerName, email string) (provider.Provider, error) {
@@ -112,8 +118,35 @@ func GetAccountsHandler(db *sql.DB) http.HandlerFunc {
 		if accts == nil {
 			accts = []*database.DBAccount{}
 		}
+		enrichAccountLimits(db, accts)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(accts)
+	}
+}
+
+// enrichAccountLimits fills in what each account's tier currently means: the
+// split threshold in force, and how much of its transfer window is spent.
+//
+// These are derived per request rather than stored on the row, so they cannot
+// drift from the settings the way a cached copy would. A usage lookup failure
+// leaves the figure at zero and is logged — a missing number must not cost the
+// user the account list.
+func enrichAccountLimits(db *sql.DB, accts []*database.DBAccount) {
+	limitSet := database.GetProviderLimits(db)
+	for _, a := range accts {
+		lim := limitSet.For(a.Provider, limits.NormalizeTier(a.Tier))
+		a.MaxFileBytes = lim.MaxFileBytes
+		a.TransferBudgetBytes = lim.TransferBytes
+		a.TransferWindowHours = lim.WindowHours
+		if !lim.Budgeted() {
+			continue
+		}
+		used, err := database.TransferUsedSince(db, a.ID, lim.WindowHours)
+		if err != nil {
+			slog.Warn("reading transfer usage", "account_id", a.ID, "error", err)
+			continue
+		}
+		a.TransferUsedBytes = used
 	}
 }
 
@@ -360,6 +393,10 @@ func searchNode(n *scanner.Node, ancestors []string, q string) []treeHit {
 
 // GetSettingsHandler returns the user-editable settings. Route: GET
 // /api/settings.
+//
+// The response is a fixed set of keys, not a dump of the settings table. That
+// table also holds the credential salt, verifier and KDF parameters, and this
+// endpoint must never be a way to read them.
 func GetSettingsHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		terms, err := database.GetExcludeTerms(db)
@@ -369,26 +406,64 @@ func GetSettingsHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"exclude_terms": terms})
+		json.NewEncoder(w).Encode(map[string]any{
+			"exclude_terms":   terms,
+			"provider_limits": database.GetProviderLimits(db),
+			// The shipped caps, so the Settings modal can offer "reset to defaults"
+			// without hardcoding numbers the server owns.
+			"provider_limit_defaults": limits.Defaults(),
+		})
 	}
 }
 
-// PutSettingsHandler replaces the exclude terms. Terms take effect on the next
-// backup; trees already recorded are left alone. Route: PUT /api/settings.
+// PutSettingsHandler replaces the exclude terms and the provider limits. Both
+// take effect on the next backup; archives already uploaded are left alone, the
+// same rule exclude terms have always followed. Route: PUT /api/settings.
+//
+// Each field is optional and applied only when present, so the Settings modal
+// can save one section without having to send the other back untouched.
 func PutSettingsHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			ExcludeTerms []string `json:"exclude_terms"`
+			ExcludeTerms   []string `json:"exclude_terms"`
+			ProviderLimits *struct {
+				Raw json.RawMessage `json:"-"`
+			} `json:"-"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		// Decode twice: once into the typed shape, once as a raw map so an absent
+		// key is distinguishable from an empty one. Sending no exclude_terms must
+		// not silently clear the user's terms.
+		raw := map[string]json.RawMessage{}
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			jsonError(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		if err := database.SetExcludeTerms(db, body.ExcludeTerms); err != nil {
-			slog.Error("saving settings", "error", err)
-			jsonError(w, "failed to save settings", http.StatusInternalServerError)
-			return
+
+		if v, ok := raw["exclude_terms"]; ok {
+			if err := json.Unmarshal(v, &body.ExcludeTerms); err != nil {
+				jsonError(w, "invalid exclude_terms", http.StatusBadRequest)
+				return
+			}
+			if err := database.SetExcludeTerms(db, body.ExcludeTerms); err != nil {
+				slog.Error("saving exclude terms", "error", err)
+				jsonError(w, "failed to save settings", http.StatusInternalServerError)
+				return
+			}
 		}
+
+		if v, ok := raw["provider_limits"]; ok {
+			// Parse rather than store verbatim: it merges over the defaults, drops
+			// providers and tiers the code does not know, and clamps nonsense. A
+			// value written straight through could otherwise disable a cap by
+			// omitting a field.
+			set := limits.Parse(string(v))
+			if err := database.SetProviderLimits(db, set); err != nil {
+				slog.Error("saving provider limits", "error", err)
+				jsonError(w, "failed to save settings", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		terms, err := database.GetExcludeTerms(db)
 		if err != nil {
 			slog.Error("reloading settings", "error", err)
@@ -396,7 +471,51 @@ func PutSettingsHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"exclude_terms": terms})
+		json.NewEncoder(w).Encode(map[string]any{
+			"exclude_terms":           terms,
+			"provider_limits":         database.GetProviderLimits(db),
+			"provider_limit_defaults": limits.Defaults(),
+		})
+	}
+}
+
+// PutAccountTierHandler changes one account's plan with its provider, which
+// selects the size cap and transfer budget applied to it. Route: PUT
+// /api/accounts/{id}/tier.
+//
+// The change is marked as app-set so the .env reconciliation on the next boot
+// leaves it alone. Without that, this endpoint would appear to work and revert
+// at the next restart.
+func PutAccountTierHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			jsonError(w, "invalid account id", http.StatusBadRequest)
+			return
+		}
+		var body struct {
+			Tier string `json:"tier"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		tier := limits.NormalizeTier(body.Tier)
+		if string(tier) != body.Tier {
+			jsonError(w, "tier must be \"free\" or \"paid\"", http.StatusBadRequest)
+			return
+		}
+		if _, err := database.GetDBAccountByID(db, id); err != nil {
+			jsonError(w, "account not found", http.StatusNotFound)
+			return
+		}
+		if err := database.UpdateAccountTier(db, id, string(tier)); err != nil {
+			slog.Error("updating account tier", "account_id", id, "error", err)
+			jsonError(w, "failed to update the account tier", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"id": id, "tier": string(tier)})
 	}
 }
 
@@ -457,6 +576,7 @@ func (h *Handlers) QuotaSync(syncer *quota.Syncer) http.HandlerFunc {
 		if accts == nil {
 			accts = []*database.DBAccount{}
 		}
+		enrichAccountLimits(h.db, accts)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(accts)
 	}
@@ -529,58 +649,55 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Exclude terms shape only the recorded tree — the zip below still archives
-	// every directory, so the uploaded copy stays complete. A settings read
+	// Decide the archives before building any of them. A source that cannot fit
+	// its targets is refused here, on directory metadata alone, rather than after
+	// compressing several gigabytes to no purpose.
+	plan, err := h.buildUploadPlan(req.SourcePath, effective)
+	if err != nil {
+		slog.Error("planning upload", "path", req.SourcePath, "error", err)
+		jsonError(w, "failed to plan the backup: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !plan.OK() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":    "this backup cannot be uploaded as configured",
+			"blockers": plan.Blockers,
+			"warnings": plan.Warnings,
+		})
+		return
+	}
+
+	// Exclude terms shape only the recorded tree — the zips below still archive
+	// every directory, so the uploaded copies stay complete. A settings read
 	// failure degrades to "exclude nothing" rather than blocking the backup.
 	excludeTerms, err := database.GetExcludeTerms(h.db)
 	if err != nil {
 		slog.Warn("could not load exclude terms; recording full tree", "error", err)
 		excludeTerms = nil
 	}
-	root, err := scanner.Tree(req.SourcePath, scanner.Options{
-		MaxDepth:     h.scanMaxDepth,
-		ExcludeTerms: excludeTerms,
-	})
+
+	built, err := h.buildArchives(req.SourcePath, plan, excludeTerms)
 	if err != nil {
-		slog.Error("scanning directory", "path", req.SourcePath, "error", err)
-		jsonError(w, "failed to scan source directory", http.StatusInternalServerError)
-		return
-	}
-	treeJSON := scanner.TreeJSON(root)
-
-	zipPath, err := archive.Zip(req.SourcePath)
-	if err != nil {
-		slog.Error("creating zip", "path", req.SourcePath, "error", err)
-		jsonError(w, "failed to create zip archive", http.StatusInternalServerError)
-		return
-	}
-	remoteName := archive.RemoteName(req.SourcePath)
-
-	zipInfo, err := os.Stat(zipPath)
-	if err != nil {
-		os.Remove(zipPath)
-		jsonError(w, "failed to stat zip file", http.StatusInternalServerError)
-		return
-	}
-	totalBytes := zipInfo.Size()
-
-	// Quota pre-check: refuse the backup (and discard the zip) if any selected
-	// account lacks the free space to hold it, so we never start an upload
-	// that is doomed to fail partway. Accounts with unknown quota (0) are
-	// skipped rather than blocking the user.
-	if msg, ok := checkQuota(h.db, effective, totalBytes); !ok {
-		os.Remove(zipPath)
-		jsonError(w, msg, http.StatusConflict)
+		built.discard()
+		slog.Error("creating archives", "path", req.SourcePath, "error", err)
+		jsonError(w, "failed to create the zip archives: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Detect same-name files already on each target account. Unresolved
-	// conflicts are reported back (409) so the user can choose overwrite/skip;
-	// "overwrite" deletes the existing remote here so the new upload replaces it.
-	// Detection failures (login/network) are non-fatal: we log and proceed,
-	// leaving the upload worker as the source of truth.
-	if conflicts := h.resolveConflicts(r.Context(), effective, remoteName, req.ConflictResolutions); len(conflicts) > 0 {
-		os.Remove(zipPath)
+	// Conflict detection runs only once the archives exist. "Overwrite" deletes
+	// the copy already on the provider, so doing it earlier would mean a failure
+	// while zipping (a full disk, an unreadable file, a volume that came out over
+	// the threshold) leaves the user with neither the old archive nor a new one.
+	// The refusal that has to happen before any compression is the plan check
+	// above, which needs no network at all.
+	//
+	// Unresolved conflicts are reported back (409) so the user can choose
+	// overwrite/skip. Detection failures (login/network) are non-fatal: we log and
+	// proceed, leaving the upload worker as the source of truth.
+	if conflicts := h.resolveConflicts(r.Context(), plan, req.ConflictResolutions); len(conflicts) > 0 {
+		built.discard()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -590,122 +707,257 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := h.db.Begin()
+	backupID, err := h.recordBackup(req.OwnerEmail, req.Title, req.SourcePath, built)
 	if err != nil {
-		os.Remove(zipPath)
-		jsonError(w, "failed to begin transaction", http.StatusInternalServerError)
-		return
-	}
-
-	// One record per user, accumulating zips. Upsert the record (renaming it if a
-	// title was supplied), then attach this upload as a new zip with its tree.
-	backupID, err := database.UpsertBackupForUser(tx, req.OwnerEmail, req.Title, req.SourcePath)
-	if err != nil {
-		tx.Rollback()
-		os.Remove(zipPath)
-		slog.Error("upserting backup record", "error", err)
-		jsonError(w, "failed to create backup", http.StatusInternalServerError)
-		return
-	}
-
-	zipID, err := database.InsertZip(tx, backupID, remoteName, req.SourcePath, totalBytes, treeJSON)
-	if err != nil {
-		tx.Rollback()
-		os.Remove(zipPath)
-		slog.Error("inserting zip", "error", err)
-		jsonError(w, "failed to record zip", http.StatusInternalServerError)
-		return
-	}
-
-	for _, accountID := range effective {
-		if _, err := database.InsertJob(tx, backupID, zipID, accountID, zipPath, remoteName, totalBytes); err != nil {
-			tx.Rollback()
-			os.Remove(zipPath)
-			slog.Error("inserting job", "account_id", accountID, "error", err)
-			jsonError(w, "failed to insert job", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		tx.Rollback()
-		os.Remove(zipPath)
-		slog.Error("committing transaction", "error", err)
-		jsonError(w, "failed to commit transaction", http.StatusInternalServerError)
+		built.discard()
+		slog.Error("recording backup", "error", err)
+		jsonError(w, "failed to record the backup", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]int64{"id": backupID})
+	json.NewEncoder(w).Encode(map[string]any{"id": backupID, "warnings": plan.Warnings})
 }
 
-// resolveConflicts checks each target account's cloud root for an existing file
-// named remoteName. For an account the user marked "overwrite" it deletes the
-// existing file so the upload replaces it; an account with an existing file and
-// no resolution is returned as a conflict for the UI to prompt on. Connection or
-// lookup failures are logged and treated as "no conflict".
-func (h *Handlers) resolveConflicts(ctx context.Context, accountIDs []int64, remoteName string, resolutions map[string]string) []conflictInfo {
-	var conflicts []conflictInfo
-	for _, id := range accountIDs {
-		acct, err := database.GetDBAccountByID(h.db, id)
-		if err != nil {
-			slog.Warn("conflict check: account not found", "account_id", id, "error", err)
-			continue
+// builtArchive is one zip written to disk, with everything needed to record it.
+type builtArchive struct {
+	zipPath    string
+	remoteName string
+	sizeBytes  int64
+	treeJSON   string
+	accountIDs []int64
+}
+
+// builtSet is every archive produced for one backup.
+type builtSet []*builtArchive
+
+// discard removes the temp zips. Called on any failure after zipping: a
+// half-recorded backup would leave multi-gigabyte files beside the user's source
+// directory with nothing in the database pointing at them.
+func (b builtSet) discard() {
+	for _, a := range b {
+		if a.zipPath != "" {
+			os.Remove(a.zipPath)
 		}
-		p, err := h.connect(ctx, acct.Provider, acct.Email)
-		if err != nil {
-			slog.Warn("conflict check: could not connect", "provider", acct.Provider, "email", acct.Email, "error", err)
-			continue
+	}
+}
+
+// buildArchives compresses the planned volumes. It returns whatever it managed
+// to write alongside the error, so the caller can clean up a partial set.
+//
+// Each group is zipped independently: a group whose threshold requires splitting
+// gets one archive per volume, and a group that fits gets one whole-directory
+// archive named exactly as an unsplit backup always has been.
+func (h *Handlers) buildArchives(sourcePath string, plan *uploadPlan, excludeTerms []string) (builtSet, error) {
+	var built builtSet
+
+	for _, g := range plan.Groups {
+		names := g.plan.Names(sourcePath)
+		accountIDs := make([]int64, 0, len(g.Accounts))
+		for _, a := range g.Accounts {
+			accountIDs = append(accountIDs, a.ID)
 		}
-		ref, found, err := p.FindByName(ctx, remoteName)
-		if err != nil {
-			slog.Warn("conflict check: lookup failed", "provider", acct.Provider, "email", acct.Email, "error", err)
-			continue
-		}
-		if !found {
-			continue
-		}
-		switch resolutions[strconv.FormatInt(id, 10)] {
-		case "overwrite":
-			if err := p.Delete(ctx, ref); err != nil {
-				slog.Warn("conflict overwrite: delete failed", "provider", acct.Provider, "email", acct.Email, "error", err)
+
+		if g.plan.ByteParts() {
+			parts, err := h.buildByteParts(sourcePath, g, accountIDs, excludeTerms)
+			built = append(built, parts...)
+			if err != nil {
+				return built, err
 			}
-		default:
-			conflicts = append(conflicts, conflictInfo{
-				AccountID: id,
-				Provider:  acct.Provider,
-				Email:     acct.Email,
-				Name:      remoteName,
+			continue
+		}
+
+		for i, vol := range g.plan.Volumes {
+			includes := g.plan.Includes(i)
+
+			// Each volume's tree covers only what that volume holds. A volume
+			// claiming the whole source would make the record's merged tree and the
+			// global search describe archives that do not contain what they say.
+			root, err := scanner.TreeFor(sourcePath, includes, scanner.Options{
+				MaxDepth:     h.scanMaxDepth,
+				ExcludeTerms: excludeTerms,
+			})
+			if err != nil {
+				return built, fmt.Errorf("scanning source directory: %w", err)
+			}
+
+			var zipPath string
+			if len(g.plan.Volumes) == 1 {
+				zipPath, err = archive.Zip(sourcePath)
+			} else {
+				zipPath, err = archive.ZipItems(sourcePath, vol.Items)
+			}
+			if err != nil {
+				return built, err
+			}
+
+			info, err := os.Stat(zipPath)
+			if err != nil {
+				os.Remove(zipPath)
+				return built, fmt.Errorf("stat zip file: %w", err)
+			}
+
+			// Packing decided on raw sizes; this is the check against what was
+			// actually written. Uploading a volume over the threshold would be
+			// uploading something the provider is going to reject, so it fails here
+			// with an explanation rather than several minutes later in a job log.
+			if g.ThresholdBytes > 0 && info.Size() > g.ThresholdBytes {
+				os.Remove(zipPath)
+				return built, fmt.Errorf(
+					"archive %s came out at %s, over the %s limit for these accounts; lower this provider's split threshold in Settings",
+					names[i], archive.HumanBytes(info.Size()), archive.HumanBytes(g.ThresholdBytes))
+			}
+
+			built = append(built, &builtArchive{
+				zipPath:    zipPath,
+				remoteName: names[i],
+				sizeBytes:  info.Size(),
+				treeJSON:   scanner.TreeJSON(root),
+				accountIDs: accountIDs,
 			})
 		}
 	}
-	return conflicts
+	return built, nil
 }
 
-// checkQuota verifies each selected account has room for sizeBytes. It returns
-// ("", true) when every account fits (or has unknown quota), or a human-readable
-// message and false on the first account that does not fit.
-func checkQuota(db *sql.DB, accountIDs []int64, sizeBytes int64) (string, bool) {
-	const bytesPerGB = 1 << 30
-	for _, id := range accountIDs {
-		acct, err := database.GetDBAccountByID(db, id)
+// recordBackup writes the record, its zips and their jobs in one transaction, so
+// a backup is never half-registered.
+func (h *Handlers) recordBackup(ownerEmail, title, sourcePath string, built builtSet) (int64, error) {
+	tx, err := h.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("beginning transaction: %w", err)
+	}
+
+	// One record per user, accumulating zips. Upsert the record (renaming it if a
+	// title was supplied), then attach each archive as a zip with its own tree.
+	backupID, err := database.UpsertBackupForUser(tx, ownerEmail, title, sourcePath)
+	if err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("upserting backup record: %w", err)
+	}
+
+	for _, a := range built {
+		zipID, err := database.InsertZip(tx, backupID, a.remoteName, sourcePath, a.sizeBytes, a.treeJSON)
 		if err != nil {
-			return "selected account not found", false
+			tx.Rollback()
+			return 0, fmt.Errorf("inserting zip %s: %w", a.remoteName, err)
 		}
-		if acct.QuotaTotalGB <= 0 {
-			continue // quota unknown; don't block
-		}
-		availableBytes := int64((acct.QuotaTotalGB - acct.QuotaUsedGB) * bytesPerGB)
-		if sizeBytes > availableBytes {
-			return fmt.Sprintf(
-				"%s account %s does not have enough space: backup is %.2f GB but only %.2f GB is free",
-				acct.Provider, acct.Email,
-				float64(sizeBytes)/bytesPerGB, float64(availableBytes)/bytesPerGB,
-			), false
+		for _, accountID := range a.accountIDs {
+			if _, err := database.InsertJob(tx, backupID, zipID, accountID, a.zipPath, a.remoteName, a.sizeBytes); err != nil {
+				tx.Rollback()
+				return 0, fmt.Errorf("inserting job for account %d: %w", accountID, err)
+			}
 		}
 	}
-	return "", true
+
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("committing transaction: %w", err)
+	}
+	return backupID, nil
+}
+
+// PostBackupsPreflight answers what an upload would do without doing any of it:
+// how many archives each provider would receive, how large they would be, and
+// anything that blocks or delays them. Route: POST /api/backups/preflight.
+//
+// It exists so the user sees the split before committing to it. The same
+// buildUploadPlan runs here and in PostBackups, so the preview cannot disagree
+// with what actually happens.
+func (h *Handlers) PostBackupsPreflight(w http.ResponseWriter, r *http.Request) {
+	if h.refuseWhenLocked(w) {
+		return
+	}
+
+	var req struct {
+		SourcePath string  `json:"source_path"`
+		AccountIDs []int64 `json:"account_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	info, err := os.Stat(req.SourcePath)
+	if err != nil || !info.IsDir() {
+		jsonError(w, "source_path must be an existing directory", http.StatusBadRequest)
+		return
+	}
+	if len(req.AccountIDs) == 0 {
+		jsonError(w, "at least one account_id is required", http.StatusBadRequest)
+		return
+	}
+
+	plan, err := h.buildUploadPlan(req.SourcePath, req.AccountIDs)
+	if err != nil {
+		slog.Error("preflight planning failed", "path", req.SourcePath, "error", err)
+		jsonError(w, "failed to plan the backup: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":                 plan.OK(),
+		"groups":             plan.Groups,
+		"blockers":           plan.Blockers,
+		"warnings":           plan.Warnings,
+		"total_source_bytes": plan.TotalSourceBytes,
+	})
+}
+
+// resolveConflicts checks each target account's cloud root for existing files
+// with any of the names this backup will produce. For an account the user marked
+// "overwrite" it deletes the existing files so the upload replaces them; an
+// account with an existing file and no resolution is returned as a conflict for
+// the UI to prompt on. Connection or lookup failures are logged and treated as
+// "no conflict".
+//
+// A split backup gives each account several names, so a conflict is reported per
+// (account, name). Prompting once per account would be ambiguous about which
+// archive is being replaced, and checking only the first name would let the
+// remaining volumes fail at upload time with 4shared's 403.0201.
+func (h *Handlers) resolveConflicts(ctx context.Context, plan *uploadPlan, resolutions map[string]string) []conflictInfo {
+	var conflicts []conflictInfo
+	for _, g := range plan.Groups {
+		names := make([]string, 0, len(g.Volumes))
+		for _, v := range g.Volumes {
+			names = append(names, v.Name)
+		}
+
+		for _, a := range g.Accounts {
+			p, err := h.connect(ctx, a.Provider, a.Email)
+			if err != nil {
+				slog.Warn("conflict check: could not connect", "provider", a.Provider, "email", a.Email, "error", err)
+				continue
+			}
+			resolution := resolutions[strconv.FormatInt(a.ID, 10)]
+
+			for _, name := range names {
+				ref, found, err := p.FindByName(ctx, name)
+				if err != nil {
+					slog.Warn("conflict check: lookup failed", "provider", a.Provider, "email", a.Email, "name", name, "error", err)
+					continue
+				}
+				if !found {
+					continue
+				}
+				if resolution == "overwrite" {
+					if err := p.Delete(ctx, ref); err != nil {
+						slog.Warn("conflict overwrite: delete failed", "provider", a.Provider, "email", a.Email, "name", name, "error", err)
+					}
+					continue
+				}
+				conflicts = append(conflicts, conflictInfo{
+					AccountID: a.ID,
+					Provider:  a.Provider,
+					Email:     a.Email,
+					Name:      name,
+				})
+			}
+		}
+	}
+	return conflicts
 }
 
 // GetJobLogsHandler returns the log lines for a single job, powering the
@@ -801,4 +1053,78 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// buildByteParts produces one archive of the whole directory and cuts it into
+// parts small enough for the group's threshold.
+//
+// This is the fallback for the one shape whole-file packing cannot express: a
+// single file larger than the provider's limit. The parts are a raw byte cut, so
+// none of them opens on its own — the tree is therefore recorded against the
+// first part, which is both the entry point a rejoining tool is pointed at and
+// the only place a tree would not be a lie about what that file contains.
+func (h *Handlers) buildByteParts(sourcePath string, g *planGroup, accountIDs []int64, excludeTerms []string) (builtSet, error) {
+	var built builtSet
+
+	// The tree describes the source as a whole, because the parts jointly are the
+	// source. Passing no includes is exactly that statement.
+	root, err := scanner.TreeFor(sourcePath, nil, scanner.Options{
+		MaxDepth:     h.scanMaxDepth,
+		ExcludeTerms: excludeTerms,
+	})
+	if err != nil {
+		return built, fmt.Errorf("scanning source directory: %w", err)
+	}
+
+	zipPath, err := archive.Zip(sourcePath)
+	if err != nil {
+		return built, err
+	}
+
+	partPaths, err := archive.SplitFile(zipPath, g.plan.PartBytes)
+	if err != nil {
+		os.Remove(zipPath)
+		return built, err
+	}
+
+	for i, p := range partPaths {
+		info, err := os.Stat(p)
+		if err != nil {
+			// Hand back what exists so the caller can clean all of it up.
+			for _, rest := range partPaths[i:] {
+				os.Remove(rest)
+			}
+			return built, fmt.Errorf("stat archive part: %w", err)
+		}
+		// The cut is exact, so a part over the threshold means the split itself is
+		// wrong rather than compression being unlucky — worth failing loudly.
+		if g.ThresholdBytes > 0 && info.Size() > g.ThresholdBytes {
+			for _, rest := range partPaths[i:] {
+				os.Remove(rest)
+			}
+			return built, fmt.Errorf("archive part %s came out at %s, over the %s limit for these accounts",
+				filepath.Base(p), archive.HumanBytes(info.Size()), archive.HumanBytes(g.ThresholdBytes))
+		}
+
+		tree := ""
+		if i == 0 {
+			tree = scanner.TreeJSON(root)
+		}
+		// Compression can bring the whole archive under the threshold after the
+		// plan estimated several parts from the uncompressed total. One part is a
+		// complete, openable archive, so it takes the plain name — a .001 suffix
+		// would tell the user to go looking for parts that do not exist.
+		remoteName := archive.PartName(sourcePath, i+1)
+		if len(partPaths) == 1 {
+			remoteName = archive.RemoteName(sourcePath)
+		}
+		built = append(built, &builtArchive{
+			zipPath:    p,
+			remoteName: remoteName,
+			sizeBytes:  info.Size(),
+			treeJSON:   tree,
+			accountIDs: accountIDs,
+		})
+	}
+	return built, nil
 }

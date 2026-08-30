@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,13 @@ type Job struct {
 	ChunksUploaded int       `json:"chunks_uploaded"`
 	ErrorMessage   string    `json:"error_message"`
 	CreatedAt      time.Time `json:"created_at"`
+
+	// HoldReason explains why a pending job is not being claimed — currently only
+	// the provider's transfer budget. It is a column rather than something derived
+	// in the UI because a job waiting hours for a window to roll over is
+	// indistinguishable from a stuck one, and the explanation has to survive a
+	// restart to be worth anything.
+	HoldReason string `json:"hold_reason,omitempty"`
 }
 
 func InsertJob(tx *sql.Tx, backupID, zipID, accountID int64, zipPath, remoteName string, totalBytes int64) (int64, error) {
@@ -69,7 +77,8 @@ func InsertAdoptedJob(tx *sql.Tx, backupID, zipID, accountID int64, remoteName, 
 
 const jobColumns = `j.id, j.backup_id, COALESCE(j.zip_id, 0), j.account_id, a.provider, a.email, j.status,
 	COALESCE(j.zip_path, ''), COALESCE(j.remote_path, ''), COALESCE(j.remote_name, ''), j.total_bytes,
-	j.uploaded_bytes, j.chunks_total, j.chunks_uploaded, COALESCE(j.error_message, ''), j.created_at`
+	j.uploaded_bytes, j.chunks_total, j.chunks_uploaded, COALESCE(j.error_message, ''), j.created_at,
+	COALESCE(j.hold_reason, '')`
 
 func scanJob(s interface {
 	Scan(...any) error
@@ -77,7 +86,7 @@ func scanJob(s interface {
 	j := &Job{}
 	if err := s.Scan(&j.ID, &j.BackupID, &j.ZipID, &j.AccountID, &j.Provider, &j.Email, &j.Status,
 		&j.ZipPath, &j.RemotePath, &j.RemoteName, &j.TotalBytes, &j.UploadedBytes, &j.ChunksTotal,
-		&j.ChunksUploaded, &j.ErrorMessage, &j.CreatedAt); err != nil {
+		&j.ChunksUploaded, &j.ErrorMessage, &j.CreatedAt, &j.HoldReason); err != nil {
 		return nil, err
 	}
 	return j, nil
@@ -121,18 +130,87 @@ func GetJob(db *sql.DB, id int64) (*Job, error) {
 	return j, nil
 }
 
+// Allowance is how many more bytes may be uploaded to one account, counting only
+// what the transfer ledger already records. MaxBytes below zero means unlimited
+// — the provider/tier has no transfer budget configured, or the user set it to
+// unlimited.
+//
+// Uploads currently running are deliberately NOT subtracted here. They are
+// subtracted inside the claim statement instead, because a figure computed
+// before the claim is a figure two workers can both act on: each reads the same
+// allowance, each claims, and the budget is exceeded by whatever the second one
+// sends. Only the claim itself is atomic.
+type Allowance struct {
+	AccountID int64
+	MaxBytes  int64
+}
+
+// Unlimited reports whether this account has no byte ceiling at the moment.
+func (a Allowance) Unlimited() bool { return a.MaxBytes < 0 }
+
 // ClaimNextPendingJob atomically marks the oldest pending job as in_progress and
 // returns it, so no two workers pick up the same job. It returns (nil, nil) when
 // there is no pending work. The UPDATE ... RETURNING is a single statement and
 // therefore atomic under SQLite's write lock.
 func ClaimNextPendingJob(db *sql.DB) (*Job, error) {
+	return ClaimNextPendingJobWithin(db, nil)
+}
+
+// inFlightForAccount is a correlated subquery totalling an account's uploads
+// that are already running. It is evaluated inside the claim so the figure is
+// read and acted on in one atomic statement.
+const inFlightForAccount = `COALESCE((SELECT SUM(f.total_bytes) FROM jobs AS f
+	WHERE f.account_id = ? AND f.status = 'in_progress'), 0)`
+
+// ClaimNextPendingJobWithin is ClaimNextPendingJob restricted to what each
+// account's transfer budget currently permits. A nil allowances slice means no
+// restriction at all.
+//
+// The budget is folded into the claim itself rather than checked after claiming
+// and released on failure. That is the difference between "this account waits"
+// and "the queue waits": a claim-then-release loop would keep taking the oldest
+// pending job — which belongs to the over-budget account — and put it straight
+// back, so no other account's jobs would ever be reached.
+//
+// Bytes already in flight are subtracted here rather than by the caller. An
+// allowance computed before the claim is one that two workers can both pass:
+// each reads "3 GB left", each claims a 1.9 GB volume, and 3.8 GB goes out. The
+// UPDATE ... RETURNING is a single statement under SQLite's write lock, so
+// counting in-flight work inside it makes the ceiling actually hold instead of
+// merely narrowing the window.
+//
+// An empty (non-nil) slice means no account may be claimed from, which is the
+// honest reading of "every account with pending work is over budget".
+func ClaimNextPendingJobWithin(db *sql.DB, allowances []Allowance) (*Job, error) {
+	where := "status = 'pending'"
+	var args []any
+
+	if allowances != nil {
+		if len(allowances) == 0 {
+			return nil, nil
+		}
+		clauses := make([]string, 0, len(allowances))
+		for _, a := range allowances {
+			if a.Unlimited() {
+				clauses = append(clauses, "account_id = ?")
+				args = append(args, a.AccountID)
+				continue
+			}
+			clauses = append(clauses, "(account_id = ? AND total_bytes <= ? - "+inFlightForAccount+")")
+			args = append(args, a.AccountID, a.MaxBytes, a.AccountID)
+		}
+		where += " AND (" + strings.Join(clauses, " OR ") + ")"
+	}
+
 	var id int64
 	err := db.QueryRow(
-		`UPDATE jobs SET status = 'in_progress', started_at = CURRENT_TIMESTAMP, error_message = NULL
+		`UPDATE jobs SET status = 'in_progress', started_at = CURRENT_TIMESTAMP,
+		                 error_message = NULL, hold_reason = NULL
 		 WHERE id = (
-		     SELECT id FROM jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1
+		     SELECT id FROM jobs WHERE `+where+` ORDER BY created_at LIMIT 1
 		 )
 		 RETURNING id`,
+		args...,
 	).Scan(&id)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -141,6 +219,114 @@ func ClaimNextPendingJob(db *sql.DB) (*Job, error) {
 		return nil, fmt.Errorf("claiming job: %w", err)
 	}
 	return GetJob(db, id)
+}
+
+// PendingAccount is one account that currently has jobs waiting, with what the
+// budget lookup needs to size its allowance.
+type PendingAccount struct {
+	AccountID int64
+	Provider  string
+	Email     string
+	Tier      string
+	// LargestPendingBytes is the biggest job waiting on this account. A job larger
+	// than the account's entire budget can never run and must be failed rather
+	// than held forever, and this is what lets the worker notice that cheaply.
+	LargestPendingBytes int64
+}
+
+// ListAccountsWithPendingJobs returns the accounts that have pending work.
+func ListAccountsWithPendingJobs(db *sql.DB) ([]PendingAccount, error) {
+	rows, err := db.Query(
+		`SELECT a.id, a.provider, a.email, COALESCE(a.tier, 'free'), MAX(j.total_bytes)
+		 FROM jobs j JOIN accounts a ON j.account_id = a.id
+		 WHERE j.status = 'pending'
+		 GROUP BY a.id, a.provider, a.email, a.tier
+		 ORDER BY a.id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing accounts with pending jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingAccount
+	for rows.Next() {
+		var pa PendingAccount
+		if err := rows.Scan(&pa.AccountID, &pa.Provider, &pa.Email, &pa.Tier, &pa.LargestPendingBytes); err != nil {
+			return nil, fmt.Errorf("scanning pending account row: %w", err)
+		}
+		out = append(out, pa)
+	}
+	return out, rows.Err()
+}
+
+// ListPendingJobsOverBytes returns an account's pending jobs larger than limit.
+// Used to fail jobs that exceed the account's entire transfer budget, which no
+// amount of waiting can fix.
+func ListPendingJobsOverBytes(db *sql.DB, accountID, limitBytes int64) ([]*Job, error) {
+	rows, err := db.Query(
+		`SELECT `+jobColumns+`
+		 FROM jobs j JOIN accounts a ON j.account_id = a.id
+		 WHERE j.status = 'pending' AND j.account_id = ? AND j.total_bytes > ?
+		 ORDER BY j.created_at`,
+		accountID, limitBytes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing oversized pending jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []*Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning pending job row: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
+// HoldPendingJobs marks an account's pending jobs that do not fit maxBytes with
+// a reason, and returns how many rows actually changed. Rows already carrying
+// the same reason are left alone, so a caller can log only on a real transition
+// instead of once per poll tick.
+func HoldPendingJobs(db *sql.DB, accountID, maxBytes int64, reason string) (int64, error) {
+	res, err := db.Exec(
+		`UPDATE jobs SET hold_reason = ?
+		 WHERE status = 'pending' AND account_id = ? AND total_bytes > ?
+		   AND COALESCE(hold_reason, '') != ?`,
+		reason, accountID, maxBytes, reason,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("holding pending jobs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return n, nil
+}
+
+// ReleasePendingJobs clears the hold on an account's pending jobs that now fit
+// maxBytes, returning how many were released. A negative maxBytes releases
+// everything, which is what an unlimited budget means.
+func ReleasePendingJobs(db *sql.DB, accountID, maxBytes int64) (int64, error) {
+	query := `UPDATE jobs SET hold_reason = NULL
+	          WHERE status = 'pending' AND account_id = ? AND hold_reason IS NOT NULL`
+	args := []any{accountID}
+	if maxBytes >= 0 {
+		query += ` AND total_bytes <= ?`
+		args = append(args, maxBytes)
+	}
+	res, err := db.Exec(query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("releasing pending jobs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return n, nil
 }
 
 // UpdateJobProgress persists incremental upload progress for a job.
@@ -248,6 +434,31 @@ func FailJob(db *sql.DB, id int64, errMsg string) error {
 		return fmt.Errorf("failing job: %w", err)
 	}
 	return nil
+}
+
+// FailPendingJob fails a job only while it is still pending, and reports whether
+// it was this call that did so.
+//
+// Unlike a claimed job, a job failed for a standing reason (an archive larger
+// than its account's whole transfer budget) is spotted by every worker goroutine
+// on every poll tick, none of which has claimed it. Without the status guard all
+// of them would fail the same job and write the same explanation, filling that
+// job's log modal with identical lines.
+func FailPendingJob(db *sql.DB, id int64, errMsg string) (bool, error) {
+	res, err := db.Exec(
+		`UPDATE jobs SET status = 'failed', error_message = ?, hold_reason = NULL,
+		                 completed_at = CURRENT_TIMESTAMP
+		 WHERE id = ? AND status = 'pending'`,
+		errMsg, id,
+	)
+	if err != nil {
+		return false, fmt.Errorf("failing pending job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, nil
+	}
+	return n > 0, nil
 }
 
 // RequeueStaleJobs resets jobs left in_progress by a previous run back to

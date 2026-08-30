@@ -94,6 +94,13 @@ document.addEventListener('alpine:init', () => {
         uploadForm: { owner_email: '', backup_id: null, title: '', source_path: '', account_ids: [], accounts: [] },
         uploading: false,
         browseLoading: false,
+        // What the server says this upload would produce: one archive set per
+        // provider threshold, plus anything blocking or delaying it. Null until
+        // checked, and cleared whenever the inputs change so a stale preview can
+        // never describe a different upload than the one about to run.
+        preflight: null,
+        preflightLoading: false,
+        preflightError: '',
 
         // Logs modal.
         showLogsModal: false,
@@ -116,12 +123,21 @@ document.addEventListener('alpine:init', () => {
         conflicts: [],
         conflictChoices: {},
 
-        // Settings modal (exclude terms).
+        // Settings modal (exclude terms and provider limits).
         showSettingsModal: false,
         excludeTerms: [],
         newTerm: '',
         settingsSaving: false,
         settingsError: '',
+        // Per-provider, per-tier size cap and transfer budget. Held as an editable
+        // copy in the units the user thinks in (GB), converted on save — a byte
+        // count is not something anyone wants to type.
+        providerLimits: {},
+        providerLimitDefaults: {},
+        limitsForm: [],
+        // Whether the modal's contents actually reflect what is stored. False
+        // means the load failed, and saving would write memory over the database.
+        settingsLoaded: false,
 
         // Auto-Sync (remote crawl). The run lives on the server; this is a view of
         // it, refreshed by the same poll tick while the modal is open. openedFromWarning
@@ -332,7 +348,17 @@ document.addEventListener('alpine:init', () => {
         providerDisplayStatus(u, provider) {
             const s = this.providerStatus(u, provider);
             if (s === 'in_progress' && this.providerProgress(u, provider) >= 100) return 'verifying';
+            // A job the worker is deliberately not claiming reads as "pending" and
+            // would otherwise be indistinguishable from a stuck one.
+            if (s === 'pending' && this.providerHold(u, provider)) return 'waiting';
             return s;
+        },
+        // The hold on this provider's pending jobs, if any. The reason is stored on
+        // the job so it survives a restart and explains itself without the user
+        // having to open a log.
+        providerHold(u, provider) {
+            const held = this.providerJobs(u, provider).find(j => this.jobHoldReason(j));
+            return held ? held.hold_reason : '';
         },
         providerProgress(u, provider) {
             const jobs = this.providerJobs(u, provider);
@@ -404,6 +430,55 @@ document.addEventListener('alpine:init', () => {
             if (!a || !a.last_quota_sync) return 'never';
             return new Date(a.last_quota_sync).toLocaleString();
         },
+
+        // ---- Account tier and transfer budget ----
+        // Changing a tier changes which size cap and transfer budget apply, so the
+        // account list is reloaded to show the new figures immediately.
+        async setAccountTier(a, tier) {
+            if (!a || a.tier === tier) return;
+            const previous = a.tier;
+            a.tier = tier; // optimistic, so the select does not snap back while saving
+            try {
+                const r = await fetch(`/api/accounts/${a.id}/tier`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tier }),
+                });
+                if (!r.ok) {
+                    a.tier = previous;
+                    const e = await r.json().catch(() => ({}));
+                    this.error = e.error || 'Could not change the account tier';
+                    return;
+                }
+                await this.loadAccounts();
+            } catch (e) {
+                a.tier = previous;
+                this.error = 'Could not change the account tier';
+            }
+        },
+        // What this account's tier means, in one line for the account card.
+        accountLimitLabel(a) {
+            if (!a) return '';
+            const cap = a.max_file_bytes > 0
+                ? `archives split at ${this.formatLimit(a.max_file_bytes)}`
+                : 'no file size limit';
+            if (!a.transfer_budget_bytes) return `${cap} · unlimited transfer`;
+            const left = Math.max(0, a.transfer_budget_bytes - (a.transfer_used_bytes || 0));
+            return `${cap} · ${this.formatLimit(left)} of ${this.formatLimit(a.transfer_budget_bytes)} left this ${a.transfer_window_hours}h`;
+        },
+        // Fraction of the transfer window consumed, for a meter.
+        transferPercent(a) {
+            if (!a || !a.transfer_budget_bytes) return 0;
+            return Math.min(100, Math.round(((a.transfer_used_bytes || 0) / a.transfer_budget_bytes) * 100));
+        },
+        // A pending job the worker is deliberately not claiming. Distinguishing
+        // this from a stuck job is the whole reason the reason is stored.
+        jobHoldReason(j) {
+            return j && j.status === 'pending' && j.hold_reason ? j.hold_reason : '';
+        },
+        heldJobs(u) {
+            return (u.jobs || []).filter(j => this.jobHoldReason(j));
+        },
         async refreshQuotas() {
             this.refreshingQuotas = true;
             try {
@@ -418,6 +493,10 @@ document.addEventListener('alpine:init', () => {
         // ---- Upload / Edit ----
         openUpload(u) {
             this.error = '';
+            // A preview describes one directory for one set of accounts. Carrying
+            // it into a different user's modal would show them someone else's plan.
+            this.preflight = null;
+            this.preflightError = '';
             this.uploadForm = {
                 owner_email: u.email,
                 backup_id: u.backup ? u.backup.id : null,
@@ -435,6 +514,10 @@ document.addEventListener('alpine:init', () => {
                 if (!r.ok) return;
                 const { path } = await r.json();
                 if (path) {
+                    // Setting x-model in code fires no DOM input event, so the
+                    // input's own @input handler will not clear the preview here.
+                    this.preflight = null;
+                    this.preflightError = '';
                     this.uploadForm.source_path = path;
                     // Default the title to the selected folder name (the zip name) when
                     // the user hasn't already given one.
@@ -446,7 +529,62 @@ document.addEventListener('alpine:init', () => {
                 this.browseLoading = false;
             }
         },
-        toggleUploadAccount(id) { this._toggle(this.uploadForm.account_ids, id); },
+        toggleUploadAccount(id) {
+            this._toggle(this.uploadForm.account_ids, id);
+            // The plan depends on which accounts are selected, so a stale preview
+            // would describe a different upload than the one about to run.
+            this.preflight = null;
+            this.preflightError = '';
+        },
+
+        // ---- Pre-flight ----
+        // Asks the server what the upload would produce before anything is
+        // compressed. This is where an impossible upload is refused: the same
+        // planner runs here and in POST /api/backups, so the preview cannot
+        // disagree with what actually happens.
+        async runPreflight() {
+            const path = (this.uploadForm.source_path || '').trim();
+            if (!path || !this.uploadForm.account_ids.length) {
+                this.preflight = null;
+                return;
+            }
+            this.preflightLoading = true;
+            this.preflightError = '';
+            try {
+                const r = await fetch('/api/backups/preflight', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        source_path: path,
+                        account_ids: this.uploadForm.account_ids,
+                    }),
+                });
+                if (!r.ok) {
+                    const e = await r.json().catch(() => ({}));
+                    this.preflightError = e.error || 'Could not check this backup';
+                    this.preflight = null;
+                    return;
+                }
+                this.preflight = await r.json();
+            } catch (e) {
+                // A failed check must not stop the user uploading: the server runs
+                // the same checks again and refuses there if it has to.
+                this.preflightError = 'Could not check this backup';
+                this.preflight = null;
+            } finally {
+                this.preflightLoading = false;
+            }
+        },
+        // A one-line summary of what a group of accounts receives.
+        planGroupSummary(g) {
+            const n = (g.volumes || []).length;
+            const who = (g.accounts || []).map(a => `${a.provider} — ${a.email}`).join(', ');
+            // Byte parts are named and counted like volumes but are not archives,
+            // so the summary must not call them one.
+            if (g.byte_parts) return `${who}: split into ${n} numbered parts`;
+            if (n <= 1) return `${who}: one archive`;
+            return `${who}: split into ${n} archives`;
+        },
         // With no directory chosen there is nothing to zip, so an existing record can
         // only be renamed. Drives both the submit label and the branch in submitUpload.
         isTitleOnly() {
@@ -507,6 +645,13 @@ document.addEventListener('alpine:init', () => {
                         this.conflictChoices = {};
                         for (const c of e.conflicts) this.conflictChoices[c.account_id] = 'overwrite';
                         this.showConflictModal = true;
+                        return;
+                    }
+                    // A blocked plan: a file too large to split, no quota, or an
+                    // archive bigger than the whole transfer budget. Each blocker
+                    // names its own cause, so show them rather than a generic line.
+                    if (e.blockers && e.blockers.length) {
+                        this.error = e.blockers.map(b => b.message).join(' ');
                         return;
                     }
                     this.error = e.error || 'Not enough space';
@@ -854,21 +999,110 @@ document.addEventListener('alpine:init', () => {
             while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
             return `${i === 0 ? n : n.toFixed(n < 10 ? 2 : 1)} ${units[i]}`;
         },
+        // Decimal units, for anything to do with provider limits. Both providers
+        // state their caps in decimal GB, the Settings fields are authored in
+        // decimal GB, and the server's own messages render decimal — showing a
+        // 1.9 GB threshold back as "1.77 GB" reads as if the setting did not save.
+        // The binary formatSize above stays where it always was, on file sizes.
+        formatLimit(b) {
+            if (!b) return '';
+            const units = ['B', 'kB', 'MB', 'GB', 'TB'];
+            let i = 0, n = b;
+            while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
+            return `${i === 0 ? n : n.toFixed(2)} ${units[i]}`;
+        },
 
-        // ---- Settings (exclude terms) ----
+        // ---- Settings (exclude terms and provider limits) ----
         async loadSettings() {
-            const r = await fetch('/api/settings');
-            if (!r.ok) return;
-            const s = await r.json().catch(() => ({}));
-            this.excludeTerms = s.exclude_terms || [];
+            try {
+                const r = await fetch('/api/settings');
+                if (!r.ok) return false;
+                const s = await r.json().catch(() => ({}));
+                this.excludeTerms = s.exclude_terms || [];
+                this.providerLimits = s.provider_limits || {};
+                this.providerLimitDefaults = s.provider_limit_defaults || {};
+                return true;
+            } catch (e) {
+                return false;
+            }
         },
         async openSettings() {
             this.settingsError = '';
             this.newTerm = '';
             // Reload so the modal always opens on the persisted list — this also makes
             // Cancel a genuine discard of anything edited in a previous session.
-            await this.loadSettings();
+            this.settingsLoaded = await this.loadSettings();
+            this.limitsForm = this.settingsLoaded ? this.limitsToForm(this.providerLimits) : [];
+            if (!this.settingsLoaded) {
+                // Nothing in the modal reflects what is stored, so saving would
+                // overwrite both sections with whatever happens to be in memory —
+                // an empty limits table (which the server reads as "use the
+                // defaults") and a stale term list. saveSettings refuses instead.
+                this.settingsError = 'Could not load the current settings, so nothing can be saved from here. Close this and try again.';
+            }
             this.showSettingsModal = true;
+        },
+
+        // Flattens the provider/tier table into rows the template can iterate, in
+        // the units a person types. Bytes are the storage format; GB is the
+        // editing format, and 0 means unlimited in both.
+        limitsToForm(set) {
+            const rows = [];
+            for (const provider of Object.keys(set).sort()) {
+                for (const tier of ['free', 'paid']) {
+                    const l = (set[provider] || {})[tier];
+                    if (!l) continue;
+                    rows.push({
+                        provider,
+                        tier,
+                        max_file_gb: this.bytesToGB(l.max_file_bytes),
+                        transfer_gb: this.bytesToGB(l.transfer_bytes),
+                        window_hours: l.window_hours || 24,
+                    });
+                }
+            }
+            return rows;
+        },
+        // Decimal GB, matching how both providers state their limits (and how the
+        // server's own messages render them).
+        bytesToGB(b) {
+            if (!b) return 0;
+            // toPrecision, not a fixed number of decimal places. Rounding to two
+            // decimals turned 0.001 GB into 0 on the way back into the form — and 0
+            // means unlimited, so reopening Settings and saving silently disabled
+            // the very threshold the user had just set. The precision here only
+            // trims float noise (1.9000000000000001 back to 1.9).
+            return Number((b / 1e9).toPrecision(12));
+        },
+        gbToBytes(gb) {
+            const n = Number(gb);
+            if (!isFinite(n) || n <= 0) return 0;
+            // A positive value must never round down to zero, because zero is how
+            // this field says "no limit". A 1-byte threshold refuses every file,
+            // which is wrong but loudly wrong — silently lifting the cap is not.
+            return Math.max(1, Math.round(n * 1e9));
+        },
+        limitsFromForm() {
+            const out = {};
+            for (const row of this.limitsForm) {
+                out[row.provider] = out[row.provider] || {};
+                out[row.provider][row.tier] = {
+                    max_file_bytes: this.gbToBytes(row.max_file_gb),
+                    transfer_bytes: this.gbToBytes(row.transfer_gb),
+                    window_hours: Math.max(1, Number(row.window_hours) || 24),
+                };
+            }
+            return out;
+        },
+        resetLimitsToDefaults() {
+            this.limitsForm = this.limitsToForm(this.providerLimitDefaults);
+        },
+        limitLabel(row) {
+            const cap = row.max_file_gb > 0 ? `split at ${row.max_file_gb} GB` : 'no size limit';
+            const budget = row.transfer_gb > 0
+                ? `${row.transfer_gb} GB per ${row.window_hours}h`
+                : 'unlimited transfer';
+            return `${cap}, ${budget}`;
         },
         addTerm() {
             const t = this.newTerm.trim();
@@ -879,13 +1113,27 @@ document.addEventListener('alpine:init', () => {
         },
         removeTerm(i) { this.excludeTerms.splice(i, 1); },
         async saveSettings() {
+            // Refuse outright rather than writing half a modal. If the load failed,
+            // the exclude terms on screen are as unrepresentative of the stored
+            // state as the empty limits table is — guarding only the limits would
+            // promise more safety than it delivers.
+            if (!this.settingsLoaded) {
+                this.settingsError = 'Could not load the current settings, so nothing can be saved from here. Close this and try again.';
+                return;
+            }
             this.settingsSaving = true;
             this.settingsError = '';
             try {
+                // The server applies whichever keys are present, so a section with
+                // nothing to say is simply omitted and its stored value is left
+                // alone.
+                const body = { exclude_terms: this.excludeTerms };
+                if (this.limitsForm.length) body.provider_limits = this.limitsFromForm();
+
                 const r = await fetch('/api/settings', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ exclude_terms: this.excludeTerms }),
+                    body: JSON.stringify(body),
                 });
                 if (!r.ok) {
                     const e = await r.json().catch(() => ({}));
@@ -893,10 +1141,15 @@ document.addEventListener('alpine:init', () => {
                     return;
                 }
                 // Re-render from the response: the server trims blanks and folds
-                // duplicates, so the saved list may differ from what was sent.
+                // duplicates, and clamps limits, so what was saved may differ from
+                // what was sent.
                 const s = await r.json().catch(() => ({}));
                 this.excludeTerms = s.exclude_terms || [];
+                this.providerLimits = s.provider_limits || {};
+                this.limitsForm = this.limitsToForm(this.providerLimits);
                 this.showSettingsModal = false;
+                // Thresholds changed, so any account card showing one is now stale.
+                await this.loadAccounts();
             } finally {
                 this.settingsSaving = false;
             }

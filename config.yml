@@ -45,6 +45,21 @@ ui:
   poll_seconds: 10
   active_poll_seconds: 2
 
+archive:
+  # How a backup too large for a provider is divided.
+  #   auto        keep whole files together, and fall back to numbered byte parts
+  #               only when a single file is larger than the provider limit
+  #   whole_files keep whole files together always; an oversized single file is
+  #               reported instead of being split
+  #   byte_parts  always cut the finished archive into fixed-size numbered parts
+  #
+  # Whole-file volumes are standalone zips: each opens on its own, carries its
+  # own recorded file tree, and can be downloaded and read individually. Byte
+  # parts are a raw cut of one archive (name.zip.001, .002, ...) and must all be
+  # downloaded and rejoined before anything can be extracted, so "auto" reaches
+  # for them only when nothing else can work.
+  split_method: auto
+
 scan:
   # How many directory levels below the source root are recorded in a zip's
   # tree. 3 records the root plus three levels beneath it. Directory names to

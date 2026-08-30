@@ -222,7 +222,7 @@ Decisions locked with the user, all implemented: crawled `tree_json` **is** deri
 
 ---
 
-## Roadmap: Pre-Launch Refinement — shipping in phases
+## Roadmap: Pre-Launch Refinement — shipped in phases
 
 Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Each phase is its own branch cut from `main`, with its own ticket, validation checklist and PR description.
 
@@ -247,18 +247,19 @@ Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-re
 
 **Phase 4 as originally scoped, for reference.** Branch `pr/13-encrypted-credentials`, no ticket yet. Accounts move from re-read-from-`.env`-on-every-boot into the `accounts` table with passwords and OAuth tokens encrypted (AES-256-GCM; key derived via scrypt from a `.env` passphrase plus a random per-install salt stored in the DB; fresh nonce per row). `golang.org/x/crypto` **is** in the module cache, so scrypt needs no network fetch. Also here: detect 4shared `401.0301`, flag the account as needing re-authorization in the UI, and add a **Re-authorize** button running `cmd/fourshared-auth`'s local-callback flow server-side, writing the new token straight to the DB — OAuth 1.0 has no refresh token, so re-authorization is the only remedy. **Danger to design around:** the metadata DB is uploaded to every main account after each job, so encrypted credentials travel with it; the passphrase must never be in the DB, and losing it loses every stored credential — say so loudly in docs and UI.
 
-**Phase 5 — NEXT.** Branch `pr/14-archive-splitting`, cut from `main`. No ticket yet — write one first. Per-provider/tier size caps and archive splitting. **This is the actual launch blocker**: a ~4.3 GB archive cannot reach a free 4shared account at all (2 GB per-file cap), so today that upload simply cannot succeed.
+**Phase 5 — Per-provider/tier size caps and archive splitting: DONE** (PR #26, branch `pr/14-archive-splitting`). Ticket `dev-tools/prompts/output/tickets/14-archive-splitting.md`. **The launch blocker is cleared**: a ~4.3 GB archive now reaches a free 4shared account as bin-packed standalone volumes, while MEGA still receives it whole.
 
-Scope as planned:
-- Per provider × tier (free/paid): a **max-file-size / split threshold** and a **daily transfer budget**, defaulted from the real caps above and editable in the Settings modal. Each account carries a tier.
-- **Splitting bin-packs first-level subdirectories into standalone zips**, never raw byte-split parts, so every volume stays an openable archive — the ZIP tree reader, Auto-Sync adoption and per-archive download all depend on that.
-- A **single file larger than the threshold** is reported, not silently split — there is no way to make it fit.
-- A **pre-flight check** refuses (or splits) an upload that cannot fit, before any zipping happens.
-- The multi-zip record model already accommodates the volumes: **no schema change** for the archives themselves. Per-account tier and the per-provider thresholds do need somewhere to live (`accounts` column + the `settings` key/value table are the obvious homes).
+Shipped: `internal/limits` (per-provider × tier max-file-size and rolling transfer budget, `0` = unlimited, editable in Settings); `archive.PlanVolumes`/`Pack`/`ZipItems` producing **standalone** zips bin-packed from first-level subdirectories; `scanner.TreeFor` so each volume records only its own tree; `accounts.tier` + `tier_source` (`.env` seeds, the Accounts view wins); `jobs.hold_reason`; the `transfer_usage` ledger; `ClaimNextPendingJobWithin` with in-flight bytes counted **inside** the claim; `POST /api/backups/preflight` (metadata-only, refuses before any compression); `PUT /api/accounts/{id}/tier`.
 
-**Open question to settle with the user before building:** whether the daily transfer budget should throttle **uploads** too, or only downloads. 4shared documents its ~3 GB/day as *download* traffic and its upload behaviour is unverified, so this is a real product decision, not a detail.
+**Four decisions locked with the user for this phase:** per-provider archive sets (MEGA whole, 4shared split) rather than one set at the strictest threshold; the transfer budget is **enforced**, holding jobs until the window rolls over; tier comes from `.env` but an app-set value wins; zipping stays synchronous in the HTTP handler.
 
-What phase 4 leaves for it: the Settings modal already has a DB-backed key/value store and a working `GET`/`PUT /api/settings` whitelist (do not widen that whitelist to reach credential material); `AccountStore` is now concurrency-safe with accessors, so adding a per-account tier means touching `Account`, the `accounts` row and the reconciliation in `internal/credentials` — all three, or the tier will not survive a restart.
+**One earlier decision was reversed during validation.** "Never raw byte-split parts" left a real gap: a single *file* over the cap cannot be packed at all, because a file is whole-file packing's floor. `archive.split_method` (config, default `auto`) now falls back to numbered `name.zip.001` parts **for that case only**; `whole_files` keeps the original refusal, `byte_parts` forces parts. See the phase-5 technical notes.
+
+---
+
+## Roadmap status: both roadmaps are complete
+
+Ticket #7 shipped across 7a/7b/7c. Pre-Launch Refinement shipped across phases 1–5. **There is no next phase planned** — agree the next chunk with the user before starting one. The candidate list (deferred-item triage, a frontend test harness, metadata-backup observability, a third provider, or simply launching) is at the end of `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Known rough edges are in `dev-tools/prompts/output/deferred-items.md` (D1–D17) — read it before proposing a fix.
 
 ---
 
@@ -556,6 +557,48 @@ Adding a provider = implement `Provider` in a new subpackage + add one `case` in
 **`AccountStore` is now concurrency-safe by construction.** Re-authorization rewrites the running credential set while workers read it, so the slices stopped being exported fields; readers get copies through `All()`/`Mains()`/`Find()`/`GetByProvider()` and `Replace()` swaps the set atomically. `LoadEnv` returns a plain `EnvConfig` (what `.env` declares) — keeping "parsed input" and "running state" as different types is what makes it obvious which one a caller means.
 
 **`golang.org/x/crypto` was already in the module cache** (verified `scrypt/` present before writing a line). It moved from indirect to direct. The cache check is the same discipline as the `x/text` and `x/time` notes above.
+
+---
+
+### Archive splitting and transfer budgets (pre-launch phase 5)
+
+**Tolerating an unreadable entry is right for a tree and catastrophic for a plan.** `scanner.walk` deliberately logs and skips a directory it cannot read, because a recorded tree is display detail. `archive.collectItems` must do the exact opposite and fail: `ZipItems` walks only the items the plan assigned it, so a directory dropped while planning is never visited and never reported — the backup uploads, looks complete, and silently is not. The unsplit path never had this exposure because it walks the whole directory. Copying the scanner's tolerance here was the first thing the verification pass caught.
+
+**"Empty" means "holds no files", never "sums to zero bytes".** A directory of `.gitkeep` markers and empty log files measures zero and still contributes zip entries — the *names* are the data. Skipping it on size alone put those files in no volume at all, while the whole-directory zip archived them. `treeSize` returns a file count alongside the byte total precisely so the two questions ("which volume does this fit in" and "does this hold anything") are answered by different numbers.
+
+**Group by threshold, then merge the groups that do not split.** Accounts are grouped by their effective size cap, which is what actually decides the archives. But different caps are different groups even when the source fits comfortably under all of them — the ordinary MEGA (no limit) plus free 4shared (1.9 GB) pair receiving a 200 MB backup. Left alone that compresses the source twice and writes the same archive name as two `backup_zips` rows, so the record tree lists it twice, search returns it twice, and Auto-Sync inherits two same-named rows to disambiguate. `mergeWholeGroups` collapses every single-volume group into one, keeping the strictest non-zero threshold for the post-write check. A split group is never merged: its volumes really are threshold-specific.
+
+**Pack on raw sizes, verify the written file.** Deflate does not expand real data, but per-entry local headers and central-directory records ride along, so packing holds back `packHeadroom` (8 MiB) and the finished volume is measured against the *true* threshold before it is uploaded. Test thresholds below the headroom silently never exercise that branch — `capacity` falls back to `threshold` — so a regression guard needs a threshold above 8 MiB.
+
+**Enforcement belongs in the claim, not after it.** `ClaimNextPendingJobWithin` folds each account's remaining allowance into the SQL as `(account_id = ? AND total_bytes <= ?)`. A claim-then-release loop looks equivalent and is not: it keeps taking the oldest pending job — which belongs to the over-budget account — and putting it straight back, so no other account's jobs are ever reached. A `nil` allowance slice means "no restriction"; an empty non-nil slice means "every account with work is over budget" and correctly claims nothing.
+
+**In-flight bytes are spent bytes, and they must be counted *inside* the claim.** The ledger records a transfer when its job *completes*, so an upload already running is invisible to it and two 1.9 GB volumes both pass a 3 GB check. Subtracting in-flight work when the allowance is computed only narrows the race — the allowance is still a number read before the claim, so two workers can both pass the same one. The subtraction is therefore a correlated subquery in `ClaimNextPendingJobWithin`'s `UPDATE ... RETURNING`, which is a single statement under SQLite's write lock; `Allowance.MaxBytes` carries the ledger-only figure. The verification pass caught this twice: first that in-flight was uncounted, then that counting it in the wrong place left the invariant unenforced.
+
+**Distinguish "waiting for a sibling upload" from "waiting for the window".** They feel nothing alike — minutes versus hours — and a hold that says only "0 B left right now" with no resume estimate reads like the second when it is usually the first. The hold message (unlike the claim) does account for in-flight work, and names it.
+
+**A rolling window needs rows, not a counter.** "5 GB per 6 hours" cannot be answered by a column that only goes up. `transfer_usage` stores one row per completed upload with its timestamp, pruned at startup; `TransferWindowResetsAt` walks them oldest-first to answer the question a held job actually raises — *when does this resume?*
+
+**A job failed for a standing reason needs a status guard.** Every worker goroutine spots an over-budget job on every poll tick and none of them has claimed it, so a plain `FailJob` writes the same explanation once per worker per tick. `FailPendingJob` fails only while the row is still `pending` and reports whether *this* call did it, so the log line fires once — the same discipline as `HoldPendingJobs`' `COALESCE(hold_reason,'') != ?` guard and `Worker.noMainOnce`.
+
+**Hold, never fail, unless waiting cannot help.** A job over the *remaining* allowance stays `pending` with a `hold_reason` (a column, so it survives a restart and explains itself without opening a log). A job over the *entire* budget can never run and is failed immediately, naming both ways out. The distinction is what keeps enforcement from becoming an unexplained stall — and `0` means unlimited everywhere, which is the deliberate escape hatch from limits we researched but cannot verify.
+
+**Delete a remote copy only once its replacement exists.** Conflict resolution ("overwrite") runs *after* the archives are built, not before. The refusal that must precede compression is the plan check, which needs no network at all; running the overwrite early meant a failure while zipping left the user with neither the old archive nor a new one.
+
+**Decimal bytes for provider limits, binary for file sizes.** Both providers state their caps in decimal GB and the Settings fields are authored in decimal, so rendering a 1.9 GB threshold through a 1024-based formatter shows "1.77 GB" and reads as if the setting did not save. `formatLimit` (decimal) is used for every limit, budget and plan-preview figure; `formatSize` (binary) stays on file sizes where it always was.
+
+**A settings form that failed to load must not be saved.** `PutSettingsHandler` applies whichever keys are present, so omitting `provider_limits` leaves them untouched — but an *empty* table PUT is read as "use the defaults" and silently replaces the user's thresholds. The client sends the section only when it has something to send, and says so when the load failed.
+
+**`limits.Parse` decodes through pointer fields on purpose.** Zero means unlimited, so decoding a partial settings object into a value type would turn "I only changed the budget" into "stop splitting entirely" — disabling the very cap the phase exists to add. Absent fields keep their default; garbage returns the defaults whole; unknown providers and tiers are dropped, so a corrupt row cannot invent or remove a provider.
+
+**A tier needs a source marker for the same reason a token does.** `.env` is replayed into the database on every boot, so `tier_source = 'app'` is what stops a plan chosen in the Accounts view reverting at the next restart. It is guarded in two places — `mergeTier` in the reconciliation and a `CASE` in `UpsertAccountRow`'s `ON CONFLICT` — because either one alone would be a single point of silent failure. Unknown or unset tiers normalize to **free**, the strict setting: mislabelling a paid account only splits archives that did not need it, while the opposite lets an oversized file through to a provider that rejects it.
+
+**A file is the floor of whole-file packing, so the fallback is a different kind of split.** Bin-packing can subdivide a directory but never a file, which leaves a single file over the cap genuinely unbackupable to that provider. `archive.split_method` (config, default `auto`) adds a byte-part fallback: zip the directory whole, then cut the finished archive into numbered `name.zip.001` parts. It is a fallback rather than the default because a byte part is not an archive — it has no central directory, so Auto-Sync cannot read a tree from it, a single-part download is unopenable, and restoring means rejoining every part first. `auto` therefore reaches for it only when whole-file packing has already failed with `FileTooLargeError`; `whole_files` refuses instead, and `byte_parts` forces it.
+
+**Only the first byte part carries the recorded tree.** The parts are slices of one archive, so a tree on each would claim every part holds the whole source. The first part is both the entry point a rejoining tool is aimed at and the only place the tree is true of the set.
+
+**A byte-part plan is never merged with a whole-file one**, even when it yields a single part: their names differ (`bkup.zip.001` versus `bkup.zip`) and only one of them is openable, so they are not the same deliverable. Conversely, when compression brings a byte-part archive under the threshold after all, the single resulting file takes the plain name — a `.001` suffix would send the user looking for parts that do not exist.
+
+**A settings field that round-trips through display rounding can silently disable itself.** `bytesToGB` rounded to two decimals, so a 0.001 GB threshold came back as `0` — and `0` means unlimited. Reopening Settings and pressing Save then lifted the cap the user had just set. Any editable numeric setting whose zero value means "off" needs its display conversion to round-trip exactly (`toPrecision`, not `toFixed`), and its parse to refuse to round a positive value down to zero.
 
 ---
 

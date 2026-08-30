@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -17,6 +18,7 @@ type Config struct {
 	Quota        QuotaConfig        `yaml:"quota"`
 	Verification VerificationConfig `yaml:"verification"`
 	Scan         ScanConfig         `yaml:"scan"`
+	Archive      ArchiveConfig      `yaml:"archive"`
 	UI           UIConfig           `yaml:"ui"`
 	Reauth       ReauthConfig       `yaml:"reauth"`
 }
@@ -86,6 +88,22 @@ type VerificationConfig struct {
 // records the root plus three levels beneath it.
 type ScanConfig struct {
 	MaxDepth int `yaml:"max_depth"`
+}
+
+// ArchiveConfig chooses how a backup too large for a provider is divided.
+//
+// SplitMethod:
+//   auto        keep files whole, and fall back to byte parts only when a single
+//               file is larger than the provider limit (the default)
+//   whole_files keep files whole always; report an oversized single file instead
+//   byte_parts  always cut the finished archive into fixed-size parts
+//
+// Whole-file volumes are standalone zips: each opens on its own, carries its own
+// recorded tree, and can be downloaded and read individually. Byte parts are a
+// raw cut of one archive and must all be rejoined before anything can be
+// extracted, so auto reaches for them only when nothing else can work.
+type ArchiveConfig struct {
+	SplitMethod string `yaml:"split_method"`
 }
 
 // UIConfig controls how often the browser re-fetches the table. Two cadences
@@ -167,6 +185,12 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Scan.MaxDepth <= 0 {
 		cfg.Scan.MaxDepth = 3
+	}
+	// Normalized rather than validated: an unrecognised method must not become
+	// "never split" or "always byte-split", which are surprising in opposite
+	// directions. archive.NormalizeMethod owns that decision.
+	if strings.TrimSpace(cfg.Archive.SplitMethod) == "" {
+		cfg.Archive.SplitMethod = "auto"
 	}
 	if cfg.UI.PollSeconds <= 0 {
 		cfg.UI.PollSeconds = 10

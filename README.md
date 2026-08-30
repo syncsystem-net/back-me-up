@@ -7,6 +7,8 @@ Backup tool that zips local directories and uploads them to cloud storage provid
 - The backups table is grouped by **user** (account email): the same email configured on both MEGA and 4shared shows as one row, and every configured account appears even before its first upload.
 - Point at a directory from a user's row (Upload / Edit), give the backup a title (defaults to the folder name), and it uploads to that user's accounts. A record belongs to one user and **accumulates zips** over time — each upload adds another archive, and every zip's directory tree is recorded and shown under "Files: expand".
 - A background worker pool uploads in chunks with live progress, automatic retry with exponential backoff, and a quota pre-check that refuses a backup that won't fit. The table refreshes every `ui.poll_seconds` (default 10) while idle and speeds up to `ui.active_poll_seconds` (default 2) while a job is running.
+- **Archives too large for a provider are split into standalone zips.** A free 4shared account caps a single file at 2 GB, so a 4.3 GB backup is packed into several volumes, each an openable archive in its own right — while MEGA, which has no per-file limit, still receives the whole thing as one file. A single file bigger than the cap falls back to numbered byte parts, so even that case can be uploaded. A pre-flight check reads directory sizes only and shows exactly what will be produced before anything is compressed. See "Archive splitting and transfer budgets".
+- **Transfer budgets hold uploads instead of failing them.** An upload that would exceed a provider's rolling allowance waits for the window and says so in the table, rather than being sent and rejected; other accounts keep uploading meanwhile. Set a budget to 0 for unlimited.
 - On success: the first chunk's checksum is verified, the account's quota is refreshed, the temp zip is cleaned up, and the metadata database is backed up to every configured main account (one per provider).
 - Per-provider status, a "verifying" state while finalizing, and a logs modal per job (including failure reasons).
 - **Download** on an account card fetches every zip stored on that account (one file at a time — the browser asks once for permission to download multiple files); the `(download file)` link on a zip's own node in the tree fetches just that archive. Plus per-provider Delete-All and record-level "Delete Record (not files)" and "Delete Record And Files" (typed `DELETE`) — with overwrite-or-skip prompts when a same-name file already exists on a selected account.
@@ -104,6 +106,7 @@ Application behavior is tuned in `config.yml`; every value has a sensible defaul
 | `verification.periodic_check_days` | `30` | Re-verify a completed file if it hasn't been re-checked within this many days (an omitted/`0` value falls back to 30). Turn periodic re-verification off with `verification.enabled: false`. |
 | `quota.sync_interval_minutes` | `60` | How often the background poller refreshes every account's cached quota (also refreshed after each upload and via "Refresh quotas now") |
 | `scan.max_depth` | `3` | Directory levels below the source root recorded in a zip's tree. `3` records the root plus three levels; an omitted, `0`, or negative value falls back to 3 |
+| `archive.split_method` | `auto` | How a backup too large for a provider is divided. `auto` keeps whole files together and falls back to numbered byte parts only when a single file exceeds the limit; `whole_files` never falls back and reports the file instead; `byte_parts` always cuts the archive into parts |
 | `ui.poll_seconds` | `10` | How often the browser re-fetches the table while nothing is uploading |
 | `ui.active_poll_seconds` | `2` | Refresh cadence used **only** while a job is pending or in progress, so progress bars stay smooth without polling hard when idle. Clamped to at most `poll_seconds` |
 | `reauth.callback_port` | `8723` | Port the temporary local listener binds during in-app re-authorization; must match the callback URL the provider's registered app accepts |
@@ -119,6 +122,41 @@ Two things worth being clear about:
 
 - Exclude terms shape the **recorded tree only**. The uploaded zip still contains every directory, so the archive stays a complete copy of the source.
 - Terms and `scan.max_depth` apply to the **next** backup. Trees already recorded are never rewritten — re-upload a record to refresh its tree.
+
+**Provider limits** are managed in the same Settings modal: for each provider and each account plan (free/paid), the size at which archives are split and the transfer budget with its rolling window. See "Archive splitting and transfer budgets" below.
+
+## Archive splitting and transfer budgets
+
+A free 4shared account rejects any single file over 2 GB, so a 4.3 GB backup cannot reach it at all as one archive. BackMeUp handles that by splitting the backup into several **standalone zips** — never `.z01`-style parts. Each volume opens on its own, and extracting all of them into the same folder rebuilds the original directory exactly.
+
+**Each provider gets its own archive set.** If you upload to MEGA and a free 4shared account at once, MEGA receives the whole archive as one file while 4shared receives the volumes — restoring from MEGA stays a single download. Accounts that need identical volumes share one set, so the source is never compressed twice for the same result.
+
+**How a backup is divided.** Volumes are packed from your first-level subdirectories, keeping each one whole where it fits. A subdirectory too large for a volume is opened up and its own children are packed instead, repeating as deep as necessary.
+
+**A single file larger than the limit** cannot be packed into any volume, because a file is the smallest thing whole-file packing can move. What happens then is set by `archive.split_method` in `config.yml`:
+
+| `split_method` | Behaviour |
+|---|---|
+| `auto` (default) | Fall back to numbered **byte parts** for that backup, so it can still be uploaded |
+| `whole_files` | Refuse, naming the file and its size — nothing is uploaded |
+| `byte_parts` | Always use byte parts, whether or not whole files would have fitted |
+
+**Byte parts are not standalone archives.** They are a raw cut of one zip (`bkup.zip.001`, `.002`, …), so every part must be downloaded and rejoined before anything can be extracted — open the `.001` in 7-Zip, which reassembles the rest automatically, or join them by hand (`copy /b bkup.zip.001+bkup.zip.002 bkup.zip` on Windows, `cat bkup.zip.* > bkup.zip` elsewhere). That is why `auto` reaches for them only when whole-file packing genuinely cannot work: a whole-file volume opens on its own, carries its own recorded file tree, and can be downloaded and read individually, and byte parts give all of that up. The pre-flight preview says clearly when a backup will be split this way.
+
+**Nothing is compressed until the plan is settled.** The **Check what this will upload** button in the Upload / Edit modal reads directory sizes only and reports exactly what would be produced, so an impossible backup is refused in seconds instead of after gigabytes of pointless zipping. The same check runs again when you upload, so what you approve is what happens.
+
+**Transfer budgets hold uploads rather than failing them.** Each provider/plan carries an allowance over a rolling window (4shared free defaults to 3 GB per 24h, MEGA free to 5 GB per 6h). A job that would exceed what is left stays `pending`, shows **waiting** with the reason and expected resume time in the Backups table, and is picked up automatically once the window rolls over. Other accounts keep uploading meanwhile — a held account never blocks the queue.
+
+Two things worth knowing about the budgets:
+
+- **They are our best guess.** 4shared publishes its 3 GB/day figure as *download* traffic and says nothing about uploads. If yours behaves differently, set that provider's transfer budget to **0** in Settings, which means unlimited and disables holding entirely.
+- **An archive larger than the whole budget is refused, not held**, because no amount of waiting would make room for it. The message names the two ways out: lower that provider's split threshold, or set its budget to unlimited.
+
+Archives already uploaded are never re-split. Limits apply to the next backup, the same rule exclude terms follow.
+
+### Account plans
+
+Every account carries a plan — **free** or **paid** — which selects the limits above. `.env` seeds it (`MEGA_ACCOUNT_1_TIER=paid`), and the dropdown on each card in the Accounts view changes it without a restart. A plan you set in the app is **never overwritten by `.env`** on the next boot, the same rule that protects a token written by Re-authorize. An unset or unrecognised plan is treated as free, which is the strict setting: mislabelling a paid account only splits archives that did not need it, while the opposite would let an oversized file through.
 
 ## Auto-Sync
 
@@ -198,11 +236,15 @@ MEGA_ACCOUNT_MAIN_PASSWORD='secret'
 MEGA_ACCOUNT_1_EMAIL=uploads@example.com
 MEGA_ACCOUNT_1_PASSWORD=secret
 MEGA_ACCOUNT_1_QUOTA_GB=20
+MEGA_ACCOUNT_1_TIER=free
 
 FOURSHARED_ACCOUNT_1_EMAIL=uploads@4shared.com
 FOURSHARED_ACCOUNT_1_PASSWORD=secret
 FOURSHARED_ACCOUNT_1_QUOTA_GB=15
+FOURSHARED_ACCOUNT_1_TIER=free
 ```
+
+`_TIER` is optional and defaults to `free`. It selects which archive size limit and transfer budget apply to that account — see "Archive splitting and transfer budgets". Changing an account's plan in the Accounts view overrides `.env` permanently.
 
 Main accounts are intentionally excluded from the backup modal — they are reserved for database backup only. They appear in the Accounts view under **Main accounts** so you can confirm the app read your configuration the way you meant it.
 
@@ -291,12 +333,13 @@ Once the consumer key/secret, the domain, and each account's token are in `.env`
 
 ## How backups upload
 
-Creating a backup writes one `pending` job per selected account. A background worker pool (its goroutine count is `concurrency.max_workers`, with a hard ceiling of `concurrency.max_concurrent_uploads` simultaneous uploads and `concurrency.max_concurrent_per_account` per account) then runs each job:
+Creating a backup plans the archives first (one set per provider size limit, split into volumes where needed), writes one `backup_zips` row per archive, and then one `pending` job per archive per selected account. A background worker pool (its goroutine count is `concurrency.max_workers`, with a hard ceiling of `concurrency.max_concurrent_uploads` simultaneous uploads and `concurrency.max_concurrent_per_account` per account) then runs each job:
 
+0. Skips any account whose transfer budget cannot fit the job right now, leaving it `pending` with a hold reason shown in the table. Other accounts are unaffected.
 1. Claims each pending job atomically and marks it `in_progress`.
 2. Uploads the zip in chunks (`upload.chunk_size_mb`), persisting progress after each chunk — the Backups table shows a live progress bar, polled every `ui.active_poll_seconds` (default 2s) while the job runs.
 3. Retries on failure with exponential backoff (`retry_policy`).
-4. On success: verifies the first chunk's checksum, refreshes the account quota, deletes the temp zip (once every sibling job for that backup is done), and uploads a copy of the metadata DB to every configured main account, attempting each independently.
+4. On success: records the transfer against the account's rolling budget, verifies the first chunk's checksum, refreshes the account quota, deletes the temp zip (once every sibling job for that archive is done), and uploads a copy of the metadata DB to every configured main account, attempting each independently.
 5. On failure (after retries): marks the job `failed`, records the error, and keeps the temp zip for a future retry.
 
 Click **logs** in a provider column to see that job's log history (including failure reasons) in a modal.

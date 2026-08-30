@@ -125,8 +125,11 @@ func TestSettingsAPINeverExposesOrAcceptsCryptoMaterial(t *testing.T) {
 		}
 	}
 
-	// A PUT naming those keys must not touch them.
-	body := `{"exclude_terms":["node_modules"],"` + keyring.SettingSalt + `":"00","` + keyring.SettingVerifier + `":"00"}`
+	// A PUT naming those keys must not touch them — including alongside the
+	// provider limits, the second key this endpoint learned to write.
+	body := `{"exclude_terms":["node_modules"],` +
+		`"provider_limits":{"fourshared":{"free":{"max_file_bytes":123}}},` +
+		`"` + keyring.SettingSalt + `":"00","` + keyring.SettingVerifier + `":"00"}`
 	if w := do(t, PutSettingsHandler(db), "PUT", "/api/settings", body); w.Code != 200 {
 		t.Fatalf("PUT status = %d: %s", w.Code, w.Body.String())
 	}
@@ -137,5 +140,9 @@ func TestSettingsAPINeverExposesOrAcceptsCryptoMaterial(t *testing.T) {
 	// And the keyring still opens with the original passphrase.
 	if _, err := keyring.Open(db, "a passphrase"); err != nil {
 		t.Fatalf("keyring no longer opens after a settings write: %v", err)
+	}
+	// The legitimate half of that same request must still have applied.
+	if got := database.GetProviderLimits(db).For("fourshared", "free").MaxFileBytes; got != 123 {
+		t.Errorf("provider limit = %d, want the written 123", got)
 	}
 }
