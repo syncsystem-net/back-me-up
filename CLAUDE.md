@@ -222,7 +222,7 @@ Decisions locked with the user, all implemented: crawled `tree_json` **is** deri
 
 ---
 
-## Roadmap: Pre-Launch Refinement — shipping in phases
+## Roadmap: Pre-Launch Refinement — shipped in phases
 
 Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Each phase is its own branch cut from `main`, with its own ticket, validation checklist and PR description.
 
@@ -247,18 +247,19 @@ Detailed plan (local, gitignored): `dev-tools/prompts/output/plans/pre-launch-re
 
 **Phase 4 as originally scoped, for reference.** Branch `pr/13-encrypted-credentials`, no ticket yet. Accounts move from re-read-from-`.env`-on-every-boot into the `accounts` table with passwords and OAuth tokens encrypted (AES-256-GCM; key derived via scrypt from a `.env` passphrase plus a random per-install salt stored in the DB; fresh nonce per row). `golang.org/x/crypto` **is** in the module cache, so scrypt needs no network fetch. Also here: detect 4shared `401.0301`, flag the account as needing re-authorization in the UI, and add a **Re-authorize** button running `cmd/fourshared-auth`'s local-callback flow server-side, writing the new token straight to the DB — OAuth 1.0 has no refresh token, so re-authorization is the only remedy. **Danger to design around:** the metadata DB is uploaded to every main account after each job, so encrypted credentials travel with it; the passphrase must never be in the DB, and losing it loses every stored credential — say so loudly in docs and UI.
 
-**Phase 5 — NEXT.** Branch `pr/14-archive-splitting`, cut from `main`. No ticket yet — write one first. Per-provider/tier size caps and archive splitting. **This is the actual launch blocker**: a ~4.3 GB archive cannot reach a free 4shared account at all (2 GB per-file cap), so today that upload simply cannot succeed.
+**Phase 5 — Per-provider/tier size caps and archive splitting: DONE** (PR #26, branch `pr/14-archive-splitting`). Ticket `dev-tools/prompts/output/tickets/14-archive-splitting.md`. **The launch blocker is cleared**: a ~4.3 GB archive now reaches a free 4shared account as bin-packed standalone volumes, while MEGA still receives it whole.
 
-Scope as planned:
-- Per provider × tier (free/paid): a **max-file-size / split threshold** and a **daily transfer budget**, defaulted from the real caps above and editable in the Settings modal. Each account carries a tier.
-- **Splitting bin-packs first-level subdirectories into standalone zips**, never raw byte-split parts, so every volume stays an openable archive — the ZIP tree reader, Auto-Sync adoption and per-archive download all depend on that.
-- A **single file larger than the threshold** is reported, not silently split — there is no way to make it fit.
-- A **pre-flight check** refuses (or splits) an upload that cannot fit, before any zipping happens.
-- The multi-zip record model already accommodates the volumes: **no schema change** for the archives themselves. Per-account tier and the per-provider thresholds do need somewhere to live (`accounts` column + the `settings` key/value table are the obvious homes).
+Shipped: `internal/limits` (per-provider × tier max-file-size and rolling transfer budget, `0` = unlimited, editable in Settings); `archive.PlanVolumes`/`Pack`/`ZipItems` producing **standalone** zips bin-packed from first-level subdirectories; `scanner.TreeFor` so each volume records only its own tree; `accounts.tier` + `tier_source` (`.env` seeds, the Accounts view wins); `jobs.hold_reason`; the `transfer_usage` ledger; `ClaimNextPendingJobWithin` with in-flight bytes counted **inside** the claim; `POST /api/backups/preflight` (metadata-only, refuses before any compression); `PUT /api/accounts/{id}/tier`.
 
-**Open question to settle with the user before building:** whether the daily transfer budget should throttle **uploads** too, or only downloads. 4shared documents its ~3 GB/day as *download* traffic and its upload behaviour is unverified, so this is a real product decision, not a detail.
+**Four decisions locked with the user for this phase:** per-provider archive sets (MEGA whole, 4shared split) rather than one set at the strictest threshold; the transfer budget is **enforced**, holding jobs until the window rolls over; tier comes from `.env` but an app-set value wins; zipping stays synchronous in the HTTP handler.
 
-What phase 4 leaves for it: the Settings modal already has a DB-backed key/value store and a working `GET`/`PUT /api/settings` whitelist (do not widen that whitelist to reach credential material); `AccountStore` is now concurrency-safe with accessors, so adding a per-account tier means touching `Account`, the `accounts` row and the reconciliation in `internal/credentials` — all three, or the tier will not survive a restart.
+**One earlier decision was reversed during validation.** "Never raw byte-split parts" left a real gap: a single *file* over the cap cannot be packed at all, because a file is whole-file packing's floor. `archive.split_method` (config, default `auto`) now falls back to numbered `name.zip.001` parts **for that case only**; `whole_files` keeps the original refusal, `byte_parts` forces parts. See the phase-5 technical notes.
+
+---
+
+## Roadmap status: both roadmaps are complete
+
+Ticket #7 shipped across 7a/7b/7c. Pre-Launch Refinement shipped across phases 1–5. **There is no next phase planned** — agree the next chunk with the user before starting one. The candidate list (deferred-item triage, a frontend test harness, metadata-backup observability, a third provider, or simply launching) is at the end of `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Known rough edges are in `dev-tools/prompts/output/deferred-items.md` (D1–D17) — read it before proposing a fix.
 
 ---
 
