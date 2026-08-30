@@ -36,7 +36,7 @@ func New(cfg *config.Config, db *sql.DB, creds *credentials.Manager, syncer *quo
 	}
 
 	chunkSize := int64(cfg.Upload.ChunkSizeMB) << 20
-	h := handlers.New(db, creds, chunkSize, cfg.Scan.MaxDepth, handlers.UI{
+	h := handlers.New(db, creds, chunkSize, cfg.Scan.MaxDepth, cfg.Archive.SplitMethod, handlers.UI{
 		PollSeconds:       cfg.UI.PollSeconds,
 		ActivePollSeconds: cfg.UI.ActivePollSeconds,
 	})

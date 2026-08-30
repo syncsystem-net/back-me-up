@@ -3,6 +3,7 @@ package autosync
 import (
 	"strings"
 
+	"github.com/syncsystem-net/back-me-up/internal/archive"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 )
 
@@ -152,6 +153,15 @@ func rank(l LocalZip) int {
 // isZipName reports whether name looks like an archive this tool would have
 // produced. Case-insensitive because the extension's case is the remote
 // server's business, not ours.
+//
+// Numbered byte parts (name.zip.001) count too. They are not readable archives —
+// the tree indexer will fail on one and adopt it with a note, which is the
+// correct outcome — but they are still this tool's output, and ignoring them
+// would make a byte-split backup invisible to a crawl that is meant to rebuild a
+// lost database.
 func isZipName(name string) bool {
-	return len(name) > 4 && strings.EqualFold(name[len(name)-4:], ".zip")
+	if len(name) > 4 && strings.EqualFold(name[len(name)-4:], ".zip") {
+		return true
+	}
+	return archive.IsPartName(name)
 }

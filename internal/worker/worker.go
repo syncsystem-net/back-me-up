@@ -122,6 +122,15 @@ func (w *Worker) Start(ctx context.Context) {
 		slog.Info("requeued stale jobs from previous run", "count", n)
 	}
 
+	// The transfer ledger only ever needs the last few hours, but it gains rows
+	// for the life of the install. Pruning at startup is often enough for a table
+	// that grows by a handful of rows per backup.
+	if n, err := database.PruneTransfers(w.db); err != nil {
+		slog.Warn("pruning transfer history failed", "error", err)
+	} else if n > 0 {
+		slog.Info("pruned old transfer history", "rows", n)
+	}
+
 	for i := 0; i < w.cfg.MaxWorkers; i++ {
 		go w.loop(ctx, i)
 	}
@@ -150,7 +159,18 @@ func (w *Worker) loop(ctx context.Context, id int) {
 			}
 			continue
 		}
-		job, err := database.ClaimNextPendingJob(w.db)
+		// What each account may still upload inside its provider's rolling
+		// transfer window. Folded into the claim so an account that is over
+		// budget waits without holding up every other account's jobs.
+		allow, err := w.allowances()
+		if err != nil {
+			slog.Error("computing transfer allowances failed", "worker", id, "error", err)
+			if !sleep(ctx, w.cfg.PollInterval) {
+				return
+			}
+			continue
+		}
+		job, err := database.ClaimNextPendingJobWithin(w.db, allow)
 		if err != nil {
 			slog.Error("claiming job failed", "worker", id, "error", err)
 			if !sleep(ctx, w.cfg.PollInterval) {
@@ -233,6 +253,9 @@ func (w *Worker) process(ctx context.Context, job *database.Job) {
 	}
 	w.log(job.ID, "info", "upload complete")
 
+	// The transfer ledger is what the budget is enforced against, so it is
+	// written before anything that could fail and skip it.
+	w.recordTransfer(job)
 	w.refreshQuota(ctx, p, job)
 	w.cleanupZip(job)
 	w.backupDatabase(ctx)
