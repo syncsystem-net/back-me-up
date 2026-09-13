@@ -172,6 +172,11 @@ type mainAccountResponse struct {
 	// NeedsReauth is set when the provider rejected this account's OAuth token.
 	NeedsReauth  bool   `json:"needs_reauth"`
 	ReauthReason string `json:"reauth_reason,omitempty"`
+
+	// MetadataBackup is what happened to this provider's copy of the metadata
+	// database. Nil means no copy has ever been attempted — a distinct state from
+	// a failed one, and the UI must not blur them.
+	MetadataBackup *database.MetadataBackupStatus `json:"metadata_backup,omitempty"`
 }
 
 // GetMainAccounts lists the configured metadata-database backup accounts, one
@@ -187,6 +192,10 @@ func (h *Handlers) GetMainAccounts(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("listing main account quotas", "error", err)
 		quotas = map[string]database.MainAccountQuota{}
 	}
+
+	// Nothing recorded is the normal state of a fresh install, so a read failure
+	// degrades to the same thing rather than to a claim about the last copy.
+	backups := database.GetMetadataBackupStatuses(h.db)
 
 	out := make([]mainAccountResponse, 0)
 	for _, m := range h.accounts.Mains() {
@@ -204,6 +213,9 @@ func (h *Handlers) GetMainAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		if q, ok := quotas[string(m.Provider)]; ok {
 			resp.QuotaTotalGB, resp.QuotaUsedGB, resp.LastSync = q.QuotaTotalGB, q.QuotaUsedGB, q.LastSync
+		}
+		if b, ok := backups[string(m.Provider)]; ok {
+			resp.MetadataBackup = &b
 		}
 		out = append(out, resp)
 	}
@@ -707,13 +719,15 @@ func (h *Handlers) PostBackups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	backupID, err := h.recordBackup(req.OwnerEmail, req.Title, req.SourcePath, built)
+	backupID, jobIDs, err := h.recordBackup(req.OwnerEmail, req.Title, req.SourcePath, built)
 	if err != nil {
 		built.discard()
 		slog.Error("recording backup", "error", err)
 		jsonError(w, "failed to record the backup", http.StatusInternalServerError)
 		return
 	}
+
+	h.logSkippedLinks(jobIDs, plan.SkippedLinks)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -823,10 +837,10 @@ func (h *Handlers) buildArchives(sourcePath string, plan *uploadPlan, excludeTer
 
 // recordBackup writes the record, its zips and their jobs in one transaction, so
 // a backup is never half-registered.
-func (h *Handlers) recordBackup(ownerEmail, title, sourcePath string, built builtSet) (int64, error) {
+func (h *Handlers) recordBackup(ownerEmail, title, sourcePath string, built builtSet) (int64, []int64, error) {
 	tx, err := h.db.Begin()
 	if err != nil {
-		return 0, fmt.Errorf("beginning transaction: %w", err)
+		return 0, nil, fmt.Errorf("beginning transaction: %w", err)
 	}
 
 	// One record per user, accumulating zips. Upsert the record (renaming it if a
@@ -834,28 +848,55 @@ func (h *Handlers) recordBackup(ownerEmail, title, sourcePath string, built buil
 	backupID, err := database.UpsertBackupForUser(tx, ownerEmail, title, sourcePath)
 	if err != nil {
 		tx.Rollback()
-		return 0, fmt.Errorf("upserting backup record: %w", err)
+		return 0, nil, fmt.Errorf("upserting backup record: %w", err)
 	}
+
+	// The job ids are returned so the caller can attach notes to them after the
+	// commit. Anything written inside the transaction could roll the backup back,
+	// and a note about what the archive omits must never be able to do that.
+	var jobIDs []int64
 
 	for _, a := range built {
 		zipID, err := database.InsertZip(tx, backupID, a.remoteName, sourcePath, a.sizeBytes, a.treeJSON)
 		if err != nil {
 			tx.Rollback()
-			return 0, fmt.Errorf("inserting zip %s: %w", a.remoteName, err)
+			return 0, nil, fmt.Errorf("inserting zip %s: %w", a.remoteName, err)
 		}
 		for _, accountID := range a.accountIDs {
-			if _, err := database.InsertJob(tx, backupID, zipID, accountID, a.zipPath, a.remoteName, a.sizeBytes); err != nil {
+			jobID, err := database.InsertJob(tx, backupID, zipID, accountID, a.zipPath, a.remoteName, a.sizeBytes)
+			if err != nil {
 				tx.Rollback()
-				return 0, fmt.Errorf("inserting job for account %d: %w", accountID, err)
+				return 0, nil, fmt.Errorf("inserting job for account %d: %w", accountID, err)
 			}
+			jobIDs = append(jobIDs, jobID)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()
-		return 0, fmt.Errorf("committing transaction: %w", err)
+		return 0, nil, fmt.Errorf("committing transaction: %w", err)
 	}
-	return backupID, nil
+	return backupID, jobIDs, nil
+}
+
+// logSkippedLinks records what the archives do not contain against every job of
+// the backup. The pre-flight warning is gone the moment the modal closes; the
+// per-job logs modal is where someone asks "is this backup complete?" months
+// later, so that is where the answer has to live.
+//
+// A failure here is logged and swallowed: the backup is already recorded and its
+// uploads are already queued, and losing a note must not look like losing a
+// backup.
+func (h *Handlers) logSkippedLinks(jobIDs []int64, links []string) {
+	if len(links) == 0 {
+		return
+	}
+	msg := skippedLinksLogMessage(links)
+	for _, id := range jobIDs {
+		if err := database.InsertJobLog(h.db, id, "warn", msg); err != nil {
+			slog.Warn("recording skipped links on job", "job", id, "error", err)
+		}
+	}
 }
 
 // PostBackupsPreflight answers what an upload would do without doing any of it:
@@ -902,6 +943,7 @@ func (h *Handlers) PostBackupsPreflight(w http.ResponseWriter, r *http.Request) 
 		"groups":             plan.Groups,
 		"blockers":           plan.Blockers,
 		"warnings":           plan.Warnings,
+		"skipped_links":      plan.SkippedLinks,
 		"total_source_bytes": plan.TotalSourceBytes,
 	})
 }

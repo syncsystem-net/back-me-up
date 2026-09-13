@@ -61,6 +61,11 @@ type uploadPlan struct {
 	// Blockers stop the upload entirely; Warnings do not.
 	Blockers []planIssue `json:"blockers"`
 	Warnings []planIssue `json:"warnings"`
+	// SkippedLinks names every symlink and Windows junction that will be left out
+	// of the archives, relative to the source. It is reported as a warning too;
+	// this is the machine-readable copy, which is what the job logs are written
+	// from once the upload is committed.
+	SkippedLinks []string `json:"skipped_links,omitempty"`
 }
 
 // planIssue is one reason an upload cannot proceed, or one thing the user should
@@ -115,6 +120,11 @@ func (h *Handlers) buildUploadPlan(sourcePath string, accountIDs []int64) (*uplo
 	sort.Slice(thresholds, func(i, j int) bool { return thresholds[i] < thresholds[j] })
 
 	out := &uploadPlan{}
+	// Links are collected as each plan is built rather than from out.Groups
+	// afterwards, because mergeWholeGroups discards the groups it folds together
+	// and their plans with them.
+	skipped := map[string]bool{}
+
 	for _, t := range thresholds {
 		g := byThreshold[t]
 		plan, err := archive.PlanVolumes(sourcePath, t, h.splitMethod)
@@ -130,16 +140,27 @@ func (h *Handlers) buildUploadPlan(sourcePath string, accountIDs []int64) (*uplo
 				})
 				continue
 			}
+			// A source that is itself a link is its own actionable case, not an
+			// unreadable directory: the remedy is to point at the real path, and the
+			// tag has to say so for anything reading these programmatically.
+			reason := "unreadable"
+			if errors.Is(err, archive.ErrSourceIsLink) {
+				reason = "source_is_link"
+			}
 			// Anything else is a source the planner could not read. The planner
 			// refuses rather than skipping (skipping would omit the directory from
 			// the archives without saying so), and the path is already named in the
 			// message — so this belongs in the preview's blocker list beside the
 			// oversized-file case, not as a bare 500 the user cannot act on.
 			out.Blockers = append(out.Blockers, planIssue{
-				Reason:  "unreadable",
+				Reason:  reason,
 				Message: err.Error(),
 			})
 			continue
+		}
+
+		for _, l := range plan.SkippedLinks {
+			skipped[l] = true
 		}
 
 		g.plan = plan
@@ -155,6 +176,13 @@ func (h *Handlers) buildUploadPlan(sourcePath string, accountIDs []int64) (*uplo
 	}
 
 	out.Groups = mergeWholeGroups(out.Groups)
+	out.SkippedLinks = sortedKeys(skipped)
+	if len(out.SkippedLinks) > 0 {
+		out.Warnings = append(out.Warnings, planIssue{
+			Reason:  "skipped_links",
+			Message: skippedLinksMessage(out.SkippedLinks),
+		})
+	}
 
 	for _, g := range out.Groups {
 		if !g.ByteParts {
@@ -183,6 +211,63 @@ func (h *Handlers) buildUploadPlan(sourcePath string, accountIDs []int64) (*uplo
 	h.checkPlanQuota(out)
 	h.checkPlanBudget(out, limitSet)
 	return out, nil
+}
+
+// sortedKeys returns a set's members in a stable order, so a plan built twice
+// from an unchanged source reads identically.
+func sortedKeys(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// maxNamedLinks bounds how many links a single message names. A source with
+// hundreds of them would otherwise produce a warning nobody reads and a job log
+// row of unbounded size; the count is the part that matters once the list is
+// long.
+const maxNamedLinks = 10
+
+// namedLinks renders the list itself: up to maxNamedLinks names, then a count of
+// what was elided, plus the right noun for the total.
+func namedLinks(links []string) (list, noun string) {
+	named := links
+	suffix := ""
+	if len(named) > maxNamedLinks {
+		named = named[:maxNamedLinks]
+		suffix = fmt.Sprintf(", and %d more", len(links)-maxNamedLinks)
+	}
+	noun = "link"
+	if len(links) > 1 {
+		noun = "links"
+	}
+	return strings.Join(named, ", ") + suffix, noun
+}
+
+// skippedLinksMessage is what the user reads in the pre-flight preview, before
+// anything is compressed. It says what will be skipped, why, and what the
+// archive therefore will not contain — a link dropped without explanation is
+// indistinguishable from data quietly lost.
+func skippedLinksMessage(links []string) string {
+	list, noun := namedLinks(links)
+	return fmt.Sprintf(
+		"%d %s will be skipped and will NOT be in the backup: %s. Symlinks and Windows junctions are not followed, so whatever they point at is only archived if it also lies inside this directory.",
+		len(links), noun, list)
+}
+
+// skippedLinksLogMessage is the same information written to a job's log, where
+// it is read months later about an archive that already exists. The pre-flight's
+// future tense would be wrong there — by then nothing "will be" skipped, it was.
+func skippedLinksLogMessage(links []string) string {
+	list, noun := namedLinks(links)
+	return fmt.Sprintf(
+		"%d %s were skipped and are NOT in this archive: %s. Symlinks and Windows junctions are not followed, so whatever they pointed at was archived only if it also lay inside the source directory.",
+		len(links), noun, list)
 }
 
 // mergeWholeGroups collapses every group that needs no split into a single

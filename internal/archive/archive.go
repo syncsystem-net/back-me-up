@@ -61,12 +61,50 @@ func ZipItems(srcDir string, items []Item) (string, error) {
 			target = filepath.Join(srcDir, item.Rel)
 		}
 
+		// A link *below* the source is skipped in the walk; a link the walk starts
+		// at is a different question and must be refused. filepath.Walk does not
+		// descend into its own root when that root is a link, so archiving one
+		// would silently produce an empty zip — the quietest possible data loss.
+		// The planner refuses the same case up front, so in practice this is only
+		// reachable if the source changes between the plan and the zip.
+		if isLinkPath(target) {
+			if relKey(item.Rel) == "." {
+				return abandon(fmt.Errorf(
+					"%s is a link, not a real directory; point the backup at the directory it refers to", target))
+			}
+			// A planned item that became a link after the plan was made. Different
+			// situation, different advice: nothing is wrong with the source the user
+			// chose, the tree changed underneath us.
+			return abandon(fmt.Errorf(
+				"%s became a link after the backup was planned; re-run the backup", target))
+		}
+
 		// A failure here fails the whole backup, deliberately: unlike the planning
 		// walk (which tolerates an unreadable entry because it is only estimating
 		// sizes), an archive that silently omits files is worse than no archive.
 		walkErr := filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
+			}
+			// Links are skipped, and the check comes first because a junction can
+			// answer IsDir() either way depending on the Go version. Without this
+			// the walk falls through to the file branch and tries to io.Copy a
+			// directory handle, which fails the whole backup with Windows' opaque
+			// "Incorrect function". Nothing is lost quietly: the planning walk
+			// collected the same links (both use IsLink), the pre-flight shows them
+			// before anything is compressed, and each job records them in its log.
+			//
+			// SkipDir, not nil, when the link also reports as a directory: Walk
+			// decides whether to descend from info.IsDir(), not from what this
+			// callback returns, so nil would archive everything under the link and
+			// break the parity with the plan that never assigned it. No current Go
+			// version reports a junction that way — this costs nothing and removes
+			// the only walk that would follow one if a future release did.
+			if IsLink(info) {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 			if info.IsDir() {
 				return nil
