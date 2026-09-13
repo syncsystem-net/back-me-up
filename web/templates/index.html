@@ -267,7 +267,7 @@
                 </div>
                 <div class="acct-grid">
                     <template x-for="m in mainAccounts" :key="m.provider">
-                        <div class="acct-card" :class="{ 'acct-card--warn': !m.usable || needsReauth(m) }">
+                        <div class="acct-card" :class="{ 'acct-card--warn': !m.usable || needsReauth(m) || dbBackupFailed(m) }">
                             <div class="acct-email">
                                 <span x-text="m.email"></span>
                                 <span class="acct-badge" x-show="needsReauth(m)">needs re-authorization</span>
@@ -286,6 +286,11 @@
                             </div>
                             <div class="acct-synced" x-show="m.last_quota_sync">Last synced: <span x-text="m.last_quota_sync"></span></div>
                             <div class="acct-synced" x-show="!m.last_quota_sync">Quota not polled yet.</div>
+                            <!-- Whether the index is actually leaving this machine. Rendered
+                                 as a warning only when a copy has been tried and failed:
+                                 "not attempted yet" is the normal state before the first
+                                 job finishes, not a problem to shout about. -->
+                            <div :class="dbBackupFailed(m) ? 'acct-warn' : 'acct-synced'" x-text="dbBackupText(m)"></div>
                             <div class="acct-warn" x-show="!m.usable">
                                 Incomplete configuration — set <span x-text="(m.missing_keys || []).join(', ')"></span> in .env.
                             </div>

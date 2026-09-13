@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/syncsystem-net/back-me-up/internal/accounts"
 	"github.com/syncsystem-net/back-me-up/internal/cloud"
+	"github.com/syncsystem-net/back-me-up/internal/database"
 	"github.com/syncsystem-net/back-me-up/internal/provider"
 )
 
@@ -46,14 +49,22 @@ func (s *stubMainProvider) ReadRange(context.Context, string, []byte, int64) (in
 func (s *stubMainProvider) GetQuota(context.Context) (int64, int64, error) { return 0, 0, nil }
 
 // mainsFixture wires a Worker whose main-account providers are stubs, keyed by
-// provider name.
+// provider name. The worker gets a real (empty, temporary) database, because the
+// upload path records each destination's outcome as it goes.
 func mainsFixture(t *testing.T, mains []accounts.MainAccount) (*Worker, map[string]*stubMainProvider) {
 	t.Helper()
 	stubs := map[string]*stubMainProvider{}
 	for _, m := range mains {
 		stubs[string(m.Provider)] = &stubMainProvider{name: string(m.Provider)}
 	}
-	w := &Worker{accounts: accounts.NewStore(mains, nil, accounts.OAuthApp{})}
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "worker.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	w := &Worker{db: db, accounts: accounts.NewStore(mains, nil, accounts.OAuthApp{})}
 	w.newMainProvider = func(m accounts.MainAccount) (provider.Provider, error) {
 		s, ok := stubs[string(m.Provider)]
 		if !ok {
@@ -176,5 +187,63 @@ func TestMainOAuthUsesTheMainAccountsOwnCredentials(t *testing.T) {
 	}
 	if got := cloud.MainOAuth(megaMain()); got != (provider.OAuthCreds{}) {
 		t.Errorf("a password provider should get no OAuth creds, got %+v", got)
+	}
+}
+
+// The whole point of the record: after a run, the Accounts view can say whether
+// each destination actually received the index.
+func TestEachDestinationsOutcomeIsRecorded(t *testing.T) {
+	mains := []accounts.MainAccount{megaMain(), fourSharedMain()}
+	w, stubs := mainsFixture(t, mains)
+	stubs["fourshared"].loginErr = fmt.Errorf("token expired, rejected or does not exist")
+
+	if got := w.uploadDBToMains(context.Background(), mains, "db.tmp", "meta.db"); got != 1 {
+		t.Fatalf("uploaded to %d destinations, want 1", got)
+	}
+
+	statuses := database.GetMetadataBackupStatuses(w.db)
+
+	mega := statuses["mega"]
+	if !mega.OK || mega.LastSuccessName != "meta.db" {
+		t.Errorf("mega status = %+v, want a success naming the file", mega)
+	}
+
+	four := statuses["fourshared"]
+	if four.OK {
+		t.Error("fourshared recorded a success despite a rejected login")
+	}
+	if four.Stage != "login" {
+		t.Errorf("fourshared stage = %q, want login", four.Stage)
+	}
+	// The stored reason is the same text the log carries, so the UI and the log
+	// cannot tell the user different stories about one failure.
+	if !strings.Contains(four.Error, "token expired") {
+		t.Errorf("fourshared error = %q, want the provider's own reason", four.Error)
+	}
+	if four.LastSuccessAt != "" {
+		t.Errorf("fourshared claims a copy landed: %+v", four)
+	}
+}
+
+// A destination that starts failing must not erase the copy that already
+// reached it — that copy is still restorable, and its name is how it is found.
+func TestALaterFailureKeepsTheLastGoodCopy(t *testing.T) {
+	mains := []accounts.MainAccount{megaMain()}
+	w, stubs := mainsFixture(t, mains)
+
+	if got := w.uploadDBToMains(context.Background(), mains, "db.tmp", "meta-first.db"); got != 1 {
+		t.Fatalf("first run uploaded to %d destinations, want 1", got)
+	}
+	stubs["mega"].uploadErr = fmt.Errorf("quota exceeded")
+	if got := w.uploadDBToMains(context.Background(), mains, "db.tmp", "meta-second.db"); got != 0 {
+		t.Fatalf("second run uploaded to %d destinations, want 0", got)
+	}
+
+	got := database.GetMetadataBackupStatuses(w.db)["mega"]
+	if got.OK || got.Stage != "upload" {
+		t.Errorf("status = %+v, want a failed upload", got)
+	}
+	if got.LastSuccessName != "meta-first.db" {
+		t.Errorf("LastSuccessName = %q, want the copy that did land", got.LastSuccessName)
 	}
 }

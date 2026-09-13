@@ -257,9 +257,17 @@ Shipped: `internal/limits` (per-provider × tier max-file-size and rolling trans
 
 ---
 
-## Roadmap status: both roadmaps are complete
+## Roadmap status: both roadmaps are complete; work is now chunk by chunk
 
-Ticket #7 shipped across 7a/7b/7c. Pre-Launch Refinement shipped across phases 1–5. **There is no next phase planned** — agree the next chunk with the user before starting one. The candidate list (deferred-item triage, a frontend test harness, metadata-backup observability, a third provider, or simply launching) is at the end of `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Known rough edges are in `dev-tools/prompts/output/deferred-items.md` (D1–D17) — read it before proposing a fix.
+Ticket #7 shipped across 7a/7b/7c. Pre-Launch Refinement shipped across phases 1–5. **There is no roadmap left** — agree each chunk with the user before starting it. The candidate list (deferred-item triage, a frontend test harness, a third provider, or simply launching) is at the end of `dev-tools/prompts/output/plans/pre-launch-refinement-phases.md`. Known rough edges are in `dev-tools/prompts/output/deferred-items.md` — read it before proposing a fix.
+
+**Launch hardening — PR #15** (branch `pr/15-reparse-points-and-db-backup-status`). Ticket `dev-tools/prompts/output/tickets/15-reparse-points-and-metadata-backup-status.md`. Two deferred items, chosen because they are the failure modes only real use finds — one loud and total, one silent and on the recovery path.
+
+**D17 shipped.** A junction or symlink anywhere in a source no longer fails the whole backup. `archive.IsLink` is the single predicate every walk consults (`Zip`/`ZipItems`, `collectItems`, `treeSize`, `scanner.walk`); links are skipped, never followed; `Plan.SkippedLinks` carries them into a `skipped_links` pre-flight warning and a per-job `job_logs` row. `archive.ErrSourceIsLink` refuses a source that is *itself* a link.
+
+**D10 shipped in full.** `database.SettingMetadataBackup` records, per provider, the last attempt (when, stage, reason) and separately the last success (when, filename); `GET /api/accounts/main` returns it and each main-account card renders never-attempted / succeeded / failed. The quota half shipped in PR #13.
+
+Deferred item **D18** was opened by the same verification pass: the 201 from `POST /api/backups` carries `warnings` and the client discards them, so an upload that skips the opt-in pre-flight surfaces skipped links only in the job log.
 
 ---
 
@@ -639,3 +647,37 @@ OAuth tokens/consumer keys are hex and don't need quoting.
 - It needs a reference checksum that outlives the deleted temp zip: verify-on-upload now **persists the first-chunk SHA-256** to `jobs.verify_checksum` (+ `last_verified_at`) via `database.SetJobVerified`. These are additive column migrations (`addColumnIfMissing`), also added to the `CREATE TABLE jobs` schema for fresh DBs.
 - Each scan re-checks a **small random sample** (`reverifyBatchSize = 5`, `ORDER BY RANDOM()`) of completed jobs whose `last_verified_at` is older than `periodic_check_days` (or null). It re-downloads only the first chunk (reusing the `cappedHasher`/`errEnoughBytes` head-download path) and compares to the stored checksum. Pass → `TouchJobVerified`; mismatch or download failure → an `error` row in `job_logs` (visible in the existing logs modal). **Re-verification reports only — it never re-uploads, deletes, or changes job status.**
 - Both verify-on-upload and re-verify hash the leading `upload.chunk_size_mb` bytes. **Changing `chunk_size_mb` between an upload and a later re-verify can cause a false mismatch** (different span hashed); documented as a known caveat.
+
+---
+
+### Links, junctions and reparse points in a source (PR #15)
+
+**Never test `FILE_ATTRIBUTE_REPARSE_POINT` directly — it is too broad for a backup tool.** OneDrive/Dropbox/Drive "files on demand" placeholders are reparse points too, and they are *real files holding the user's data*. A bare attribute check classifies them as links and quietly produces an archive missing every cloud-only file in the source — the same silent data loss the strict planner exists to prevent, arrived at from the opposite direction. Go already draws the line correctly: `os.Lstat` reports only **name-surrogate** reparse points (mount points and symlinks) as `ModeSymlink`/`ModeIrregular`, and reports a placeholder as an ordinary file or directory. `archive.IsLink` therefore asks the mode bits and nothing else. It tests **both** bits because which one a junction gets has changed across Go releases (`ModeSymlink` in older versions, `ModeIrregular` on 1.23+). The first cut of this used the raw attribute and the verification pass caught it.
+
+**One predicate, four walks.** `archive.Zip`/`ZipItems`, `archive.collectItems`, `archive.treeSize` and `scanner.walk` all call `IsLink`. They had three different wrong answers before: the zip walk classified a junction as a file and `io.Copy`'d a directory handle (`read …\junc: Incorrect function`, failing the entire backup); `collectItems` packed it as a ~0-byte *file item*; `scanner.walk` dropped it as a side effect of its `IsDir()` test. Any new walk must consult the same function, or the plan and the zip start describing different archives.
+
+**Check the link before the `IsDir()` test, and return `SkipDir` when both are true.** `filepath.Walk` decides whether to descend from `info.IsDir()`, **not** from what the callback returns, so returning `nil` for a link that reports as a directory archives everything under it. No current Go version reports a junction that way; the guard costs nothing and removes the only walk that would follow one if a future release changed.
+
+**A walk never skips its own root, so a source that is itself a link must be refused.** `filepath.Walk` does not descend into a root that is a link, so archiving one produces an **empty zip that looks like a successful backup**. `checkNotLink` refuses with `archive.ErrSourceIsLink`, which `buildUploadPlan` tags as `source_is_link` rather than folding into `unreadable` — the source is perfectly readable, it just is not what the user thinks they chose, and the remedy is different.
+
+**A skipped link is named twice, in two tenses.** The pre-flight warning is the only moment the user can still change their mind, and it is gone once the modal closes; the `job_logs` row is what answers "is this backup complete?" months later. Same facts, different wording: `skippedLinksMessage` is future tense, `skippedLinksLogMessage` past. Both cap the list at `maxNamedLinks` and report the true total — a source with hundreds of links would otherwise produce an unbounded log row nobody reads.
+
+**Sizes follow the skip.** A link contributes no bytes to `Plan.TotalBytes`, no entry to the recorded tree, and no size to `scanner.dirImmediateSize`. That keeps the quota pre-check, the transfer budget and the displayed tree describing the archive that will actually exist.
+
+**Test against a real junction, and make sure the test is not skipping.** `mklink /J` needs no elevation, so the Windows path is exercised for real; `os.Symlink` does need Developer Mode, which is why the helpers use a junction on Windows and a symlink elsewhere and `t.Skip` when the OS refuses. A skipped link test asserts nothing — check for `--- PASS`, not merely the absence of `FAIL`.
+
+---
+
+### Metadata-database backup status (PR #15, closing D10)
+
+**The last attempt and the last success are separate fields on purpose.** A run of failures must not erase the record of the copy that did land: that copy is still in the cloud, still restorable, and **its filename is the only thing a recovery has to go on**. `RecordMetadataBackupFailure` mutates the existing struct and leaves `LastSuccessAt`/`LastSuccessName` alone; `RecordMetadataBackupSuccess` replaces wholesale, which is what clears a stale `Stage`/`Error`.
+
+**"Never attempted" is a third state, not a blank.** It is the normal condition of a fresh install, and it must not render as a failure or as an empty line that reads like success. An absent DB entry gives a nil `MetadataBackup` with `omitempty`, so the key is absent from the JSON entirely, and the card says "Database copy: not attempted yet" without the warning styling.
+
+**Unknown never degrades to success.** An unset or unparseable settings row yields an empty map, which renders as "not attempted". That direction is the safe one — the whole feature exists to stop the user believing in a backup that is not happening. A write over an unreadable row logs loudly before replacing it, because that is the only moment anyone could notice a previous record was lost rather than never written.
+
+**Record the failures that happen *before* the per-destination loop.** A failed WAL snapshot or `copyToTemp` fails every destination for good, and the original code only logged it — so the Accounts view kept reporting the friendly, wrong "not attempted yet" while no copy of the index was leaving the machine. `backupDatabase` now records that against every main account with stage `snapshotting the database`. (Caught by the verification pass.)
+
+**The read-modify-write is in a transaction.** Several worker goroutines finish jobs at once and the status is one shared row. With `SetMaxOpenConns(1)` the transaction holds the only connection, so two providers finishing together cannot each write a map missing the other's entry.
+
+**Timestamps are stored RFC3339 UTC and rendered with `toLocaleString()`.** Note the asymmetry with `last_quota_sync`, which is a bare SQLite `CURRENT_TIMESTAMP` string with no zone marker — `new Date()` parses *that* as local time and would misreport it by hours, which is why the quota line is still rendered raw. Do not "unify" the two without changing how the quota timestamp is stored.

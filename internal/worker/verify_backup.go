@@ -102,7 +102,15 @@ func (w *Worker) backupDatabase(ctx context.Context) {
 	// other and the DB is read once however many main accounts are configured.
 	tmp, err := copyToTemp(w.dbPath)
 	if err != nil {
+		// Recorded against every destination, not just logged. A full disk or a
+		// locked file fails all of them for good, and the Accounts view would
+		// otherwise keep reporting the friendly, wrong "not attempted yet" while no
+		// copy of the index is leaving the machine — which is the exact question
+		// this record exists to answer.
 		slog.Warn("copying db for backup failed", "error", err)
+		for _, m := range mains {
+			w.recordMainBackupFailure(string(m.Provider), m.Email, "snapshotting the database", err)
+		}
 		return
 	}
 	defer os.Remove(tmp)
@@ -124,23 +132,46 @@ func (w *Worker) backupDatabase(ctx context.Context) {
 func (w *Worker) uploadDBToMains(ctx context.Context, mains []accounts.MainAccount, path, name string) int {
 	uploaded := 0
 	for _, m := range mains {
+		// Named prov, not provider: the provider package is imported here, and
+		// shadowing it in a function that talks to backends is a trap.
+		prov := string(m.Provider)
+
 		p, err := w.newMainProvider(m)
 		if err != nil {
-			slog.Warn("metadata db backup failed", "provider", m.Provider, "email", m.Email, "stage", "building provider", "error", err)
+			w.recordMainBackupFailure(prov, m.Email, "building provider", err)
 			continue
 		}
 		if err := p.Login(ctx, m.Email, m.Password); err != nil {
-			slog.Warn("metadata db backup failed", "provider", m.Provider, "email", m.Email, "stage", "login", "error", err)
+			w.recordMainBackupFailure(prov, m.Email, "login", err)
 			continue
 		}
 		if _, err := p.Upload(ctx, path, name, nil); err != nil {
-			slog.Warn("metadata db backup failed", "provider", m.Provider, "email", m.Email, "stage", "upload", "error", err)
+			w.recordMainBackupFailure(prov, m.Email, "upload", err)
 			continue
 		}
+
 		uploaded++
-		slog.Info("metadata db backed up to main account", "provider", m.Provider, "email", m.Email, "name", name)
+		slog.Info("metadata db backed up to main account", "provider", prov, "email", m.Email, "name", name)
+		if err := database.RecordMetadataBackupSuccess(w.db, prov, name, time.Now()); err != nil {
+			slog.Warn("recording metadata backup status failed", "provider", prov, "error", err)
+		}
 	}
 	return uploaded
+}
+
+// recordMainBackupFailure logs a failed destination and persists it, so the
+// Accounts view can say the copy is not landing without anyone reading a log.
+//
+// The stored reason is the same text as the log line, deliberately: two
+// descriptions of one failure that disagree is worse than one that is terse.
+// Persisting is best-effort — the metadata backup is already a
+// logged-but-never-fatal path, and a status write must not become the thing that
+// breaks a completed job.
+func (w *Worker) recordMainBackupFailure(prov, email, stage string, cause error) {
+	slog.Warn("metadata db backup failed", "provider", prov, "email", email, "stage", stage, "error", cause)
+	if err := database.RecordMetadataBackupFailure(w.db, prov, stage, cause.Error(), time.Now()); err != nil {
+		slog.Warn("recording metadata backup status failed", "provider", prov, "error", err)
+	}
 }
 
 // usableMains returns the main accounts that can actually be logged in to: ones

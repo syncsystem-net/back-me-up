@@ -244,6 +244,50 @@ document.addEventListener('alpine:init', () => {
         // straight to the encrypted store; this drives and watches it.
         needsReauth(a) { return !!(a && a.needs_reauth); },
         canReauth(a) { return !!(a && a.provider === 'fourshared'); },
+
+        // ---- Metadata database backup status ----
+        // The database is the index: it says which archive holds what. If copies
+        // of it stop reaching a main account, the only place that has ever said
+        // so is a log line, and the user finds out during a restore. These read
+        // the record the worker now keeps.
+        //
+        // Never attempted, succeeded and failed are three states, not two. A
+        // missing record must not render as a failure (a fresh install has simply
+        // not run a job yet) and must not render as a blank that looks like
+        // success.
+        dbBackup(m) { return (m && m.metadata_backup) || null; },
+        dbBackupFailed(m) {
+            const b = this.dbBackup(m);
+            return !!(b && b.last_attempt_at && !b.ok);
+        },
+        dbBackupText(m) {
+            const b = this.dbBackup(m);
+            if (!b || !b.last_attempt_at) return 'Database copy: not attempted yet.';
+            if (b.ok) {
+                return `Database copy: last sent ${this.formatStamp(b.last_success_at)}`
+                    + (b.last_success_name ? ` as ${b.last_success_name}.` : '.');
+            }
+            const stage = b.stage ? ` while ${b.stage}` : '';
+            const why = b.error ? `: ${b.error}` : '.';
+            let text = `Database copy FAILED ${this.formatStamp(b.last_attempt_at)}${stage}${why}`;
+            if (b.last_success_at) {
+                // The copy that did land is still out there and still restorable,
+                // and its name is what a recovery needs in order to find it.
+                text += ` Last copy that landed: ${this.formatStamp(b.last_success_at)}`
+                    + (b.last_success_name ? ` (${b.last_success_name}).` : '.');
+            } else {
+                text += ' No copy has ever reached this account.';
+            }
+            return text;
+        },
+        // Stamps are stored as RFC3339 UTC. Rendering them in the browser's own
+        // locale is the point — an hour read off a server-side UTC string is the
+        // kind of thing that makes someone think a backup is a day stale.
+        formatStamp(s) {
+            if (!s) return 'never';
+            const d = new Date(s);
+            return isNaN(d.getTime()) ? s : d.toLocaleString();
+        },
         async startReauth(provider, email, isMain) {
             this.reauthError = '';
             this.reauthRun = { phase: 'starting', provider, email, is_main: !!isMain };

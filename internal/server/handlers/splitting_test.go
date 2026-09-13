@@ -173,7 +173,7 @@ func TestAnUnsplitBackupProducesExactlyOneArchiveForEveryone(t *testing.T) {
 		t.Fatalf("wrote %d archives, want 1 — the source must not be compressed twice", len(built))
 	}
 
-	backupID, err := h.recordBackup("u@example.com", "Unsplit", src, built)
+	backupID, _, err := h.recordBackup("u@example.com", "Unsplit", src, built)
 	if err != nil {
 		t.Fatalf("recordBackup: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestRecordBackupWritesOneZipRowPerArchive(t *testing.T) {
 		t.Fatalf("buildArchives: %v", err)
 	}
 
-	backupID, err := h.recordBackup("u@example.com", "Split test", src, built)
+	backupID, _, err := h.recordBackup("u@example.com", "Split test", src, built)
 	if err != nil {
 		t.Fatalf("recordBackup: %v", err)
 	}

@@ -58,6 +58,13 @@ type Plan struct {
 	Mode SplitMode
 	// PartBytes is the size each byte part is cut to, when Mode is ModeByteParts.
 	PartBytes int64
+	// SkippedLinks names every symlink, directory symlink and Windows junction
+	// the planning walk left out, relative to the source root and in a stable
+	// order. The archives will not contain them, so this is what the pre-flight
+	// warns with and what each job records in its log — a link dropped without
+	// being named is exactly the silent data loss the strict planner exists to
+	// prevent.
+	SkippedLinks []string
 }
 
 // ByteParts reports whether this plan produces raw parts rather than standalone
@@ -66,6 +73,12 @@ func (p *Plan) ByteParts() bool { return p != nil && p.Mode == ModeByteParts }
 
 // Split reports whether this plan produces more than one archive.
 func (p *Plan) Split() bool { return p != nil && len(p.Volumes) > 1 }
+
+// ErrSourceIsLink reports a source directory that is itself a link. It is a
+// sentinel rather than a bare message because the caller tags it for the UI, and
+// it is a different case from "the planner could not read this": the source is
+// perfectly readable, it just is not the thing the user thinks they chose.
+var ErrSourceIsLink = errors.New("source is a link")
 
 // FileTooLargeError reports a single file that no threshold-respecting archive
 // can contain. It is deliberately not a generic failure: the only useful thing
@@ -97,11 +110,16 @@ func (e *FileTooLargeError) Error() string {
 func PlanVolumes(srcDir string, thresholdBytes int64, method SplitMethod) (*Plan, error) {
 	srcDir = filepath.Clean(srcDir)
 
+	if err := checkNotLink(srcDir); err != nil {
+		return nil, err
+	}
+
 	if NormalizeMethod(string(method)) == MethodByteParts && thresholdBytes > 0 {
 		return PlanBytes(srcDir, thresholdBytes)
 	}
 
-	total, _, err := treeSize(srcDir)
+	links := &linkSet{}
+	total, _, err := treeSize(srcDir, ".", links)
 	if err != nil {
 		return nil, err
 	}
@@ -110,9 +128,10 @@ func PlanVolumes(srcDir string, thresholdBytes int64, method SplitMethod) (*Plan
 	// caller zips the directory whole, exactly as it always has.
 	if thresholdBytes <= 0 || total <= thresholdBytes {
 		return &Plan{
-			Volumes:    []Volume{{Items: []Item{{Rel: ".", Bytes: total, IsDir: true}}, Bytes: total}},
-			TotalBytes: total,
-			Mode:       ModeWholeFiles,
+			Volumes:      []Volume{{Items: []Item{{Rel: ".", Bytes: total, IsDir: true}}, Bytes: total}},
+			TotalBytes:   total,
+			Mode:         ModeWholeFiles,
+			SkippedLinks: links.sorted(),
 		}, nil
 	}
 
@@ -121,7 +140,7 @@ func PlanVolumes(srcDir string, thresholdBytes int64, method SplitMethod) (*Plan
 		capacity = thresholdBytes
 	}
 
-	items, err := collectItems(srcDir, ".", capacity, thresholdBytes)
+	items, err := collectItems(srcDir, ".", capacity, thresholdBytes, links)
 	if err != nil {
 		var tooLarge *FileTooLargeError
 		if errors.As(err, &tooLarge) && NormalizeMethod(string(method)) == MethodAuto {
@@ -133,7 +152,25 @@ func PlanVolumes(srcDir string, thresholdBytes int64, method SplitMethod) (*Plan
 		return nil, err
 	}
 
-	return &Plan{Volumes: Pack(items, capacity), TotalBytes: total, Mode: ModeWholeFiles}, nil
+	return &Plan{
+		Volumes:      Pack(items, capacity),
+		TotalBytes:   total,
+		Mode:         ModeWholeFiles,
+		SkippedLinks: links.sorted(),
+	}, nil
+}
+
+// checkNotLink refuses a source directory that is itself a link. Both walks stop
+// at a link rather than following it, so planning or zipping one would describe
+// an empty backup as a complete one. The user pointed at it deliberately, so the
+// answer is an explanation, not a silent skip.
+func checkNotLink(srcDir string) error {
+	if isLinkPath(srcDir) {
+		return fmt.Errorf(
+			"%w: %s is a link, not a real directory; point the backup at the directory it refers to",
+			ErrSourceIsLink, srcDir)
+	}
+	return nil
 }
 
 // collectItems turns the contents of dir into packable items, descending into
@@ -153,7 +190,7 @@ func PlanVolumes(srcDir string, thresholdBytes int64, method SplitMethod) (*Plan
 // walks only the items it was given. Skipping quietly here would upload a backup
 // that silently does not contain the user's data — where the unsplit path, which
 // walks the whole directory, would have failed loudly instead.
-func collectItems(dir, relBase string, capacity, threshold int64) ([]Item, error) {
+func collectItems(dir, relBase string, capacity, threshold int64, links *linkSet) ([]Item, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s while planning the archives: %w", dir, err)
@@ -166,6 +203,18 @@ func collectItems(dir, relBase string, capacity, threshold int64) ([]Item, error
 			rel = filepath.Join(relBase, e.Name())
 		}
 		full := filepath.Join(dir, e.Name())
+
+		// A link is not an item, and this has to be decided before the IsDir test:
+		// a junction reports IsDir() false, so without it a link was packed as a
+		// zero-byte *file*, assigned to a volume, and then blew up in ZipItems when
+		// the walk tried to open it. Skipping a link is not the tolerance this
+		// function otherwise refuses — an unreadable directory is data we failed to
+		// see, whereas a link holds no data of its own. It is recorded either way,
+		// so the difference is visible to the user rather than argued in a comment.
+		if info, err := e.Info(); err == nil && IsLink(info) {
+			links.add(rel)
+			continue
+		}
 
 		if !e.IsDir() {
 			info, err := e.Info()
@@ -185,7 +234,7 @@ func collectItems(dir, relBase string, capacity, threshold int64) ([]Item, error
 			continue
 		}
 
-		size, files, err := treeSize(full)
+		size, files, err := treeSize(full, rel, links)
 		if err != nil {
 			return nil, fmt.Errorf("cannot measure %s while planning the archives: %w", full, err)
 		}
@@ -203,7 +252,7 @@ func collectItems(dir, relBase string, capacity, threshold int64) ([]Item, error
 		}
 
 		// Too big to keep whole: open it up and apply the same rule inside.
-		children, err := collectItems(full, rel, capacity, threshold)
+		children, err := collectItems(full, rel, capacity, threshold, links)
 		if err != nil {
 			return nil, err
 		}
@@ -327,7 +376,10 @@ func (p *Plan) Includes(volume int) []string {
 // Like collectItems, it fails rather than skipping an unreadable entry: a size
 // that quietly under-counts would put a directory in a volume it does not fit,
 // and a subtree silently missed here is a subtree missing from the backup.
-func treeSize(root string) (int64, int, error) {
+// relBase is root's own path relative to the source root, so a skipped link is
+// named the way the user would recognise it; links may be nil when the caller
+// only wants a size.
+func treeSize(root, relBase string, links *linkSet) (int64, int, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return 0, 0, err
@@ -342,12 +394,23 @@ func treeSize(root string) (int64, int, error) {
 		if err != nil {
 			return fmt.Errorf("cannot read %s: %w", path, err)
 		}
-		if d.IsDir() {
-			return nil
-		}
 		fi, err := d.Info()
 		if err != nil {
 			return fmt.Errorf("cannot read %s: %w", path, err)
+		}
+		// Skipped here for the same reason as in collectItems and in the zip walk,
+		// and counted the same way — the three walks share IsLink so they cannot
+		// disagree about what the archive holds. WalkDir does not descend into a
+		// link, so nothing beneath it is reachable from here anyway.
+		if path != root && IsLink(fi) {
+			links.add(joinRel(relBase, relTo(root, path)))
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
 		}
 		total += fi.Size()
 		files++
@@ -447,7 +510,12 @@ func IsPartName(name string) bool {
 // uncompressed total, and compression only reduces it, so the real count is
 // settled after the archive is written.
 func PlanBytes(srcDir string, partBytes int64) (*Plan, error) {
-	total, _, err := treeSize(srcDir)
+	if err := checkNotLink(srcDir); err != nil {
+		return nil, err
+	}
+
+	links := &linkSet{}
+	total, _, err := treeSize(srcDir, ".", links)
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +534,13 @@ func PlanBytes(srcDir string, partBytes int64) (*Plan, error) {
 		volumes = append(volumes, Volume{Bytes: size})
 		remaining -= size
 	}
-	return &Plan{Volumes: volumes, TotalBytes: total, Mode: ModeByteParts, PartBytes: partBytes}, nil
+	return &Plan{
+		Volumes:      volumes,
+		TotalBytes:   total,
+		Mode:         ModeByteParts,
+		PartBytes:    partBytes,
+		SkippedLinks: links.sorted(),
+	}, nil
 }
 
 // SplitFile cuts path into consecutive parts of at most partBytes, named with

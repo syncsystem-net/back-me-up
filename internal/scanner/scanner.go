@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/syncsystem-net/back-me-up/internal/archive"
 )
 
 // Node is one directory in a recorded tree. SizeBytes counts only the files
@@ -98,6 +100,15 @@ func walk(dirPath, rel string, depth, maxDepth int, excludes []string, sel *sele
 
 	var nodes []*Node
 	for _, e := range entries {
+		// Links are left out deliberately, not as a side effect of the IsDir test
+		// below: the archive does not contain them either, and a tree that listed a
+		// junction would describe contents the zip has not got. The predicate is
+		// archive's so that the tree, the plan and the zip cannot disagree about
+		// what a link is — a junction answers IsDir() differently depending on the
+		// Go version, which is exactly the kind of drift this avoids.
+		if info, err := e.Info(); err == nil && archive.IsLink(info) {
+			continue
+		}
 		if !e.IsDir() {
 			continue
 		}
@@ -152,6 +163,11 @@ func dirImmediateSize(dirPath, rel string, sel *selector) int64 {
 		}
 		info, err := e.Info()
 		if err != nil {
+			continue
+		}
+		// A link contributes no bytes to the archive, so counting one here would
+		// inflate a size the user reads next to contents that are not there.
+		if archive.IsLink(info) {
 			continue
 		}
 		total += info.Size()
