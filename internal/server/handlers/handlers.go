@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -354,29 +355,74 @@ func SearchTreesHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		matches := make([]searchMatch, 0)
-		for _, z := range zips {
-			var root scanner.Node
-			if err := json.Unmarshal([]byte(z.TreeJSON), &root); err != nil {
-				// A zip with an unparseable or empty tree simply contributes no
-				// matches; one bad row must not fail the whole search.
+		json.NewEncoder(w).Encode(searchZips(zips, q))
+	}
+}
+
+// searchZips matches q against every zip's tree and returns one result per
+// (record, archive name, path).
+//
+// A record can hold several zip rows with the same name — a directory uploaded
+// to MEGA, then re-uploaded to 4shared after the first 4shared attempt failed.
+// Those rows describe one archive, so the table renders them as one node, and
+// search does the same: a repeated match is folded into the first, and its
+// accounts are unioned in. The first zip id is kept because zips arrive newest
+// first, which is also the row whose tree the table displays.
+func searchZips(zips []*database.SearchableZip, q string) []searchMatch {
+	type matchKey struct {
+		backupID int64
+		zipName  string
+		path     string
+	}
+	matches := make([]searchMatch, 0)
+	index := make(map[matchKey]int)
+	for _, z := range zips {
+		var root scanner.Node
+		if err := json.Unmarshal([]byte(z.TreeJSON), &root); err != nil {
+			// A zip with an unparseable or empty tree simply contributes no
+			// matches; one bad row must not fail the whole search.
+			continue
+		}
+		for _, hit := range searchNode(&root, nil, q) {
+			key := matchKey{z.BackupID, z.ZipName, hit.path}
+			if i, seen := index[key]; seen {
+				matches[i].Accounts = unionAccounts(matches[i].Accounts, z.Accounts)
 				continue
 			}
-			for _, hit := range searchNode(&root, nil, q) {
-				matches = append(matches, searchMatch{
-					BackupID:   z.BackupID,
-					Title:      z.Title,
-					OwnerEmail: z.OwnerEmail,
-					ZipID:      z.ZipID,
-					ZipName:    z.ZipName,
-					Accounts:   z.Accounts,
-					Path:       hit.path,
-					Name:       hit.name,
-				})
+			index[key] = len(matches)
+			matches = append(matches, searchMatch{
+				BackupID:   z.BackupID,
+				Title:      z.Title,
+				OwnerEmail: z.OwnerEmail,
+				ZipID:      z.ZipID,
+				ZipName:    z.ZipName,
+				Accounts:   unionAccounts(nil, z.Accounts),
+				Path:       hit.path,
+				Name:       hit.name,
+			})
+		}
+	}
+	return matches
+}
+
+// unionAccounts merges b into a without duplicates and returns the result
+// sorted, so a merged match lists its accounts in the same order whichever zip
+// row happened to be seen first. It always returns a fresh non-nil slice: the
+// inputs are shared with every other match from the same zip, and an empty list
+// must encode as [] rather than null.
+func unionAccounts(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, s := range list {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
 			}
 		}
-		json.NewEncoder(w).Encode(matches)
 	}
+	sort.Strings(out)
+	return out
 }
 
 type treeHit struct {

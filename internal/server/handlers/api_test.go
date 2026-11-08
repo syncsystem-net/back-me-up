@@ -103,6 +103,11 @@ func TestSettingsEndpointRoundTrip(t *testing.T) {
 
 func TestSearchEndpointAttributesMatches(t *testing.T) {
 	db, _ := newAPITestDB(t)
+	// Search credits an account only with a completed copy; the fixture's job is
+	// still pending, as an upload leaves it.
+	if _, err := db.Exec(`UPDATE jobs SET status = 'complete'`); err != nil {
+		t.Fatalf("completing job: %v", err)
+	}
 
 	// Accent-insensitive: the stored name is "Conteúdo Antigo".
 	w := do(t, SearchTreesHandler(db), "GET", "/api/search?q=conteudo", "")
