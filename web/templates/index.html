@@ -165,12 +165,10 @@
                                             <div class="quota-bar"><div class="quota-fill" :style="`width:${accountPct(userAccount(u, prov))}%`"></div></div>
 
                                             <div class="provider-actions">
-                                                <template x-if="providerStatus(u, prov)">
-                                                    <span class="chip" :class="'chip-' + providerDisplayStatus(u, prov)" x-text="providerDisplayStatus(u, prov)"></span>
-                                                </template>
-                                                <template x-if="!providerStatus(u, prov)">
-                                                    <span class="chip chip-none">no uploads</span>
-                                                </template>
+                                                <!-- Gray in every state: the label carries the meaning, and a
+                                                     red chip for a failure a later upload already fixed was
+                                                     exactly the false alarm this card used to raise. -->
+                                                <span class="chip chip-gray" x-text="statusLabel(providerDisplayStatus(u, prov) || 'none')"></span>
                                                 <button class="btn btn-purple btn-sm" x-show="providerJobs(u, prov).length" @click="openLogs(u, prov)">Log</button>
                                             </div>
 
@@ -191,6 +189,11 @@
                                             <!-- Why an upload is waiting rather than running. Without this a
                                                  job held for the transfer budget looks identical to a stuck one. -->
                                             <div class="job-hold" x-show="providerHold(u, prov)" x-text="providerHold(u, prov)"></div>
+
+                                            <!-- Unresolved failures only, and a way straight to them. -->
+                                            <button class="failure-note" x-show="providerFailureNote(u, prov)"
+                                                    @click="openJobsPage('failed')"
+                                                    x-text="providerFailureNote(u, prov) + ' — see Jobs'"></button>
                                         </div>
                                     </template>
                                     <template x-if="!(u.accounts && u.accounts.length)">
@@ -199,8 +202,9 @@
                                 </div>
                             </td>
                             <td class="col-title">
-                                <!-- One tree for the whole record. Every zip is a top-level node
-                                     carrying its own download link, with its directories nested
+                                <!-- One tree for the whole record. Every archive is a top-level node
+                                     (same-named zip rows merged into one) carrying a download link
+                                     per provider that holds it, with its directories nested
                                      beneath it — the archives belong to this record and read as
                                      one structure, not as detached blocks. -->
                                 <div x-show="isFilesOpen(u)">
@@ -219,11 +223,18 @@
                                                 <span class="tree-toggle tree-toggle-empty" x-show="!row.hasChildren">·</span>
                                                 <span class="tree-name" x-text="row.name"></span>
                                                 <span class="tree-size" x-show="row.size" x-text="formatSize(row.size)"></span>
-                                                <!-- Each archive's own download link, on the archive's own node. -->
-                                                <template x-if="row.downloadJob">
-                                                    <a class="tree-download" :href="`/api/jobs/${row.downloadJob.id}/download`"
-                                                       :title="`Download ${row.name} from ${row.downloadJob.provider}`">(download file)</a>
-                                                </template>
+                                                <!-- One link per provider holding a completed copy, on the
+                                                     archive's own node: "download MEGA | download 4shared". -->
+                                                <span class="tree-downloads" x-show="row.downloads.length">
+                                                    <template x-for="(d, di) in row.downloads" :key="d.provider">
+                                                        <span>
+                                                            <span class="tree-download-sep" x-show="di > 0">|</span>
+                                                            <a class="tree-download" :href="`/api/jobs/${d.job.id}/download`"
+                                                               :title="`Download ${row.name} from ${d.label}`"
+                                                               x-text="`download ${d.label}`"></a>
+                                                        </span>
+                                                    </template>
+                                                </span>
                                                 <span class="tree-size" x-show="row.noTree">(no tree recorded)</span>
                                             </div>
                                         </template>
@@ -246,7 +257,89 @@
 
         <!-- ===================== JOBS ===================== -->
         <div x-show="page === 'jobs'">
-            <div class="panel"><p class="muted">Job monitoring coming soon.</p></div>
+            <!-- Every upload across every record, built from the same polled
+                 payload as the Backups table, so it refreshes on the same cadence
+                 (fast while anything is active). -->
+            <div class="jobs-counters">
+                <div class="jobs-counter"><span class="jobs-counter-n" x-text="jobsCounts().in_progress"></span><span>In Progress</span></div>
+                <div class="jobs-counter"><span class="jobs-counter-n" x-text="jobsCounts().pending"></span><span>Pending</span></div>
+                <div class="jobs-counter" :class="{ 'jobs-counter--alert': jobsCounts().failed > 0 }">
+                    <span class="jobs-counter-n" x-text="jobsCounts().failed"></span><span>Failed (needs attention)</span>
+                </div>
+                <div class="jobs-counter"><span class="jobs-counter-n" x-text="jobsCounts().complete"></span><span>Complete</span></div>
+            </div>
+
+            <div class="toolbar">
+                <div class="jobs-filters">
+                    <template x-for="f in jobsFilters()" :key="f.key">
+                        <button class="btn btn-sm" :class="jobsFilter === f.key ? 'btn-purple' : 'btn-grey'"
+                                @click="jobsFilter = f.key" x-text="f.label"></button>
+                    </template>
+                </div>
+            </div>
+
+            <div class="panel" x-show="filteredJobRows().length === 0">
+                <p class="muted" x-text="jobRows().length === 0 ? 'No jobs yet.' : 'No jobs match this filter.'"></p>
+            </div>
+
+            <!-- Scrolls sideways inside itself on a narrow window rather than
+                 widening the page. -->
+            <div class="jobs-table-wrap" x-show="filteredJobRows().length > 0">
+                <table class="jobs-table">
+                    <thead>
+                        <tr>
+                            <th>Status</th>
+                            <th>Archive</th>
+                            <th>Record</th>
+                            <th>Account</th>
+                            <th>Created / Finished</th>
+                            <th>Details</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="row in filteredJobRows()" :key="row.job.id">
+                            <tr :class="{ 'job-row-replaced': !row.effective }">
+                                <td>
+                                    <span class="chip chip-gray" x-text="statusLabel(jobDisplayStatus(row))"></span>
+                                    <div class="job-sub" x-text="'job #' + row.job.id"></div>
+                                </td>
+                                <td class="job-archive" x-text="row.job.remote_name || '(unnamed)'"></td>
+                                <td>
+                                    <div x-text="row.title"></div>
+                                    <div class="job-sub" x-text="row.owner"></div>
+                                </td>
+                                <td>
+                                    <div x-text="providerName(row.job.provider)"></div>
+                                    <div class="job-sub" x-text="row.job.email"></div>
+                                </td>
+                                <td class="job-times">
+                                    <div x-text="formatStamp(row.job.created_at)"></div>
+                                    <div class="job-sub" x-text="row.job.completed_at ? formatStamp(row.job.completed_at) : '—'"></div>
+                                </td>
+                                <td class="job-details">
+                                    <template x-if="row.job.status === 'in_progress'">
+                                        <div>
+                                            <div class="progress"><div class="progress-fill" :style="`width:${jobPercent(row.job)}%`"></div></div>
+                                            <div class="job-sub" x-text="jobBytes(row.job)"></div>
+                                        </div>
+                                    </template>
+                                    <div class="job-detail-text" x-show="jobDetail(row.job)" x-text="jobDetail(row.job)"></div>
+                                    <div class="job-sub" x-show="!row.effective" x-text="replacedNote(row)"></div>
+                                    <div class="job-error" x-show="jobError(row.job)" x-text="jobError(row.job)"></div>
+                                </td>
+                                <td class="job-actions">
+                                    <button class="btn btn-purple btn-sm" @click="openJobLogs(row.job)">Log</button>
+                                    <button class="btn btn-pink btn-sm" x-show="isUnresolvedFailure(row)"
+                                            :disabled="isRetrying(row.job) || credentials.locked"
+                                            @click="retryJob(row.job)"
+                                            x-text="isRetrying(row.job) ? 'Retrying…' : 'Retry'"></button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <!-- ===================== ACCOUNTS ===================== -->
