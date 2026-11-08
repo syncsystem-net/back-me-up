@@ -1,6 +1,6 @@
 # BackMeUp
 
-Backup tool that zips local directories and uploads them to cloud storage providers (MEGA, 4shared). Manage multiple accounts, track upload jobs, and verify file integrity.
+Backup tool that zips local directories and uploads them to cloud storage providers (MEGA, 4shared). Initially, these two just to build the coding structure to support multiple providers. The goal is to add additional ones. Manage multiple accounts, track upload jobs, and verify file integrity.
 
 ## Features
 
