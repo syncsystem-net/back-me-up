@@ -201,7 +201,11 @@
                                     </template>
                                 </div>
                             </td>
-                            <td class="col-title">
+                            <!-- Spans Title through Actions: the tree's archive names, sizes and
+                                 per-provider download links need the room, and those columns
+                                 carry nothing in the expanded row. Not .col-title — that class
+                                 sets a width meant for a single column. -->
+                            <td class="col-files" colspan="4">
                                 <!-- One tree for the whole record. Every archive is a top-level node
                                      (same-named zip rows merged into one) carrying a download link
                                      per provider that holds it, with its directories nested
@@ -242,7 +246,6 @@
                                     <p class="muted" x-show="!(u.zips && u.zips.length)">No files recorded for this record yet.</p>
                                 </div>
                             </td>
-                            <td colspan="3"></td>
                         </tr>
                     </tbody>
                 </template>
@@ -304,7 +307,11 @@
                                     <span class="chip chip-gray" x-text="statusLabel(jobDisplayStatus(row))"></span>
                                     <div class="job-sub" x-text="'job #' + row.job.id"></div>
                                 </td>
-                                <td class="job-archive" x-text="row.job.remote_name || '(unnamed)'"></td>
+                                <td>
+                                    <div class="job-archive" x-text="row.job.remote_name || '(unnamed)'"></div>
+                                    <!-- Size of the archive this job uploads (or uploaded). -->
+                                    <div class="job-sub" x-text="formatSize(row.job.total_bytes) || '—'"></div>
+                                </td>
                                 <td>
                                     <div x-text="row.title"></div>
                                     <div class="job-sub" x-text="row.owner"></div>
