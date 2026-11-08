@@ -269,6 +269,8 @@ Ticket #7 shipped across 7a/7b/7c. Pre-Launch Refinement shipped across phases 1
 
 Deferred item **D18** was opened by the same verification pass: the 201 from `POST /api/backups` carries `warnings` and the client discards them, so an upload that skips the opt-in pre-flight surfaces skipped links only in the job log.
 
+**Production feedback — PR #16** (branch `pr/16-jobs-view-retry-unified-tree`). Ticket `dev-tools/prompts/output/tickets/16-jobs-view-retry-and-unified-tree.md`. The first chunk driven by real use: a production instance runs at `N:\meus_documentos\backup\back-me-up` **against the same cloud accounts as this dev repo**, so any change must preserve existing local and remote data (no destructive migration; inspect a *copy* of the prod DB, never the live file). Shipped: gray friendly-label status chips; the **effective-job rule** driving provider status, record status, the Jobs view and Retry; same-named zips unified into one tree node with per-provider download links, sorted naturally; the Jobs view (client-side, from `/api/users`); `POST /api/jobs/{id}/retry`; search merged by `(record, archive, path)` and crediting completed copies only. No schema change. Header totals were investigated and left alone — they already exclude main accounts. Opened **D19** (a Replaced job keeps its temp zip alive) and **D20** (retrying a MEGA verification failure duplicates the node).
+
 ---
 
 ## Technical Notes
@@ -681,3 +683,21 @@ OAuth tokens/consumer keys are hex and don't need quoting.
 **The read-modify-write is in a transaction.** Several worker goroutines finish jobs at once and the status is one shared row. With `SetMaxOpenConns(1)` the transaction holds the only connection, so two providers finishing together cannot each write a map missing the other's entry.
 
 **Timestamps are stored RFC3339 UTC and rendered with `toLocaleString()`.** Note the asymmetry with `last_quota_sync`, which is a bare SQLite `CURRENT_TIMESTAMP` string with no zone marker — `new Date()` parses *that* as local time and would misreport it by hours, which is why the quota line is still rendered raw. Do not "unify" the two without changing how the quota timestamp is stored.
+
+---
+
+### Effective jobs, the Jobs view and Retry (PR #16)
+
+**A record's job list is history, not state.** A record accumulates zips, and re-uploading a directory to the provider that failed appends a *new* zip row with the same name plus new jobs, leaving the old failed job in place. Any status derived from "does any job have status X" is therefore wrong forever after the first failure — production showed a 4shared card stuck on "failed" after the re-upload succeeded. The rule now: group a record's jobs by `(account_id, remote_name)`, the highest id is the **effective** job, the rest are **superseded**. Provider status, the record label, the Jobs view's "Replaced" marker and the server's Retry refusal (`database.LaterJobForSameArchive`) all use that one rule; keep the client (`effectiveIndex` in `app.js`) and server keys identical or they will disagree about which job a button acts on.
+
+**Activity outranks failure in a status chip.** Status answers "what is happening now": in progress, then pending/waiting, then failed, then complete. Failed-first hid a running upload behind an old failure. Unresolved failures are still surfaced, as a count on the card that links to Jobs → Failed.
+
+**Progress sums active jobs only.** Summing every job a record ever ran made a new upload start near 100% and broke the 100%-triggered "Verifying" label. "Verifying" is "every *in-progress* job has sent all its bytes", not "active progress ≥ 100": with `max_concurrent_per_account: 1` a split backup always has queued siblings at 0 bytes.
+
+**Unify by name at display time, never by rewriting rows.** Same-named zips in a record render as one node: tree and size from the newest row with a tree, one download link per provider pointing at that provider's newest *completed* job. Expansion keys are `${backupId}/${zipName}:${path}`, not zip id, so a new row joining a group keeps the state. Stored/Total GB count a name once. The existing duplicate rows in production stay as they are.
+
+**Retry re-queues, it does not recreate.** `RetryJob` checks, in order: credentials lock (503), status is `failed`, no later job for the same archive (names it), `zip_path` exists **and its size equals `total_bytes`** (temp names carry a random token, but a replaced or truncated file must never be resent as the archive the job recorded). The status flip is a guarded `UPDATE … WHERE status = 'failed'`, so a double click queues once. The job keeps its `zip_id`, so no tree duplicate appears — which is the whole advantage over re-uploading the directory.
+
+**Search credits only completed copies.** `ListSearchableZips` used to attribute an archive to every account that had *any* job for it, so a failed upload looked like a stored copy. It now requires `status = 'complete'`, and `SearchTreesHandler` merges same-named zips' matches.
+
+**The dev and prod instances share accounts, and that has teeth.** Re-authorizing 4shared in one instance invalidates the token the other holds (prod's token died hours after an in-app re-authorization). Both instances ship their metadata DB to the same main account under indistinguishable names. And Auto-Sync in dev adopts prod's archives, after which a dev Delete removes real files. Re-authorize in prod; keep dev's main accounts commented out; delete from dev only what dev uploaded.

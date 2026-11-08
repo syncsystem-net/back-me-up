@@ -15,8 +15,74 @@ function parseTreeJSON(zip) {
     // not a real tree — show the "none recorded" fallback rather than a bare
     // "(unnamed)" row.
     if (tree && !tree.name) tree = null;
+    // Sorted once here rather than on every render: the poll re-renders the
+    // table constantly and the parsed tree is reused until its raw string
+    // changes. The raw string is what the cache compares, so sorting the parsed
+    // copy cannot make an unchanged tree look edited.
+    if (tree) tree = sortTree(tree);
     treeCache.set(zip.id, { raw, tree });
     return tree;
+}
+
+// Natural, case-insensitive order: bkup2 before bkup10, "Docs" beside "docs".
+// The server records children in walk order and lists zips newest first, so
+// left alone a record reads bkup040 … bkup001.
+function naturalCompare(a, b) {
+    return String(a || '').localeCompare(String(b || ''), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+// A sorted copy of a parsed tree, children ordered by name at every level.
+function sortTree(node) {
+    const kids = (node.children || []).map(sortTree);
+    kids.sort((a, b) => naturalCompare(a.name, b.name));
+    return { ...node, children: kids };
+}
+
+// Alpine hands templates reactive proxies. Caches keyed by object identity need
+// the underlying object, or each proxy wrapper would look like a new key.
+function rawOf(v) {
+    return (window.Alpine && typeof Alpine.raw === 'function') ? Alpine.raw(v) : v;
+}
+
+// ---- Effective jobs ----
+// A record keeps every upload attempt: a failed 4shared job stays in the table
+// after the directory is re-uploaded to 4shared and succeeds. The *effective*
+// job for an archive on an account is the newest one — the highest id among
+// jobs sharing (record, account, remote name). Everything that asks "is this
+// still a problem?" uses this one rule — the provider chip, the record label,
+// the Jobs view's Replaced marker and its Retry button — and the server's retry
+// refusal applies the same key, so none of them can disagree.
+//
+// Memoised per jobs array: /api/users replaces the arrays on every poll tick,
+// so a stale entry is simply never asked for again and the WeakMap drops it.
+const effectiveCache = new WeakMap();
+
+function jobArchiveKey(j) {
+    return `${j.backup_id}|${j.account_id}|${j.remote_name || ''}`;
+}
+
+function effectiveIndex(jobs) {
+    const raw = rawOf(jobs || []);
+    const hit = effectiveCache.get(raw);
+    if (hit) return hit;
+    const byKey = new Map();
+    for (const j of raw) {
+        const k = jobArchiveKey(j);
+        const cur = byKey.get(k);
+        if (!cur || j.id > cur.id) byKey.set(k, j);
+    }
+    const ids = new Set();
+    for (const j of byKey.values()) ids.add(j.id);
+    const entry = { byKey, ids };
+    effectiveCache.set(raw, entry);
+    return entry;
+}
+
+function isActiveJob(j) { return j.status === 'pending' || j.status === 'in_progress'; }
+
+// Display names for providers, as the user knows them.
+function providerName(p) {
+    return p === 'mega' ? 'MEGA' : p === 'fourshared' ? '4shared' : (p || '');
 }
 
 // Case- and accent-insensitive folding, mirroring scanner.Fold on the server so
@@ -81,8 +147,10 @@ document.addEventListener('alpine:init', () => {
         expandedAccounts: [],
         expandedFiles: [],
         allExpanded: false,
-        // Tree node expansion, keyed by `${zipId}:${nodePath}` for the same reason.
-        // Two lists because "open" has a default (root open, rest closed) that a single
+        // Tree node expansion, keyed by `${backupId}/${archiveName}:${nodePath}` for
+        // the same reason. Not by zip id: same-named zip rows render as one node,
+        // and a re-upload adding a row to that group must neither reset the node
+        // nor give it a second state. Two lists because "open" has a default (root open, rest closed) that a single
         // list could not distinguish from "never touched".
         expandedNodes: [],
         collapsedNodes: [],
@@ -156,6 +224,14 @@ document.addEventListener('alpine:init', () => {
         searchRan: false,
         searching: false,
         searchError: '',
+
+        // Jobs view. Built entirely from `users`, which the poll already
+        // refreshes, so it needs no endpoint of its own and updates on the same
+        // cadence. The filter and per-row retry state are plain component state
+        // keyed by job id, so they survive the poll replacing every job object.
+        jobsFilter: 'all',
+        retryingJobs: [],
+        jobErrors: {},
 
         async init() {
             // Same rule as the refresh loop: the poll must be armed even if a
@@ -379,19 +455,32 @@ document.addEventListener('alpine:init', () => {
 
         // ---- Per-user / per-provider helpers ----
         userAccount(u, provider) { return (u.accounts || []).find(a => a.provider === provider) || null; },
+        // Every job ever run against this provider, superseded ones included. The
+        // logs and the bulk Download/Delete actions want the full history; status
+        // questions go through effectiveJobs instead.
         providerJobs(u, provider) { return (u.jobs || []).filter(j => j.provider === provider); },
         completedJobs(u, provider) { return this.providerJobs(u, provider).filter(j => j.status === 'complete'); },
+        // The newest job per archive on this provider's account — the only ones
+        // whose outcome still describes what the cloud holds.
+        effectiveJobs(u, provider) {
+            const { ids } = effectiveIndex(u.jobs);
+            return this.providerJobs(u, provider).filter(j => ids.has(j.id));
+        },
+        // Activity first: a running upload is what the user needs to see, and an
+        // old failure must not hide it. Only then does an unresolved failure win
+        // over success — and "unresolved" means the effective job failed, so a
+        // failure that a later upload of the same archive fixed no longer counts.
         providerStatus(u, provider) {
-            const jobs = this.providerJobs(u, provider);
+            const jobs = this.effectiveJobs(u, provider);
             if (jobs.length === 0) return null;
-            if (jobs.some(j => j.status === 'failed')) return 'failed';
             if (jobs.some(j => j.status === 'in_progress')) return 'in_progress';
-            if (jobs.every(j => j.status === 'complete')) return 'complete';
-            return 'pending';
+            if (jobs.some(j => j.status === 'pending')) return 'pending';
+            if (jobs.some(j => j.status === 'failed')) return 'failed';
+            return 'complete';
         },
         providerDisplayStatus(u, provider) {
             const s = this.providerStatus(u, provider);
-            if (s === 'in_progress' && this.providerProgress(u, provider) >= 100) return 'verifying';
+            if (s === 'in_progress' && this.providerVerifying(u, provider)) return 'verifying';
             // A job the worker is deliberately not claiming reads as "pending" and
             // would otherwise be indistinguishable from a stuck one.
             if (s === 'pending' && this.providerHold(u, provider)) return 'waiting';
@@ -404,34 +493,74 @@ document.addEventListener('alpine:init', () => {
             const held = this.providerJobs(u, provider).find(j => this.jobHoldReason(j));
             return held ? held.hold_reason : '';
         },
+        // Progress of the work still to do, not of everything this account ever
+        // received. Summing history made a new upload start near 100%.
         providerProgress(u, provider) {
-            const jobs = this.providerJobs(u, provider);
+            const jobs = this.providerJobs(u, provider).filter(isActiveJob);
             if (jobs.length === 0) return null;
             let up = 0, tot = 0;
             for (const j of jobs) { up += j.uploaded_bytes || 0; tot += j.total_bytes || 0; }
             if (tot === 0) return 0;
             return Math.min(100, Math.round((up / tot) * 100));
         },
+        // Every running upload on this provider has sent all its bytes and is in
+        // the post-upload checksum. Judged on the running jobs alone: a queued
+        // sibling volume sits at 0 bytes, so a sum over every active job would
+        // keep the label on In Progress through each verification of a split
+        // backup — the label would almost never appear.
+        providerVerifying(u, provider) {
+            const running = this.providerJobs(u, provider).filter(j => j.status === 'in_progress');
+            return running.length > 0 && running.every(j => this.jobVerifying(j));
+        },
+        // "3 of 40 archives failed" for the card, or '' when nothing needs
+        // attention. Counted over effective jobs, so it is the number of archives
+        // this account is actually missing.
+        providerFailureNote(u, provider) {
+            const jobs = this.effectiveJobs(u, provider);
+            const failed = jobs.filter(j => j.status === 'failed').length;
+            if (!failed) return '';
+            return `${failed} of ${jobs.length} archive${jobs.length === 1 ? '' : 's'} failed`;
+        },
+        // The vocabulary every status chip uses. The raw values are database
+        // states; nobody should have to read "in_progress" in a product.
+        statusLabel(s) {
+            const labels = {
+                pending: 'Pending',
+                waiting: 'Waiting',
+                in_progress: 'In Progress',
+                verifying: 'Verifying',
+                complete: 'Complete',
+                failed: 'Failed',
+                replaced: 'Replaced',
+                none: 'No Uploads',
+            };
+            return labels[s || 'none'] || s;
+        },
+        providerName(p) { return providerName(p); },
 
         // ---- Record-level status / totals ----
-        // A record is Synced when every job completed, Unsynced if any failed, and
-        // Syncing while uploads are still running.
+        // Same rules as the provider chip: Syncing while anything is running,
+        // otherwise Unsynced only for a failure no later upload has fixed.
         recordStatus(u) {
             const jobs = u.jobs || [];
             if (jobs.length === 0) return null;
-            if (jobs.some(j => j.status === 'failed')) return 'unsynced';
-            if (jobs.every(j => j.status === 'complete')) return 'synced';
-            return 'syncing';
+            if (jobs.some(isActiveJob)) return 'syncing';
+            const { ids } = effectiveIndex(u.jobs);
+            if (jobs.some(j => ids.has(j.id) && j.status === 'failed')) return 'unsynced';
+            return 'synced';
         },
         recordStatusLabel(u) {
             const s = this.recordStatus(u);
             return s === 'synced' ? 'Synced' : s === 'unsynced' ? 'Unsynced' : s === 'syncing' ? 'Syncing…' : '';
         },
-        storedGB(u) {
+        // Same-named zip rows are one archive (see archiveGroups), so each is
+        // counted once, at the size the tree shows for it.
+        storedBytes(u) {
             let b = 0;
-            for (const z of (u.zips || [])) b += z.size_bytes || 0;
-            return (b / 1073741824).toFixed(2);
+            for (const g of this.archiveGroups(u)) b += g.rep.size_bytes || 0;
+            return b;
         },
+        storedGB(u) { return (this.storedBytes(u) / 1073741824).toFixed(2); },
         accountUsedGB(a) { return (a ? a.quota_used_gb || 0 : 0); },
         accountTotalGB(a) { return (a ? a.quota_total_gb || 0 : 0); },
         accountPct(a) {
@@ -444,7 +573,7 @@ document.addEventListener('alpine:init', () => {
         totalRecords() { return this.users.filter(u => u.backup).length; },
         grandTotalGB() {
             let b = 0;
-            for (const u of this.users) for (const z of (u.zips || [])) b += z.size_bytes || 0;
+            for (const u of this.users) b += this.storedBytes(u);
             return (b / 1073741824).toFixed(2);
         },
 
@@ -722,11 +851,21 @@ document.addEventListener('alpine:init', () => {
         },
 
         // ---- Downloads ----
-        // The completed job holding this zip, preferring one on an account the row
-        // is showing. A zip can be stored on several accounts; any completed copy
-        // is the same file, so the first one is fine.
-        zipDownloadJob(u, zip) {
-            return (u.jobs || []).find(j => j.zip_id === zip.id && j.status === 'complete') || null;
+        // One link per provider holding a completed copy of the archive, each
+        // pointing at that provider's newest completed job. The group can span
+        // several zip rows (a re-upload to one provider appends a row), so the
+        // lookup takes every zip id in the group, not just the representative's.
+        archiveDownloads(u, zipIds) {
+            const out = [];
+            for (const provider of ['mega', 'fourshared']) {
+                let best = null;
+                for (const j of (u.jobs || [])) {
+                    if (j.provider !== provider || j.status !== 'complete' || !zipIds.has(j.zip_id)) continue;
+                    if (!best || j.id > best.id) best = j;
+                }
+                if (best) out.push({ provider, label: providerName(provider), job: best });
+            }
+            return out;
         },
         downloadAllLabel(u, provider) {
             const n = this.completedJobs(u, provider).length;
@@ -764,6 +903,18 @@ document.addEventListener('alpine:init', () => {
                 for (const l of lines) this.logs.push({ ...l, email: j.email });
             }
             this.logs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        },
+
+        // One job's log lines, for the Jobs view. Same modal as the per-provider
+        // logs, so the two read alike.
+        async openJobLogs(j) {
+            this.logsTitle = `${providerName(j.provider)} logs — ${j.remote_name || 'job #' + j.id} (job #${j.id})`;
+            this.logs = [];
+            this.showLogsModal = true;
+            const r = await fetch(`/api/jobs/${j.id}/logs`).catch(() => null);
+            if (!r || !r.ok) return;
+            const lines = (await r.json().catch(() => [])) || [];
+            this.logs = lines.map(l => ({ ...l, email: j.email }));
         },
 
         // ---- Deletes ----
@@ -923,53 +1074,83 @@ document.addEventListener('alpine:init', () => {
         },
 
         // ---- Files tree ----
-        // ONE tree per record. Each zip contributes a depth-0 node — the archive
-        // itself, carrying its own download link — and that zip's directories nest
-        // beneath it. The parsed tree's root IS the archive (same directory), so its
-        // *children* are emitted at depth 1 rather than repeating the same name twice.
+        // ONE tree per record, with one top-level node per *archive*. A record can
+        // hold several zip rows with the same name — the directory reached MEGA,
+        // failed on 4shared, and was re-uploaded to 4shared alone, which appends a
+        // row — and those rows are one archive in the cloud, so they render as
+        // one node carrying a download link per provider that holds a copy.
+        //
+        // The node's tree and size come from the group's representative: the
+        // newest row with a recorded tree, falling back to the newest row. Newest
+        // because a re-upload of a changed directory records the current state.
+        archiveGroups(u) {
+            const byName = new Map();
+            for (const z of (u.zips || [])) {
+                const name = z.name || '(unnamed)';
+                if (!byName.has(name)) byName.set(name, []);
+                byName.get(name).push(z);
+            }
+            const recordKey = u.backup ? u.backup.id : u.email;
+            const groups = [];
+            for (const [name, zips] of byName) {
+                const newestFirst = [...zips].sort((a, b) => b.id - a.id);
+                const rep = newestFirst.find(z => parseTreeJSON(z)) || newestFirst[0];
+                groups.push({
+                    key: `${recordKey}/${name}`,
+                    name,
+                    rep,
+                    root: parseTreeJSON(rep),
+                    zipIds: new Set(zips.map(z => z.id)),
+                });
+            }
+            groups.sort((a, b) => naturalCompare(a.name, b.name));
+            return groups;
+        },
+        // The zip node replaces the parsed tree's root — they denote the same
+        // directory — so the root's *children* are emitted at depth 1 rather than
+        // repeating the same name twice.
         //
         // Alpine cannot recurse with x-for, so the result is flattened to the rows
         // that are currently VISIBLE (collapsed subtrees are skipped) and rendered by
         // a single x-for, with depth expressed as left padding.
         recordTreeRows(u) {
             const rows = [];
-            for (const z of (u.zips || [])) {
-                const root = parseTreeJSON(z);
-                const children = root ? (root.children || []) : [];
-                // The zip node's path is empty: it stands in for the tree root, so it
-                // inherits the root's "open by default" behaviour via depth 0.
-                const zipOpen = this.isNodeOpen(z.id, '', 0);
+            for (const g of this.archiveGroups(u)) {
+                const children = g.root ? (g.root.children || []) : [];
+                // The archive node's path is empty: it stands in for the tree root,
+                // so it inherits the root's "open by default" behaviour via depth 0.
+                const zipOpen = this.isNodeOpen(g.key, '', 0);
                 rows.push({
-                    key: this.nodeKey(z.id, ''),
+                    key: this.nodeKey(g.key, ''),
                     isZip: true,
-                    zipId: z.id,
+                    groupKey: g.key,
                     path: '',
-                    name: z.name || '(unnamed)',
+                    name: g.name,
                     depth: 0,
-                    size: z.size_bytes || 0,
+                    size: g.rep.size_bytes || 0,
                     hasChildren: children.length > 0,
                     // Distinct from hasChildren: an archive whose tree was recorded
                     // but is empty (an empty source directory) has a tree, and must
                     // not be labelled as having none.
-                    noTree: root === null,
+                    noTree: g.root === null,
                     expanded: zipOpen,
-                    downloadJob: this.zipDownloadJob(u, z),
+                    downloads: this.archiveDownloads(u, g.zipIds),
                 });
                 if (!zipOpen) continue;
                 const walk = (node, parentPath, depth) => {
                     const name = node.name || '(unnamed)';
                     const path = parentPath ? `${parentPath}/${name}` : name;
                     const kids = node.children || [];
-                    const open = this.isNodeOpen(z.id, path, depth);
+                    const open = this.isNodeOpen(g.key, path, depth);
                     rows.push({
-                        key: this.nodeKey(z.id, path),
+                        key: this.nodeKey(g.key, path),
                         isZip: false,
-                        zipId: z.id,
+                        groupKey: g.key,
                         path, name, depth,
                         size: node.size_bytes || 0,
                         hasChildren: kids.length > 0,
                         expanded: open,
-                        downloadJob: null,
+                        downloads: [],
                     });
                     if (kids.length && open) for (const c of kids) walk(c, path, depth + 1);
                 };
@@ -977,17 +1158,19 @@ document.addEventListener('alpine:init', () => {
             }
             return rows;
         },
-        nodeKey(zipId, path) { return `${zipId}:${path}`; },
+        // groupKey is `${backupId}/${archiveName}`, so a key reads
+        // `${backupId}/${archiveName}:${path}`.
+        nodeKey(groupKey, path) { return `${groupKey}:${path}`; },
         // Default state: root open, everything below closed. An explicit entry in
         // either list overrides that default.
-        isNodeOpen(zipId, path, depth) {
-            const k = this.nodeKey(zipId, path);
+        isNodeOpen(groupKey, path, depth) {
+            const k = this.nodeKey(groupKey, path);
             if (this.expandedNodes.includes(k)) return true;
             if (this.collapsedNodes.includes(k)) return false;
             return depth === 0;
         },
         toggleTreeNode(row) {
-            const k = this.nodeKey(row.zipId, row.path);
+            const k = this.nodeKey(row.groupKey, row.path);
             const open = row.expanded;
             this.expandedNodes = this.expandedNodes.filter(x => x !== k);
             this.collapsedNodes = this.collapsedNodes.filter(x => x !== k);
@@ -995,20 +1178,19 @@ document.addEventListener('alpine:init', () => {
             else this.expandedNodes.push(k);
         },
         // Every node key in the record that has children — the only nodes
-        // expand/collapse-all needs to record. Walks the full tree of every zip,
-        // not just the visible rows, and includes each zip's own node.
+        // expand/collapse-all needs to record. Walks the full tree of every
+        // archive, not just the visible rows, and includes each archive's own node.
         allRecordNodeKeys(u) {
             const keys = [];
-            for (const z of (u.zips || [])) {
-                const root = parseTreeJSON(z);
-                const children = root ? (root.children || []) : [];
-                if (children.length) keys.push(this.nodeKey(z.id, ''));
+            for (const g of this.archiveGroups(u)) {
+                const children = g.root ? (g.root.children || []) : [];
+                if (children.length) keys.push(this.nodeKey(g.key, ''));
                 const walk = (node, parentPath) => {
                     const name = node.name || '(unnamed)';
                     const path = parentPath ? `${parentPath}/${name}` : name;
                     const kids = node.children || [];
                     if (kids.length) {
-                        keys.push(this.nodeKey(z.id, path));
+                        keys.push(this.nodeKey(g.key, path));
                         for (const c of kids) walk(c, path);
                     }
                 };
@@ -1016,14 +1198,12 @@ document.addEventListener('alpine:init', () => {
             }
             return keys;
         },
-        // Whether this record has anything to expand — a record whose zips carry no
-        // recorded tree would otherwise show Expand All / Collapse All buttons that
-        // silently do nothing.
+        // Whether this record has anything to expand — a record whose archives carry
+        // no recorded tree would otherwise show Expand All / Collapse All buttons
+        // that silently do nothing. Asked of the representatives, because those are
+        // the trees actually rendered.
         hasExpandableTree(u) {
-            return (u.zips || []).some(z => {
-                const root = parseTreeJSON(z);
-                return !!(root && (root.children || []).length);
-            });
+            return this.archiveGroups(u).some(g => !!(g.root && (g.root.children || []).length));
         },
         setRecordTreeOpen(u, open) {
             // A Set, not includes(): this filters both lists once per key, which is
@@ -1036,6 +1216,125 @@ document.addEventListener('alpine:init', () => {
             if (open) this.expandedNodes.push(...keys);
             else this.collapsedNodes.push(...keys);
         },
+
+        // ---- Jobs view ----
+        // Every job across every record, derived from the polled `users` payload.
+        // Each row carries what the template needs to label it, including whether
+        // a later job for the same archive on the same account has replaced it.
+        jobRows() {
+            const rows = [];
+            for (const u of this.users) {
+                for (const j of (u.jobs || [])) {
+                    const replacedBy = this.supersedingJob(u, j);
+                    rows.push({
+                        job: j,
+                        title: u.backup ? (u.backup.title || '(untitled)') : '(untitled)',
+                        owner: u.email,
+                        effective: !replacedBy,
+                        replacedBy,
+                    });
+                }
+            }
+            // Active first — that is what someone opening this view wants to see —
+            // then newest first. Ids rise with creation, and unlike created_at they
+            // cannot tie.
+            rows.sort((a, b) => {
+                const aa = isActiveJob(a.job) ? 0 : 1;
+                const ba = isActiveJob(b.job) ? 0 : 1;
+                return aa !== ba ? aa - ba : b.job.id - a.job.id;
+            });
+            return rows;
+        },
+        // The job that replaced j, or null when j is itself the effective one.
+        supersedingJob(u, j) {
+            const eff = effectiveIndex(u.jobs).byKey.get(jobArchiveKey(j));
+            return eff && eff.id !== j.id ? eff : null;
+        },
+        // A failure no later upload has fixed — the only kind that needs anything
+        // from the user, and the only kind Retry is offered for.
+        isUnresolvedFailure(row) { return row.effective && row.job.status === 'failed'; },
+        jobsCounts() {
+            const c = { in_progress: 0, pending: 0, failed: 0, complete: 0 };
+            for (const row of this.jobRows()) {
+                const s = row.job.status;
+                if (s === 'in_progress') c.in_progress++;
+                else if (s === 'pending') c.pending++;
+                else if (s === 'complete') c.complete++;
+                else if (this.isUnresolvedFailure(row)) c.failed++;
+            }
+            return c;
+        },
+        // "Failed" means unresolved: a failure a later upload replaced is history,
+        // not something to act on, so it shows under All but not here.
+        jobsFilters() {
+            return [
+                { key: 'all', label: 'All' },
+                { key: 'active', label: 'Active' },
+                { key: 'failed', label: 'Failed' },
+                { key: 'complete', label: 'Complete' },
+            ];
+        },
+        filteredJobRows() {
+            const rows = this.jobRows();
+            switch (this.jobsFilter) {
+                case 'active': return rows.filter(r => isActiveJob(r.job));
+                case 'failed': return rows.filter(r => this.isUnresolvedFailure(r));
+                case 'complete': return rows.filter(r => r.job.status === 'complete');
+                default: return rows;
+            }
+        },
+        // The note on a provider card links here, already narrowed to what the
+        // note is about.
+        openJobsPage(filter) {
+            this.jobsFilter = filter || 'all';
+            this.page = 'jobs';
+        },
+        jobVerifying(j) {
+            return j.status === 'in_progress' && j.total_bytes > 0 && (j.uploaded_bytes || 0) >= j.total_bytes;
+        },
+        jobDisplayStatus(row) {
+            const j = row.job;
+            if (j.status === 'failed' && !row.effective) return 'replaced';
+            if (this.jobVerifying(j)) return 'verifying';
+            if (this.jobHoldReason(j)) return 'waiting';
+            return j.status;
+        },
+        jobPercent(j) {
+            if (!j.total_bytes) return 0;
+            return Math.min(100, Math.round(((j.uploaded_bytes || 0) / j.total_bytes) * 100));
+        },
+        jobBytes(j) {
+            return `${this.formatSize(j.uploaded_bytes) || '0 B'} of ${this.formatSize(j.total_bytes) || '0 B'}`;
+        },
+        jobDetail(j) { return j.error_message || this.jobHoldReason(j) || ''; },
+        replacedNote(row) {
+            const r = row.replacedBy;
+            if (!r) return '';
+            return `Replaced by job #${r.id} (${this.statusLabel(r.status).toLowerCase()}).`;
+        },
+        isRetrying(j) { return this.retryingJobs.includes(j.id); },
+        async retryJob(j) {
+            if (this.isRetrying(j)) return;
+            this.retryingJobs.push(j.id);
+            this.jobErrors = { ...this.jobErrors, [j.id]: '' };
+            try {
+                const r = await fetch(`/api/jobs/${j.id}/retry`, { method: 'POST' });
+                if (!r.ok) {
+                    const e = await r.json().catch(() => ({}));
+                    this.jobErrors = { ...this.jobErrors, [j.id]: e.error || 'Could not retry this job' };
+                    return;
+                }
+                await this.loadUsers();
+                // A queued job is work: re-arm now so the fast cadence starts
+                // immediately rather than after the idle timer already in flight.
+                this.scheduleRefresh();
+            } catch (e) {
+                this.jobErrors = { ...this.jobErrors, [j.id]: 'Could not retry this job' };
+            } finally {
+                this.retryingJobs = this.retryingJobs.filter(id => id !== j.id);
+            }
+        },
+        jobError(j) { return this.jobErrors[j.id] || ''; },
         formatSize(b) {
             if (!b) return '';
             const units = ['B', 'KB', 'MB', 'GB', 'TB'];

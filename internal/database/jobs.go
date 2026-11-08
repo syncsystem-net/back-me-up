@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -31,6 +32,14 @@ type Job struct {
 	// indistinguishable from a stuck one, and the explanation has to survive a
 	// restart to be worth anything.
 	HoldReason string `json:"hold_reason,omitempty"`
+
+	// StartedAt and CompletedAt are when the latest attempt was claimed and when
+	// it reached a terminal state. Both are nil until that happens, and both are
+	// cleared by a retry, so a re-queued job never shows the finish time of the
+	// attempt it replaces. CompletedAt is set on failure too — it means
+	// "finished", not "succeeded".
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 }
 
 func InsertJob(tx *sql.Tx, backupID, zipID, accountID int64, zipPath, remoteName string, totalBytes int64) (int64, error) {
@@ -78,16 +87,23 @@ func InsertAdoptedJob(tx *sql.Tx, backupID, zipID, accountID int64, remoteName, 
 const jobColumns = `j.id, j.backup_id, COALESCE(j.zip_id, 0), j.account_id, a.provider, a.email, j.status,
 	COALESCE(j.zip_path, ''), COALESCE(j.remote_path, ''), COALESCE(j.remote_name, ''), j.total_bytes,
 	j.uploaded_bytes, j.chunks_total, j.chunks_uploaded, COALESCE(j.error_message, ''), j.created_at,
-	COALESCE(j.hold_reason, '')`
+	COALESCE(j.hold_reason, ''), j.started_at, j.completed_at`
 
 func scanJob(s interface {
 	Scan(...any) error
 }) (*Job, error) {
 	j := &Job{}
+	var started, completed sql.NullTime
 	if err := s.Scan(&j.ID, &j.BackupID, &j.ZipID, &j.AccountID, &j.Provider, &j.Email, &j.Status,
 		&j.ZipPath, &j.RemotePath, &j.RemoteName, &j.TotalBytes, &j.UploadedBytes, &j.ChunksTotal,
-		&j.ChunksUploaded, &j.ErrorMessage, &j.CreatedAt, &j.HoldReason); err != nil {
+		&j.ChunksUploaded, &j.ErrorMessage, &j.CreatedAt, &j.HoldReason, &started, &completed); err != nil {
 		return nil, err
+	}
+	if started.Valid {
+		j.StartedAt = &started.Time
+	}
+	if completed.Valid {
+		j.CompletedAt = &completed.Time
 	}
 	return j, nil
 }
@@ -128,6 +144,71 @@ func GetJob(db *sql.DB, id int64) (*Job, error) {
 		return nil, fmt.Errorf("scanning job: %w", err)
 	}
 	return j, nil
+}
+
+// LaterJobForSameArchive returns the newest job uploading the same archive to
+// the same account as job, created after it — or nil when there is none.
+//
+// "Same archive" is (record, account, remote name), the key the Jobs view and
+// the provider cards use to decide which job is the effective one. A failed job
+// that has such a successor has been superseded: retrying it would upload a
+// second copy of something already uploaded, or race the upload that replaced
+// it. Keeping the rule here and in the UI identical is what stops the two from
+// disagreeing about whether a failure still needs attention.
+func LaterJobForSameArchive(db *sql.DB, job *Job) (*Job, error) {
+	row := db.QueryRow(
+		`SELECT `+jobColumns+`
+		 FROM jobs j JOIN accounts a ON j.account_id = a.id
+		 WHERE j.backup_id = ? AND j.account_id = ? AND COALESCE(j.remote_name, '') = ?
+		   AND j.id > ?
+		 ORDER BY j.id DESC
+		 LIMIT 1`,
+		job.BackupID, job.AccountID, job.RemoteName, job.ID,
+	)
+	later, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("looking up a later job for the same archive: %w", err)
+	}
+	return later, nil
+}
+
+// RetryFailedJob puts a failed job back in the queue, reporting whether it was
+// this call that did so.
+//
+// The status guard is the whole point: a double click, or two tabs, must not
+// queue the same upload twice, and a job that is no longer failed must not be
+// knocked back to pending mid-upload. Exactly one caller sees true.
+//
+// What is reset is what a freshly inserted job carries. Progress and the chunk
+// counters go to zero because resume is whole-file (a provider session cannot be
+// reconstructed, so the upload restarts from byte 0). error_message and
+// hold_reason go to NULL, the convention every other path uses for "none".
+// started_at and completed_at go to NULL so the job does not report the timing
+// of the attempt that failed.
+//
+// Deliberately left alone: zip_id and zip_path, so the retried upload reuses the
+// kept temp archive and stays attached to the same zip row (no duplicate in the
+// tree); remote_path, verify_checksum and last_verified_at, which only the
+// success path ever writes, so a failed job carries none of them and the worker
+// overwrites them on completion anyway.
+func RetryFailedJob(db *sql.DB, id int64) (bool, error) {
+	res, err := db.Exec(
+		`UPDATE jobs SET status = 'pending', uploaded_bytes = 0, chunks_uploaded = 0, chunks_total = 0,
+		                 error_message = NULL, hold_reason = NULL, started_at = NULL, completed_at = NULL
+		 WHERE id = ? AND status = 'failed'`,
+		id,
+	)
+	if err != nil {
+		return false, fmt.Errorf("retrying job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("retrying job: %w", err)
+	}
+	return n > 0, nil
 }
 
 // Allowance is how many more bytes may be uploaded to one account, counting only

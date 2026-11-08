@@ -43,5 +43,6 @@ func Register(mux *http.ServeMux, h *handlers.Handlers, db *sql.DB, syncer *quot
 	mux.HandleFunc("DELETE /api/backups/{id}", h.DeleteBackup)
 	mux.HandleFunc("GET /api/jobs/{id}/logs", handlers.GetJobLogsHandler(db))
 	mux.HandleFunc("GET /api/jobs/{id}/download", h.DownloadJob)
+	mux.HandleFunc("POST /api/jobs/{id}/retry", h.RetryJob)
 	mux.HandleFunc("DELETE /api/jobs/{id}", h.DeleteJob)
 }

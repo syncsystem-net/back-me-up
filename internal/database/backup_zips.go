@@ -48,8 +48,8 @@ func scanZip(s interface{ Scan(...any) error }) (*Zip, error) {
 
 // SearchableZip is one zip paired with the record it belongs to and the accounts
 // that hold it, so a tree-JSON hit can be attributed back to a backup, a zip, and
-// an account. Accounts come from the zip's jobs — a zip that never uploaded
-// anywhere still appears, with an empty Accounts list.
+// an account. Accounts come from the zip's completed jobs — a zip that never
+// finished uploading anywhere still appears, with an empty Accounts list.
 type SearchableZip struct {
 	ZipID      int64
 	ZipName    string
@@ -69,7 +69,7 @@ func ListSearchableZips(db *sql.DB) ([]*SearchableZip, error) {
 		`SELECT z.id, z.name, COALESCE(z.tree_json, ''), b.id, b.title, COALESCE(b.owner_email, '')
 		 FROM backup_zips z
 		 JOIN backups b ON b.id = z.backup_id
-		 ORDER BY z.created_at DESC`,
+		 ORDER BY z.created_at DESC, z.id DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("querying searchable zips: %w", err)
@@ -90,10 +90,14 @@ func ListSearchableZips(db *sql.DB) ([]*SearchableZip, error) {
 		return nil, err
 	}
 
+	// Only a completed upload means the account holds a copy. A pending or
+	// failed job is an intention, not an archive, and crediting it sends the user
+	// to an account that cannot give them the file back.
 	acctRows, err := db.Query(
 		`SELECT DISTINCT j.zip_id, a.provider, a.email
 		 FROM jobs j JOIN accounts a ON a.id = j.account_id
-		 WHERE j.zip_id IS NOT NULL`,
+		 WHERE j.zip_id IS NOT NULL AND j.status = 'complete'
+		 ORDER BY a.provider, a.email`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("querying zip accounts: %w", err)
